@@ -324,11 +324,10 @@ fn gemm_w8a8_impl(
             "gemm_w8a8 received an unsupported scale mode or layout".into(),
         ));
     }
-    let dims = activation.shape().dims();
-    if dims.len() != 2 || dims[1] != weight.input_dim {
+    if activation.input_dim != weight.input_dim {
         return Err(Error::Other(format!(
-            "gemm_w8a8 activation shape mismatch: expected [M,{}], got {dims:?}",
-            weight.input_dim
+            "gemm_w8a8 activation width mismatch: expected {}, got {}",
+            weight.input_dim, activation.input_dim
         )));
     }
     if weight.values_i8.device() != ctx.device_id()
@@ -348,23 +347,14 @@ fn gemm_w8a8_impl(
         )));
     }
 
-    let rows = dims[0];
-    let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
-    let weight_scales = CudaBuffer::from_tensor(weight.scales_f32).map_err(Error::Cuda)?;
-    let quantized = crate::workspace::output_buffer(ctx, rows * weight.input_dim)?;
-    let row_scales = crate::workspace::output_buffer(ctx, rows * std::mem::size_of::<f32>())?;
-    unsafe {
-        ffi::check_cuda(ffi::apxinf_static_quantize_rows_bf16_int8(
-            activation.ptr(),
-            quantized.ptr(),
-            row_scales.ptr(),
-            rows as i32,
-            weight.input_dim as i32,
-            ctx.stream().handle(),
-        ))
-        .map_err(Error::Cuda)?;
+    let rows = activation.rows;
+    if std::env::var_os("APXINF_GR00T_LOG_W8A8_GEMM_SHAPES").is_some() {
+        eprintln!(
+            "APXINF_W8A8_BF16_GEMM_SHAPE m={rows} n={} k={}",
+            weight.output_dim, weight.input_dim
+        );
     }
-
+    let weight_scales = CudaBuffer::from_tensor(weight.scales_f32).map_err(Error::Cuda)?;
     let output = crate::workspace::output_buffer(
         ctx,
         rows * weight.output_dim * DType::BF16.size_in_bytes(),
@@ -404,9 +394,9 @@ fn gemm_w8a8_impl(
     {
         let cutlass_result = unsafe {
             ffi::check_cuda(ffi::apxinf_static_cutlass_int8_gemm_bf16(
-                quantized.ptr(),
+                activation.quantized.ptr(),
                 weight.values_i8.ptr(),
-                row_scales.ptr(),
+                activation.row_scales.ptr(),
                 weight_scales.ptr(),
                 output.ptr(),
                 rows as i32,
@@ -440,7 +430,7 @@ fn gemm_w8a8_impl(
             rows,
             weight.output_dim,
             weight.input_dim,
-            &quantized,
+            &activation.quantized,
             weight.values_i8,
             &accumulators,
         )
@@ -448,7 +438,7 @@ fn gemm_w8a8_impl(
     unsafe {
         ffi::check_cuda(ffi::apxinf_static_dequantize_int32_bf16(
             accumulators.ptr(),
-            row_scales.ptr(),
+            activation.row_scales.ptr(),
             weight_scales.ptr(),
             output.ptr(),
             rows as i32,

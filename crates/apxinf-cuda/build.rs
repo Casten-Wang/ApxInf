@@ -1,4 +1,6 @@
 use std::env;
+use std::ffi::OsStr;
+use std::path::Path;
 
 #[path = "build_support/cuda_arch.rs"]
 mod cuda_arch;
@@ -96,6 +98,37 @@ fn emit_rerun_if_changed_tree(root: &std::path::Path) {
             println!("cargo:rerun-if-changed={}", path.display());
         }
     }
+}
+
+fn nvcc_object_is_fresh(object: &Path, depfile: &Path, command_file: &Path, command: &str) -> bool {
+    let Ok(object_modified) = object.metadata().and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    if std::fs::read_to_string(command_file).ok().as_deref() != Some(command) {
+        return false;
+    }
+    let Ok(dependencies) = std::fs::read_to_string(depfile) else {
+        return false;
+    };
+    let normalized_dependencies = dependencies.replace("\\\n", " ");
+    let Some((_, dependencies)) = normalized_dependencies.split_once(':') else {
+        return false;
+    };
+    dependencies.split_whitespace().all(|dependency| {
+        Path::new(dependency)
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified <= object_modified)
+    })
+}
+
+fn command_signature(program: &OsStr, arguments: &[std::ffi::OsString]) -> String {
+    let mut signature = program.to_string_lossy().into_owned();
+    for argument in arguments {
+        signature.push('\0');
+        signature.push_str(&argument.to_string_lossy());
+    }
+    signature
 }
 
 fn is_fa2_sm80_family(arch: &str) -> bool {
@@ -456,6 +489,9 @@ fn main() {
                     println!("cargo:rerun-if-changed={}", entry.display());
                     let stem = entry.file_stem().unwrap().to_string_lossy().to_string();
                     let obj = format!("{out_dir}/{stem}.o");
+                    let depfile = format!("{obj}.d");
+                    let command_file = format!("{obj}.cmd");
+
                     let mut cmd = std::process::Command::new(&nvcc);
                     cmd.args([
                         "-c",
@@ -466,7 +502,13 @@ fn main() {
                         "-fPIC",
                         "-O3",
                         "-std=c++17",
+                        "-MMD",
+                        "-MF",
+                        &depfile,
                     ]);
+                    if nvcc_arch.as_deref() == Some("sm_110") {
+                        cmd.arg("-DAPXINF_TARGET_SM110=1");
+                    }
                     let selected_arch = if entry == &cutlass_fmha
                         || entry == &cutlass_gemm_operator
                         || entry == &cutlass_fp8_dual_operator
@@ -553,9 +595,23 @@ fn main() {
                             cmd.arg(format!("-I{}", include.display()));
                         }
                     }
+                    let arguments = cmd.get_args().map(ToOwned::to_owned).collect::<Vec<_>>();
+                    let signature = command_signature(cmd.get_program(), &arguments);
+                    if nvcc_object_is_fresh(
+                        Path::new(&obj),
+                        Path::new(&depfile),
+                        Path::new(&command_file),
+                        &signature,
+                    ) {
+                        println!("cargo:warning=reusing fresh CUDA object {stem}.o");
+                        continue;
+                    }
+
                     let status = cmd.status().expect("failed to run nvcc");
 
                     assert!(status.success(), "nvcc failed for {}", entry.display());
+                    std::fs::write(&command_file, signature)
+                        .unwrap_or_else(|error| panic!("write {command_file}: {error}"));
                 }
 
                 // Create a static library from all kernel objects

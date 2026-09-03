@@ -16,6 +16,7 @@ apxinf/
 │   ├── auto.py       AutoPolicy: checkpoint -> concrete policy by config type
 │   └── impls/        concrete per-model policies (the part that grows)
 │       ├── pi05.py       Pi05Policy (registered as "pi05")
+│       ├── gr00t.py      Gr00tPolicy (registered as "gr00t"/"gr00tn1d7")
 │       └── walloss.py    WallossPolicy (registered as "walloss")
 ├── adapters/     downstream: expose a Policy through a foreign API (lazy imports)
 │   └── lerobot.py   ApxInfPolicy — drop-in policy for a lerobot control loop
@@ -33,8 +34,8 @@ apxinf/
   `Normalizer`/`Unnormalizer`, `GaussianNoise`, chained by `Pipeline`. No GPU /
   no Rust dependency; unit-tests run offline. sentencepiece is imported lazily
   by the tokenizer only.
-- **L2 policies** (`apxinf.Pi05Policy`, `apxinf.WallossPolicy`, or
-  `apxinf.AutoPolicy`) — own each model family's pre/post contract around a
+- **L2 policies** (`apxinf.Pi05Policy`, `apxinf.Gr00tPolicy`,
+  `apxinf.WallossPolicy`, or `apxinf.AutoPolicy`) — own each model family's pre/post contract around a
   bare-model handle and return deployable actions from one
   `infer(obs_dict) -> {actions, timing, ...}` call. `import apxinf`
   stays CUDA-free; only `apxinf.Model` and a policy's `from_pretrained` pull in
@@ -141,12 +142,50 @@ Any default step is replaceable at construction (`image_pipeline=`,
 `tokenizer=`, `unnormalizer=`, `noise=`) for a custom high-performance
 implementation.
 
+### GR00T N1.7
+
+The GR00T policy deliberately keeps the same outward observation/result shape
+as PI0.5 while preserving N1.7's own processor contract:
+
+```python
+from apxinf import Gr00tPolicy
+
+policy = Gr00tPolicy.from_pretrained(
+    "/models/GR00T-N1.7-LIBERO/libero_10",
+    backbone="/models/Cosmos-Reason2-2B",
+    precision="bf16",
+)
+result = policy.infer({
+    "observation/image": base_rgb_uint8,
+    "observation/wrist_image": wrist_rgb_uint8,
+    "observation/state": libero_state_float32,
+    "prompt": "put the moka pot on the stove",
+})
+actions = result["actions"]  # [16, 7] for the LIBERO checkpoint
+```
+
+For Thor FP8, pass `precision="fp8"` and
+`calibration="/path/to/calibration.json"`. For Orin INT8, pass
+`precision="int8"`.
+The checkpoint declares the state-field widths and decoded action layout; the
+caller supplies one flat state vector in that declared order. The optional
+`noise=` argument follows the shared `Policy` contract and accepts either
+`[40, 132]` or `[1, 40, 132]` for the released checkpoint.
+
+GR00T requires the pinned Isaac-GR00T/Transformers processor environment at
+load time. Those packages are imported lazily, so ordinary PI0.5 or offline
+processor users do not acquire them. See
+[`examples/gr00tpolicy_infer.py`](examples/gr00tpolicy_infer.py) for a complete
+CLI invocation. The supported device/precision matrix, measured performance
+boundary and validation commands are documented in the
+[`GR00T N1.7 guide`](../../doc/gr00t-n1.7/README.md).
+
 ## Policy contract
 
 `apxinf.Policy` is a structural `typing.Protocol` every L2 policy satisfies:
 `metadata`, `action_dim`, `action_horizon`, `infer(obs, noise=None) -> dict`, `close()`.
 `infer` guarantees the `actions` and `timing` keys across all policies. It's the
-anchor point for future models (a `GrootPolicy` satisfies the same contract),
+anchor point for model-specific policies (`Gr00tPolicy` satisfies the same contract),
 for `AutoPolicy` dispatch, and for a future lerobot adaptor — no inheritance
 required, structural typing only.
 
