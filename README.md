@@ -44,12 +44,15 @@ from apxinf import AutoPolicy
 
 policy = AutoPolicy.from_pretrained("<path-to-model>", precision="bf16")
 
-result = policy.infer({
-    "observation/image":       np.zeros((256, 256, 3), np.uint8),
-    "observation/wrist_image": np.zeros((256, 256, 3), np.uint8),
-    "observation/state":       np.zeros(policy.action_dim, np.float32),
-    "prompt":                  "put both moka pots on the stove",
-})
+observation = {
+    key: np.zeros((256, 256, 3), np.uint8)
+    for key in policy.metadata["image_keys"]
+}
+observation[policy.metadata["prompt_key"]] = "put both moka pots on the stove"
+if state_key := policy.metadata.get("state_key"):
+    observation[state_key] = np.zeros(policy.metadata["state_dim"], np.float32)
+
+result = policy.infer(observation)
 
 result["actions"]   # (H, policy.action_dim) float32, unnormalized
 result["timing"]    # model_ms / total_ms
@@ -251,7 +254,7 @@ a mismatch produces wrong actions, not an error.
 `--help` lists every preset. If an installed client uses different keys, pass
 the concrete policy fields through `--policy-options` (for example
 `{"image_keys":[...],"state_key":"state"}`) or register a named preset; do not
-edit the generic server. See [Adding an embodiment](../../doc/adding-an-embodiment.md).
+edit the generic server. See [Adding an embodiment](doc/adding-an-embodiment.md).
 
 The server keeps the checkpoint's native action width unless the user supplies
 `--action-dim` or selects a preset with a deployable width. It publishes the

@@ -25,6 +25,7 @@ from apxinf import AutoPolicy
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True, type=pathlib.Path)
+    parser.add_argument("--tokenizer", type=pathlib.Path)
     parser.add_argument("--precision", choices=("auto", "fp8", "bf16", "int8"), default="bf16")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -55,9 +56,15 @@ def synthetic_observation_for(policy, *, prompt: str = "pick up the block"):
         or not all(isinstance(key, str) and key for key in image_keys)
     ):
         raise ValueError(f"policy metadata image_keys must be non-empty strings, got {image_keys!r}")
+    state_key = policy.metadata.get("state_key")
+    state_dim = policy.metadata.get("state_dim")
+    if state_key is not None and not isinstance(state_dim, int):
+        raise ValueError("policy metadata must declare state_dim when state_key is set")
     return synthetic_observation(
         image_keys=tuple(image_keys),
-        state_dim=policy.action_dim,
+        state_key=state_key,
+        prompt_key=policy.metadata.get("prompt_key", "prompt"),
+        state_dim=state_dim or 0,
         prompt=prompt,
     )
 
@@ -72,6 +79,8 @@ def main() -> None:
         precision=args.precision,
         action_dim=args.action_dim,
     )
+    if getattr(args, "tokenizer", None) is not None:
+        options["tokenizer_path"] = args.tokenizer
     policy = AutoPolicy.from_pretrained(args.model_dir, **options)
     try:
         print("dispatched model_type:", policy.metadata.get("model_type"))

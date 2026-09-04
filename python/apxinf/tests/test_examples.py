@@ -25,7 +25,11 @@ def _load_example(name: str):
 
 
 class _PolicyContractOnly:
-    metadata = {"image_keys": ["front", "wrist"]}
+    metadata = {
+        "image_keys": ["front", "wrist"],
+        "state_key": "observation/state",
+        "state_dim": 8,
+    }
     action_dim = 7
 
 
@@ -36,7 +40,7 @@ def test_autopolicy_example_uses_public_metadata_contract():
     assert set(observation) == {"front", "wrist", "observation/state", "prompt"}
     assert observation["front"].shape == (256, 256, 3)
     assert observation["front"].dtype == np.uint8
-    assert observation["observation/state"].shape == (7,)
+    assert observation["observation/state"].shape == (8,)
 
 
 @pytest.mark.parametrize("image_keys", [None, [], ["front", ""]])
@@ -48,6 +52,16 @@ def test_autopolicy_example_rejects_missing_or_invalid_image_contract(image_keys
         action_dim = 7
 
     with pytest.raises(ValueError, match="image_keys"):
+        example.synthetic_observation_for(BadPolicy())
+
+
+def test_autopolicy_example_requires_state_width_when_state_is_served():
+    example = _load_example("autopolicy_infer")
+
+    class BadPolicy:
+        metadata = {"image_keys": ["front"], "state_key": "observation/state"}
+
+    with pytest.raises(ValueError, match="state_dim"):
         example.synthetic_observation_for(BadPolicy())
 
 

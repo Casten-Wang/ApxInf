@@ -7,15 +7,15 @@ points other layers code against:
 * :class:`BareModel` — the model-side contract (L1 bare inference) a policy
   consumes, i.e. the subset of a ``apxinf_py.Model`` handle it relies on.
 * :class:`Policy` — the L2 contract (``obs dict -> result dict``) every
-  model-specific policy satisfies (``Pi05Policy`` today; e.g. a future
-  ``GrootPolicy``). Downstream consumers (the websocket server, the
+  model-specific policy satisfies. Downstream consumers (the websocket server, the
   :class:`~apxinf.policies.auto.AutoPolicy` registry, a lerobot adaptor) code
   against this, never a concrete class.
-
-It exists to pin these contracts *now*, before a second model lands, so the
-layout is set for whoever adds one. They intentionally stay tiny: extract richer
-shared structure when a second model actually teaches us what is common, not by
-guessing from one example.
+* :class:`ComposablePolicy` — the narrow extra capability a policy needs before
+  an *outer* layer (a robot adapter) can wrap steps around its chain. Optional:
+  a policy is a perfectly good :class:`Policy` without it.
+* :data:`VIEW_SLOTS` — the camera slot names a checkpoint's weights consume, in
+  order. Model vocabulary, kept here so a policy and a robot preset can both
+  name a slot without importing each other.
 
 The ``Policy.infer`` result is a plain dict. Two keys are guaranteed across all
 policies: ``actions`` (deployable, unnormalized-domain ``float32``
@@ -27,11 +27,26 @@ anything beyond the two guaranteed ones.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Protocol, runtime_checkable
+from typing import Any, Dict, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
-__all__ = ["Policy", "BareModel"]
+__all__ = ["Policy", "BareModel", "ComposablePolicy", "VIEW_SLOTS"]
+
+#: Camera view slots, in the order a checkpoint's weights consume them, as named
+#: by openpi's ``model.IMAGE_KEYS``.
+#:
+#: These are **model** vocabulary, not wire keys and not a dataset's convention.
+#: A checkpoint's ``num_views`` says how many of these it was trained on; the
+#: *order* is baked into the weights, and nothing here ever crosses the network.
+#: They live in this module rather than in a robot preset or in ``pi05.py``
+#: because both sides need to agree on them without either importing the other:
+#: a policy uses them to name the cameras it wants when the caller does not, and
+#: a robot preset uses them to say which slot each of its wire keys fills.
+#:
+#: The pi05 family shares this vocabulary. A model with a different camera layout
+#: declares its own rather than stretching this tuple.
+VIEW_SLOTS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
 
 @runtime_checkable
@@ -89,4 +104,27 @@ class Policy(Protocol):
 
     def close(self) -> None:
         """Release any underlying model resources."""
+        ...
+
+
+@runtime_checkable
+class ComposablePolicy(Protocol):
+    """A :class:`Policy` that accepts outer input and output processing steps."""
+
+    def with_adapter(
+        self,
+        *,
+        before: Sequence[Any] = (),
+        after: Sequence[Any] = (),
+        action_dim: Optional[int] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> "Policy":
+        """Return a policy running ``before`` ahead of, and ``after`` behind, its own chain.
+
+        Each entry is a ``(name, step)`` pair (a
+        :data:`~apxinf.processors.base.StepSpec`). ``action_dim`` declares the
+        deployable width the wrapped chain now emits, since an appended step may
+        change it; ``metadata`` is merged over the inherited description. The
+        returned policy shares the underlying model handle — do not close both.
+        """
         ...

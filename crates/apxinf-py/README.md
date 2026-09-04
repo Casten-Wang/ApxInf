@@ -4,9 +4,8 @@ PyO3 bindings for the ApxInf VLA runtime — the **binding layer** of the ApxInf
 Python frontend.
 
 `import apxinf_py` gives in-process, numpy-in / numpy-out access to bare-model
-inference, removing the old subprocess + stdio hop. The policy-facing tier is L1; no
-processor lives here (tokenize / normalize / resize belong to the `apxinf`
-Python package, Phase 2):
+inference. The policy-facing tier is L1; tokenize, normalize, and resize belong
+to the `apxinf` Python package:
 
 - **PI0.5 L1** `Model.infer_rgb(...)` — resized RGB in; vision patchification
   runs inside the Rust CUDA graph.

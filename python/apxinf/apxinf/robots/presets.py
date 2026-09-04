@@ -1,64 +1,35 @@
-"""Robot presets: the wire contract of one embodiment, as a named table entry.
+"""Named robot presets for deployable inference contracts.
 
-OpenPI keeps this information in a Python registry of ``TrainConfig``s: which
-``DataTransformFn`` pair runs, and therefore which **wire keys** the client must
-send. ``serve_policy.py --policy.config pi05_UnitreeG1_...`` selects an entry;
-the client cannot negotiate it and must match by hand.
-
-This module is the same idea with the same shape, so switching embodiments is a
-launch flag on both sides rather than a code edit on ours:
-
-    openpi:  serve_policy.py --policy.config pi05_UnitreeG1_groundwire
-    apxinf:  pi05_openpi_websocket_server.py --robot unitree_g1
-
-**Why a table and not a default.** ``Pi05Policy``'s ``_DEFAULT_IMAGE_KEYS`` is
-LIBERO's wire contract. As *the* default it silently applied to every checkpoint,
-so a G1 checkpoint served without extra arguments ran LIBERO's keys, dropped
-state, and skipped the G1 delta→absolute and 32→16 steps — every symptom of a
-"model accuracy problem" with nothing in the logs. A preset makes the embodiment
-an explicit, named choice.
-
-**Why slot names.** ``image_keys`` is order-significant: entry ``i`` is stacked
-into model view slot ``i``, which the checkpoint trained as openpi's
-``base_0_rgb`` / ``left_wrist_0_rgb`` / ``right_wrist_0_rgb``. A tuple written in
-the wrong order still stacks, still has the right shape, and silently feeds the
-wrong camera to each slot. Pairing every wire key with the slot it fills makes
-that order reviewable instead of positional.
-
-**Naming rule: ``<arm>_<convention>``.** The arm alone does not determine the
-contract — LIBERO and DROID are both Franka Panda, yet LIBERO sends
-``observation/image`` with a 7-dim EEF-delta action while DROID sends
-``observation/exterior_image_1_left`` with a different action space. So a preset
-is named for the arm *and* the dataset convention whose keys it implements:
-``franka_libero``, not ``libero`` (a benchmark, not a robot) and not ``franka``
-(ambiguous). Single-embodiment robots that own their convention need no suffix —
-``unitree_g1``.
+A preset pairs an :class:`Embodiment` (camera/action geometry and robot
+processing) with a :class:`~apxinf.conventions.Convention` (wire keys and state
+routing). ``image_keys`` order maps directly to model :data:`VIEW_SLOTS`.
+External packages may add pairings with :func:`register_robot_preset`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
+from .. import conventions
+from ..conventions import Convention
 from ..policies.auto import AutoPolicy
-from ..policies.base import Policy
-from ..processors.robots.unitree_g1 import G1_CAMERAS, G1_STATE_KEY
+from ..policies.base import VIEW_SLOTS, Policy
+from ..processors.robots.unitree_g1 import G1_ROBOT_DIM
 from .unitree_g1 import build_unitree_g1_policy
 
 __all__ = [
     "VIEW_SLOTS",
+    "Embodiment",
+    "Convention",
     "RobotPreset",
     "ROBOT_PRESETS",
     "ROBOT_ALIASES",
     "available_robots",
     "get_robot_preset",
+    "register_robot_preset",
     "build_robot_policy",
 ]
-
-#: pi05 model view slots in order, as named by openpi's ``model.IMAGE_KEYS``.
-#: A checkpoint's ``num_views`` is how many of these its weights were trained on;
-#: the names are openpi's convention, the *order* is baked into the weights.
-VIEW_SLOTS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
 
 def _build_generic(model_dir, **kwargs) -> Policy:
@@ -67,60 +38,161 @@ def _build_generic(model_dir, **kwargs) -> Policy:
 
 
 @dataclass(frozen=True)
-class RobotPreset:
-    """One embodiment's serving contract: wire keys + action width + builder."""
+class Embodiment:
+    """Robot camera/action geometry and its optional processing builder."""
 
-    #: Registry name, used as ``--robot <name>``.
+    #: Robot name, used in the served metadata and in preset names.
     name: str
-    #: ``(view slot, wire key)`` pairs in model slot order. The slot name is
-    #: documentation and validation; only the wire key goes on the network.
-    slots: Tuple[Tuple[str, str], ...]
-    #: Wire key of the proprioceptive state vector.
-    state_key: str
-    #: Wire key of the task instruction.
-    prompt_key: str = "prompt"
+    #: Cameras this body carries; must equal the checkpoint's ``num_views``.
+    num_cameras: int
     #: Deployable action width. ``None`` keeps the model's full vector — correct
     #: when a robot output step does the truncation itself (G1's 32→16 encode).
     action_dim: Optional[int] = None
-    #: Optional policy override for state string encoding. ``None`` leaves the
-    #: choice to the checkpoint's concrete policy; state representation is a
-    #: model semantic, not solely an embodiment property.
-    discrete_state: Optional[bool] = None
+    #: Width of this body's state vector, i.e. how wide ``norm_stats["state"]``
+    #: has to be. A fact about the hardware, so it does not follow
+    #: :attr:`action_dim`: a robot's state and action spaces need not match
+    #: (Franka under LIBERO has 8-dim state and a 7-dim EEF-delta action).
+    #: ``None`` means this body makes no claim and the check is skipped.
+    state_dim: Optional[int] = None
+    #: Width of this body's action vector, i.e. how wide ``norm_stats["actions"]``
+    #: has to be. Distinct from :attr:`action_dim`, which is a *loading* knob
+    #: saying what to trim the model down to: the G1 declares ``action_dim=None``
+    #: because ``UnitreeG1EncodeActions`` owns the truncation, but its actions are
+    #: still 16 wide and its statistics must be. ``None`` skips the check.
+    action_width: Optional[int] = None
     #: Factory that loads the checkpoint and wires this robot's pre/post steps.
     builder: Callable[..., Policy] = _build_generic
-    #: One-line description for ``--help`` and the served metadata.
-    summary: str = ""
     #: Extra keyword arguments the builder always receives.
     builder_kwargs: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.slots:
-            raise ValueError(f"RobotPreset {self.name!r}: at least one camera slot is required")
-        if len(self.slots) > len(VIEW_SLOTS):
+        if not 1 <= self.num_cameras <= len(VIEW_SLOTS):
             raise ValueError(
-                f"RobotPreset {self.name!r}: {len(self.slots)} slots exceeds pi05's "
-                f"{len(VIEW_SLOTS)} view slots {VIEW_SLOTS}"
+                f"Embodiment {self.name!r}: num_cameras={self.num_cameras} is outside "
+                f"1..{len(VIEW_SLOTS)}, the view slots {VIEW_SLOTS} a checkpoint fills"
             )
-        expected = VIEW_SLOTS[: len(self.slots)]
-        declared = tuple(slot for slot, _ in self.slots)
-        if declared != expected:
+        if (
+            self.action_dim is not None
+            and self.action_width is not None
+            and self.action_dim > self.action_width
+        ):
+            # Trimming is a slice of the statistics, so it cannot ask for more
+            # columns than the body's actions have. Getting this pair backwards
+            # would make the preflight check the wrong width and pass a
+            # checkpoint that the unnormalizer then fails on, mid-serve.
             raise ValueError(
-                f"RobotPreset {self.name!r}: slots must be a prefix of {VIEW_SLOTS} in "
-                f"order (a checkpoint fills view slots from 0 up), got {declared}"
+                f"Embodiment {self.name!r}: action_dim={self.action_dim} trims wider "
+                f"than action_width={self.action_width}, but action_width is how many "
+                "columns this body's actions (and its norm_stats) have"
             )
-        wire = [key for _, key in self.slots]
-        if len(set(wire)) != len(wire):
-            raise ValueError(f"RobotPreset {self.name!r}: duplicate camera wire keys {wire}")
+
+    @property
+    def has_robot_steps(self) -> bool:
+        """Whether this body adds robot-specific pre/post processing."""
+        return self.builder is not _build_generic
+
+
+@dataclass(frozen=True)
+class RobotPreset:
+    """A validated, deployable pairing of an embodiment and wire convention."""
+
+    #: Registry name, used as ``--robot <name>``. Spelled ``<arm>_<convention>``
+    #: when the arm is shared, bare when the body owns its convention.
+    name: str
+    #: The body being served.
+    embodiment: Embodiment
+    #: The key convention its client speaks.
+    convention: Convention
+    #: One-line description for ``--help`` and the served metadata.
+    summary: str = ""
+
+    def __post_init__(self) -> None:
+        if self.convention.num_cameras != self.embodiment.num_cameras:
+            raise ValueError(
+                f"RobotPreset {self.name!r}: convention {self.convention.name!r} names "
+                f"{self.convention.num_cameras} cameras but embodiment "
+                f"{self.embodiment.name!r} has {self.embodiment.num_cameras}; a "
+                "convention can only be paired with a body it was recorded on"
+            )
+
+    # Flat accessors expose the combined serving contract.
 
     @property
     def image_keys(self) -> Tuple[str, ...]:
         """Camera wire keys in model slot order — what ``ImageStack`` consumes."""
-        return tuple(key for _, key in self.slots)
+        return self.convention.image_keys
+
+    @property
+    def state_key(self) -> str:
+        return self.convention.state_key
+
+    @property
+    def prompt_key(self) -> str:
+        return self.convention.prompt_key
+
+    @property
+    def discrete_state(self) -> Optional[bool]:
+        return self.convention.discrete_state
+
+    @property
+    def slots(self) -> Tuple[Tuple[str, str], ...]:
+        """``(view slot, wire key)`` pairs in model slot order."""
+        return self.convention.slots
+
+    @property
+    def action_dim(self) -> Optional[int]:
+        return self.embodiment.action_dim
+
+    @property
+    def state_dim(self) -> Optional[int]:
+        return self.embodiment.state_dim
+
+    @property
+    def action_width(self) -> Optional[int]:
+        return self.embodiment.action_width
+
+    @property
+    def builder(self) -> Callable[..., Policy]:
+        return self.embodiment.builder
+
+    @property
+    def builder_kwargs(self) -> Mapping[str, Any]:
+        return self.embodiment.builder_kwargs
 
     @property
     def num_views(self) -> int:
         """Cameras this preset sends; must equal the checkpoint's ``num_views``."""
-        return len(self.slots)
+        return self.embodiment.num_cameras
+
+    @property
+    def has_robot_steps(self) -> bool:
+        """Whether this preset wires robot-specific pre/post steps."""
+        return self.embodiment.has_robot_steps
+
+    def synthetic_gaps(
+        self, *, discrete_state: bool, served_action_dim: int
+    ) -> Tuple[str, ...]:
+        """Describe preset behavior unavailable to a random-weight server."""
+        gaps = []
+        if discrete_state:
+            gaps.append(
+                "discrete_state=True — the synthetic tokenizer ignores state, so the "
+                "served metadata says discrete_state=False"
+            )
+        if self.has_robot_steps:
+            gap = (
+                f"its robot pre/post steps — {self.builder.__name__} never runs, so no "
+                "state decode, delta->absolute or action re-encode is wired"
+            )
+            if self.action_dim is None:
+                # action_dim=None means an output step owns the truncation (G1's
+                # 32->16 encode). Without that step the full model vector ships.
+                gap += (
+                    f"; the served action_dim is the model's full {served_action_dim}, "
+                    "not the width that skipped step would emit"
+                )
+            gaps.append(gap)
+        return tuple(gaps)
 
     def describe(self) -> str:
         """Human-readable slot→wire-key mapping, for ``--help`` and startup logs."""
@@ -128,44 +200,51 @@ class RobotPreset:
         return f"{self.name}: {rendered}; state={self.state_key}"
 
 
-#: Franka Panda under LIBERO's key convention (the 7-DoF sim benchmark):
-#: 2 cameras, 7-dim action. Mirrors openpi ``LiberoInputs``. State encoding is
-#: checkpoint-specific: PI0.5 drops it by default, while WallOSS discretizes it.
+#: --- bodies -----------------------------------------------------------------
+
+#: Franka Emika Panda under LIBERO: 2 cameras, 8 state values, 7 actions.
+FRANKA = Embodiment(name="franka", num_cameras=2, action_dim=7, state_dim=8, action_width=7)
+
+#: Unitree G1: 3 cameras and 16 state/action values. The encode step owns output
+#: selection, so ``action_dim`` remains ``None`` while ``action_width`` is 16.
+UNITREE_G1_BODY = Embodiment(
+    name="unitree_g1",
+    num_cameras=3,
+    action_dim=None,
+    state_dim=G1_ROBOT_DIM,
+    action_width=G1_ROBOT_DIM,
+    builder=build_unitree_g1_policy,
+    builder_kwargs={
+        "use_delta_joint_actions": True,
+        "adapt_to_pi": True,
+        # Match OpenPI's float64 normalization. State values near a discretization
+        # bin edge can otherwise produce different token ids.
+        "norm_dtype": "float64",
+    },
+)
+
+#: --- deployable pairings -----------------------------------------------------
+
+#: Franka Panda under LIBERO's keys: 2 cameras, 7-dim action.
 FRANKA_LIBERO = RobotPreset(
     name="franka_libero",
-    slots=(
-        ("base_0_rgb", "observation/image"),
-        ("left_wrist_0_rgb", "observation/wrist_image"),
-    ),
-    state_key="observation/state",
-    action_dim=7,
-    discrete_state=None,
+    embodiment=FRANKA,
+    convention=conventions.LIBERO,
     summary="Franka Panda, LIBERO keys: 2 cameras, 7-dim action (6 EEF deltas + gripper)",
 )
 
-#: Unitree G1 (humanoid, dual-arm + 2 dexterous hands): 3 cameras, 16-dim action.
-#: Mirrors the ``pi05_UnitreeG1`` fine-tune's ``unitreeG1Inputs``/``Outputs``: the
-#: client sends the nested ``obs["images"][...]`` layout and a flat ``"state"``.
-#: ``action_dim`` stays ``None`` because ``UnitreeG1EncodeActions`` does the 32→16
-#: truncation after delta→absolute has seen the full-width action.
+#: Unitree G1 under its native wire convention.
 UNITREE_G1 = RobotPreset(
     name="unitree_g1",
-    slots=tuple(zip(VIEW_SLOTS, G1_CAMERAS)),
-    state_key=G1_STATE_KEY,
-    action_dim=None,
-    discrete_state=True,
-    builder=build_unitree_g1_policy,
+    embodiment=UNITREE_G1_BODY,
+    convention=conventions.UNITREE_G1,
     summary="Unitree G1: 3 cameras, 16-DoF state, delta joint actions, 32->16 encode",
-    builder_kwargs={"use_delta_joint_actions": True, "adapt_to_pi": True},
 )
 
-#: Name -> preset. Add an embodiment here once its steps and factory exist; that
-#: is the whole registration step (openpi's ``training/config.py`` equivalent).
+#: Canonical preset registry; external packages use :func:`register_robot_preset`.
 ROBOT_PRESETS: Dict[str, RobotPreset] = {p.name: p for p in (FRANKA_LIBERO, UNITREE_G1)}
 
-#: Accepted spellings that are not canonical names. ``libero`` names a benchmark
-#: rather than a robot, but it is what the deployed launch commands and docs say,
-#: so it keeps resolving instead of failing a running deployment on a rename.
+#: Accepted non-canonical preset names.
 ROBOT_ALIASES: Dict[str, str] = {"libero": "franka_libero"}
 
 
@@ -185,6 +264,49 @@ def get_robot_preset(name: str) -> RobotPreset:
             f"unknown robot preset {name!r}; known: {list(available_robots())}"
             f" (aliases: {list(ROBOT_ALIASES)})"
         ) from None
+
+
+def register_robot_preset(
+    preset: RobotPreset,
+    *,
+    aliases: Iterable[str] = (),
+    replace: bool = False,
+) -> RobotPreset:
+    """Register and return ``preset`` for use at module scope.
+
+    External packages can register during import::
+
+        MY_ROBOT = register_robot_preset(
+            RobotPreset(name="myarm_mydataset", embodiment=MY_ARM, convention=MY_KEYS),
+            aliases=("myarm",),
+        )
+
+    Re-registering needs ``replace=True``; aliases cannot shadow canonical names.
+    Registration is process-local.
+    """
+    if not isinstance(preset, RobotPreset):
+        raise TypeError(f"expected a RobotPreset, got {type(preset).__name__}")
+    existing = ROBOT_PRESETS.get(preset.name)
+    if existing is not None and not replace:
+        raise ValueError(
+            f"robot preset {preset.name!r} is already registered ({existing.describe()}); "
+            "pass replace=True to override it"
+        )
+    for alias in aliases:
+        if alias in ROBOT_PRESETS:
+            raise ValueError(
+                f"alias {alias!r} for {preset.name!r} is already a canonical preset name; "
+                "an alias that shadows a real preset would silently redirect --robot"
+            )
+        target = ROBOT_ALIASES.get(alias)
+        if target is not None and target != preset.name and not replace:
+            raise ValueError(
+                f"alias {alias!r} already resolves to {target!r}; pass replace=True to move it"
+            )
+    ROBOT_PRESETS[preset.name] = preset
+    for alias in aliases:
+        ROBOT_ALIASES[alias] = preset.name
+    return preset
 
 
 def build_robot_policy(
@@ -207,8 +329,11 @@ def build_robot_policy(
     an installed robot stack without editing the preset or touching the client.
 
     The resulting wire contract is published in the policy ``metadata``
-    (``robot`` / ``image_keys`` / ``state_key`` / ``discrete_state``), which the
-    server pushes on connect, so a client can assert it rather than guess.
+    (``robot`` / ``robot_steps`` / ``image_keys`` / ``state_key`` /
+    ``discrete_state``), which the server pushes on connect, so a client can
+    assert it rather than guess. ``robot_steps`` says whether this robot's
+    pre/post steps are actually wired, so a server that serves the preset's keys
+    without its arithmetic cannot pass for the real thing.
     """
     preset = get_robot_preset(robot)
     keys = tuple(image_keys) if image_keys is not None else preset.image_keys
@@ -223,7 +348,9 @@ def build_robot_policy(
         "action_dim": width,
         "metadata": {
             "robot": preset.name,
+            "robot_steps": preset.has_robot_steps,
             "robot_slots": [list(pair) for pair in zip(VIEW_SLOTS, keys)],
+            "state_dim": preset.state_dim,
             **(dict(metadata) if metadata else {}),
         },
         **dict(preset.builder_kwargs),

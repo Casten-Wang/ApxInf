@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Functional smoke test for the Unitree G1 pi05 adapter.
+"""Functional smoke test for the Unitree G1 policy adapter.
 
-Runs the integrator's ``pi05_UnitreeG1`` serving config through our interface: a
-G1-style observation (3 cameras ``cam_high`` / ``cam_left_wrist`` /
+A G1-style observation (3 cameras ``cam_high`` / ``cam_left_wrist`` /
 ``cam_right_wrist``, 16-DoF state, a prompt) is fed to a
 :func:`~apxinf.robots.build_unitree_g1_policy` policy and must come back
 as a ``[action_horizon, 16]`` action chunk — exercising every adapter step
@@ -12,7 +11,7 @@ Since we hold no G1 checkpoint/norm_stats, this validates **plumbing and shape**
 on a stand-in pi05 checkpoint: the action unnormalizer is a full-model-width
 identity, so values are not G1-calibrated (that needs the integrator's gripper
 limits + the G1 weights). It proves the config runs end-to-end through the
-interface, which is the compatibility question.
+adapter.
 """
 
 from __future__ import annotations
@@ -29,9 +28,8 @@ if _APXINF_PKG.is_dir() and str(_APXINF_PKG) not in sys.path:
     sys.path.insert(0, str(_APXINF_PKG))
 
 from apxinf import build_unitree_g1_policy  # noqa: E402
+from apxinf.conventions import UNITREE_G1 as G1_KEYS  # noqa: E402
 from apxinf.processors import Unnormalizer  # noqa: E402
-from apxinf.processors.transforms import Unnormalize  # noqa: E402
-from apxinf.robots.unitree_g1 import G1_CAMERAS, G1_STATE_KEY  # noqa: E402
 
 
 def parse_args():
@@ -47,20 +45,17 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Full-model-width identity unnormalizer: [50,32] passes through unchanged so
-    # the 32->16 robot truncation and delta->absolute run on the raw model output.
-    identity = None  # built after we know the model width
-
-    # Build once to learn the model width, then rebuild with a matching identity.
-    # (Cheap: model load dominates; we load a single time by peeking metadata.)
+    # Load the handle first so the identity unnormalizer can be built at the
+    # model's own width: [50,32] then passes through unchanged, so delta->absolute
+    # and the 32->16 robot truncation run on the raw model output.
     import apxinf_py
 
     model = apxinf_py.Model.load(
         "pi05", str(args.model_dir / "model.safetensors"), device=args.device, precision=args.precision
     )
     width = model.action_dim
-    identity = Unnormalize(
-        Unnormalizer(mean=np.zeros(width, np.float32), std=np.ones(width, np.float32), mode="mean_std")
+    identity = Unnormalizer(
+        mean=np.zeros(width, np.float32), std=np.ones(width, np.float32), mode="mean_std"
     )
 
     policy = build_unitree_g1_policy(
@@ -68,8 +63,9 @@ def main():
         model=model,  # reuse the already-loaded handle
         use_delta_joint_actions=True,
         adapt_to_pi=True,
-        state_key=G1_STATE_KEY,
-        unnormalizer=identity,
+        state_key=G1_KEYS.state_key,
+        image_keys=G1_KEYS.image_keys,
+        unnormalizer=identity,  # injected into the model's own unnormalize step
         precision=args.precision,
         device=args.device,
         metadata={"config": "pi05_UnitreeG1_groundwire", "note": "stand-in ckpt, shape-only"},
@@ -90,13 +86,13 @@ def main():
     # level under "images", state flat. The policy's image_keys are the paths
     # ("images/cam_high"), which lookup_key walks into this dict.
     groups: dict = {}
-    for key in G1_CAMERAS:
+    for key in G1_KEYS.image_keys:
         group, _, camera = key.partition("/")
         assert camera, f"expected a nested camera path, got {key!r}"
         groups.setdefault(group, {})[camera] = cam()
     observation = dict(groups)
-    observation[G1_STATE_KEY] = rng.standard_normal(16).astype(np.float32)
-    observation["prompt"] = args.prompt
+    observation[G1_KEYS.state_key] = rng.standard_normal(16).astype(np.float32)
+    observation[G1_KEYS.prompt_key] = args.prompt
 
     out = policy.infer(observation)
     actions = np.asarray(out["actions"])

@@ -1,6 +1,6 @@
 """ApxInf Python frontend.
 
-Three layers, kept deliberately decoupled:
+Public modules:
 
 * :mod:`apxinf.processors` — pure-numpy pre/post-processing *steps* (resize,
   tokenize, normalize, noise) plus a :class:`~apxinf.processors.Pipeline`
@@ -15,10 +15,16 @@ Three layers, kept deliberately decoupled:
   :class:`~apxinf.policies.auto.AutoPolicy` dispatches a checkpoint to its concrete
   policy by ``config.json`` model type; :class:`~apxinf.policies.base.Policy` is
   the structural contract they all satisfy.
+* :mod:`apxinf.conventions` — dataset **recording dialects**: the camera and
+  state wire keys a client sends, and whether state was recorded into the prompt.
+  A dialect is a property of the data, not of the arm or the weights, so it
+  depends on neither and both can change under it.
 * **robots** — the assembly layer (:mod:`apxinf.robots`). A ``build_*`` factory
-  binds one robot to a model policy by wiring its
-  :mod:`apxinf.processors.robots` steps into the policy pipelines. Depends
-  downward on both ``policies`` and ``processors``; neither depends back.
+  binds one robot to a model policy by wrapping its
+  :mod:`apxinf.processors.robots` steps *around* the policy's own chain, through
+  :class:`~apxinf.policies.base.ComposablePolicy`. A
+  :class:`~apxinf.robots.presets.RobotPreset` pairs one body with one convention
+  and is the only deployable unit.
 * **bindings** — :class:`Model` re-exports the ``apxinf_py`` PyO3 handle (L1
   bare-model inference; an internal L0 patches path exists but is private). It is
   the single public surface; you never import ``apxinf_py`` directly.
@@ -33,7 +39,7 @@ policy's ``from_pretrained`` pull in the ``apxinf_py`` binding.
 
 from __future__ import annotations
 
-from . import processors
+from . import conventions, processors
 from .calibration import (
     CalibrationContext,
     CalibrationPlan,
@@ -45,14 +51,29 @@ from .calibration import (
     QuantizedOperator,
     adapt_records,
 )
-from .policies import AutoPolicy, Gr00tPolicy, Pi05Policy, Policy, WallossPolicy
+from .conventions import (
+    Convention,
+    available_conventions,
+    get_convention,
+    register_convention,
+)
+from .policies import (
+    AutoPolicy,
+    ComposablePolicy,
+    Gr00tPolicy,
+    Pi05Policy,
+    Policy,
+    WallossPolicy,
+)
 from .robots import (
     ROBOT_PRESETS,
+    Embodiment,
     RobotPreset,
     available_robots,
     build_robot_policy,
     build_unitree_g1_policy,
     get_robot_preset,
+    register_robot_preset,
 )
 from .processors import (
     GaussianNoise,
@@ -67,8 +88,10 @@ from .processors import (
 
 __all__ = [
     "processors",
+    "conventions",
     # policy contract (outward); BareModel (inward) lives in apxinf.policies
     "Policy",
+    "ComposablePolicy",
     # L2 policies
     "Pi05Policy",
     "Gr00tPolicy",
@@ -86,11 +109,18 @@ __all__ = [
     "adapt_records",
     # robot adapters
     "build_unitree_g1_policy",
-    # robot presets (embodiment -> wire keys + pipelines), openpi's TrainConfig analogue
+    # dataset dialects (wire keys + state routing), independent of any body
+    "Convention",
+    "available_conventions",
+    "get_convention",
+    "register_convention",
+    # robot presets (body x convention -> wire contract), openpi's TrainConfig analogue
+    "Embodiment",
     "RobotPreset",
     "ROBOT_PRESETS",
     "available_robots",
     "get_robot_preset",
+    "register_robot_preset",
     "build_robot_policy",
     # bindings (lazy)
     "Model",

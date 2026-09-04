@@ -19,6 +19,7 @@ class Model:
         calibration: str | None = ...,
         tactics: str | None = ...,
         autotune: bool = ...,
+        config_json: str | None = ...,
         action_horizon: int | None = ...,
         num_views: int | None = ...,
         num_flow_steps: int | None = ...,
@@ -29,6 +30,8 @@ class Model:
 
         ``device`` is ``cuda:N`` (default) or ``cpu``.
         ``precision`` is ``auto`` (default), ``fp8``, ``bf16``, or ``int8``.
+        ``config_json`` supplies architecture JSON when it is stored outside the
+        checkpoint's ``config.json``. ``None`` leaves loading to AutoModel.
         ``action_horizon`` overrides the checkpoint's chunk length (a sequence
         length, not a weight dimension).
         ``num_views`` serves fewer cameras than the checkpoint declares (1..=its

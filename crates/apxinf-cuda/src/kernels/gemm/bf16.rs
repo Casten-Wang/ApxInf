@@ -170,8 +170,21 @@ fn launch_tactic_bf16(
                 output,
             )
             .map_err(Error::Cuda),
-        TacticBackend::CublasLt => unsafe {
+        TacticBackend::CublasLt | TacticBackend::CublasLtCustom => unsafe {
             ffi::check_cublas(ffi::apxinf_static_bf16_gemm(
+                activation.ptr(),
+                weight.ptr(),
+                output.ptr(),
+                key.m as i32,
+                key.n as i32,
+                key.k as i32,
+                1.0,
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)
+        },
+        TacticBackend::CublasLtCustomSplitSerial => unsafe {
+            ffi::check_cublas(ffi::apxinf_static_bf16_gemm_split(
                 activation.ptr(),
                 weight.ptr(),
                 output.ptr(),
@@ -191,6 +204,18 @@ fn launch_tactic_bf16(
 
 fn prepare_tactic_bf16(key: &GemmTuningKey, tactic: TacticId) -> Result<()> {
     super::providers::prepare(key, tactic)
+}
+
+fn resolve_bf16_plan(
+    ctx: &CudaContext,
+    key: &GemmTuningKey,
+    activation: &CudaBuffer,
+    weight: &CudaBuffer,
+) -> Result<super::PreparedGemmPlan> {
+    ctx.gemm_plans()
+        .resolve_or_tune(ctx, key, super::plan::default_bf16_tactic(), |preferred| {
+            autotune_request_bf16(ctx, key, activation, weight, preferred)
+        })
 }
 
 fn autotune_request_bf16(
@@ -234,14 +259,7 @@ fn autotune_request_bf16(
     let events = CudaEventPair::new()?;
     let mut evictor = ColdL2Evictor::new(ctx)?;
     let engine = AutoTuneEngine::new(AutoTuneConfig::default())?;
-    let candidates = super::providers::candidates(key, 64)
-        .into_iter()
-        .filter(|candidate| {
-            matches!(
-                candidate.tactic.backend,
-                TacticBackend::Vendor | TacticBackend::CublasLt
-            )
-        });
+    let candidates = super::providers::candidates(key, 64).into_iter();
     engine.tune_with_preferred(key, preferred, candidates, |candidate, config| {
         prepare_tactic_bf16(key, candidate.tactic)?;
         launch_tactic_bf16(ctx, key, activation, weight, &output, candidate.tactic)?;
@@ -386,12 +404,7 @@ pub fn gemm_bf16(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Res
     let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
     let weight = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
     let key = tuning_key(ctx, m, n, k);
-    let plan = ctx.gemm_plans().resolve_or_tune(
-        ctx,
-        &key,
-        super::plan::default_bf16_tactic(),
-        |preferred| autotune_request_bf16(ctx, &key, &activation, &weight, preferred),
-    )?;
+    let plan = resolve_bf16_plan(ctx, &key, &activation, &weight)?;
     let use_split_serial = plan.tactic.backend == TacticBackend::CublasLtCustomSplitSerial;
     let use_persisted_cublaslt = matches!(
         plan.tactic.backend,
@@ -456,9 +469,22 @@ pub fn gemm_bf16(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Res
     Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
 }
 
-/// Run the configured cuBLASLt BF16 gate + native SM100 CUTLASS up/GeGLU EVT.
-/// Returns `None` unless the exact physical record selects BF16 fused GeGLU;
-/// selected but unsupported records fail closed instead of falling back.
+fn geglu_tuning_key(ctx: &CudaContext, m: usize, full_n: usize, k: usize) -> GemmTuningKey {
+    let mut key = tuning_key(ctx, m, full_n, k);
+    key.epilogue = Epilogue::GeGlu;
+    key
+}
+
+const fn decomposed_geglu_tactic() -> TacticId {
+    TacticId {
+        backend: TacticBackend::GemmThenGeGlu,
+        value: 0,
+    }
+}
+
+/// Resolve and execute the complete BF16 gate/up projection plus GeGLU
+/// operator. The selected tactic may be fused or a prepared GEMM followed by
+/// the standalone activation kernel.
 pub fn gemm_bf16_geglu_fused(
     ctx: &CudaContext,
     activation: &Tensor,
@@ -466,7 +492,7 @@ pub fn gemm_bf16_geglu_fused(
     bf16_dual_geglu_interleaved: bool,
     bf16_dual_geglu_auto_interleaved: Option<&Tensor>,
     bf16_sm89_geglu_interleaved: Option<&Tensor>,
-) -> Result<Option<Tensor>> {
+) -> Result<Tensor> {
     if activation.dtype() != DType::BF16 || packed_weight.dtype() != DType::BF16 {
         return Err(Error::Other(format!(
             "BF16 fused GeGLU expects BF16 operands, got {} and {}",
@@ -492,294 +518,526 @@ pub fn gemm_bf16_geglu_fused(
             },
         });
     }
-    let (m, k, full_n) = (a[0], a[1], b[1]);
-    let key = tuning_key(ctx, m, full_n, k);
-    // Do not cache Bucket/Default from this optional fused probe. On an exact
-    // miss the caller falls back to the plain GEMM API, which must retain the
-    // opportunity to run AUTO_TUNE for this physical key.
-    let Some(exact_tactic) = ctx.tuning().lookup_gemm_exact(&key) else {
-        return Ok(None);
-    };
-    let fused_backend = matches!(
-        exact_tactic.backend,
-        TacticBackend::CublasLtCustomSplitGeGluCutlassBf16
-            | TacticBackend::CutlassBf16DualGeGluM522
-            | TacticBackend::CutlassBf16DualGeGluM533
-    );
-    if !fused_backend {
-        return Ok(None);
+    if let Some(weight) = bf16_dual_geglu_auto_interleaved {
+        super::validate_geglu_weight(
+            "BF16 dual GeGLU auto-interleaved weight",
+            weight,
+            DType::BF16,
+            b,
+            expected_device,
+        )?;
     }
+    if let Some(weight) = bf16_sm89_geglu_interleaved {
+        super::validate_geglu_weight(
+            "BF16 SM89 GeGLU interleaved weight",
+            weight,
+            DType::BF16,
+            b,
+            expected_device,
+        )?;
+    }
+    super::observe_bf16(activation, packed_weight)?;
+
+    let (m, k, full_n) = (a[0], a[1], b[1]);
+    let n = full_n / 2;
+    let activation_buffer = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+    let primary_weight = CudaBuffer::from_tensor(packed_weight).map_err(Error::Cuda)?;
+    let automatic_interleaved = bf16_dual_geglu_auto_interleaved
+        .map(CudaBuffer::from_tensor)
+        .transpose()
+        .map_err(Error::Cuda)?;
+    let sm89_interleaved = bf16_sm89_geglu_interleaved
+        .map(CudaBuffer::from_tensor)
+        .transpose()
+        .map_err(Error::Cuda)?;
+    let (plain_weight, dual_weight) = if bf16_dual_geglu_interleaved {
+        (None, Some(&primary_weight))
+    } else {
+        (Some(&primary_weight), automatic_interleaved.as_ref())
+    };
+
+    let key = geglu_tuning_key(ctx, m, full_n, k);
+    let plain_key = tuning_key(ctx, m, full_n, k);
+    // A cold GeGLU key may tune both the complete operator and its decomposed
+    // GEMM candidate. Resolve that dependency before the outer tuning session
+    // takes its non-reentrant lock.
+    let mut plain_plan = if ctx.tuning().lookup_gemm_exact(&key).is_none() {
+        plain_weight
+            .map(|weight| resolve_bf16_plan(ctx, &plain_key, &activation_buffer, weight))
+            .transpose()?
+    } else {
+        None
+    };
+    let default = default_bf16_geglu_tactic(
+        ctx,
+        &key,
+        plain_weight.is_some(),
+        dual_weight.is_some(),
+        sm89_interleaved.is_some(),
+    )?;
     let plan = ctx
         .gemm_plans()
-        .resolve(ctx, &key, super::plan::default_bf16_tactic())?;
-    let fused_tactic = (plan.source == super::plan::PlanSource::Exact).then_some(plan.tactic);
-    let bf16_split_evt = fused_tactic
-        .is_some_and(|tactic| tactic.backend == TacticBackend::CublasLtCustomSplitGeGluCutlassBf16);
-    let bf16_dual_geglu_expected_m = fused_tactic.and_then(|tactic| match tactic.backend {
-        TacticBackend::CutlassBf16DualGeGluM522 => Some(522),
-        TacticBackend::CutlassBf16DualGeGluM533 => Some(533),
-        _ => None,
-    });
-    let bf16_dual_geglu = bf16_dual_geglu_expected_m.is_some();
-    let weight_route = bf16_dual_geglu_weight_route(
-        bf16_dual_geglu_mode()?,
-        bf16_dual_geglu,
-        bf16_dual_geglu_interleaved,
-        bf16_dual_geglu_auto_interleaved.is_some(),
-    )?;
-    let selected_weight = match weight_route {
-        Bf16DualGeGluWeightRoute::Plain | Bf16DualGeGluWeightRoute::InterleavedPrimary => {
-            packed_weight
-        }
-        Bf16DualGeGluWeightRoute::InterleavedAuto => bf16_dual_geglu_auto_interleaved.unwrap(),
-    };
-    if selected_weight.dtype() != DType::BF16 || selected_weight.shape().dims() != b {
-        return Err(Error::Other(format!(
-            "BF16 dual GeGLU selected weight must be BF16 {b:?}, got {} {:?}",
-            selected_weight.dtype(),
-            selected_weight.shape().dims()
-        )));
+        .resolve_or_tune(ctx, &key, default, |preferred| {
+            autotune_request_bf16_geglu(
+                ctx,
+                &key,
+                &plain_key,
+                plain_plan.as_ref(),
+                &activation_buffer,
+                plain_weight,
+                dual_weight,
+                sm89_interleaved.as_ref(),
+                preferred,
+            )
+        })?;
+
+    if plan.tactic.backend == TacticBackend::GemmThenGeGlu && plain_plan.is_none() {
+        plain_plan = plain_weight
+            .map(|weight| resolve_bf16_plan(ctx, &plain_key, &activation_buffer, weight))
+            .transpose()?;
     }
-    if selected_weight.device() != expected_device {
-        return Err(Error::DeviceMismatch {
-            expected: expected_device,
-            got: selected_weight.device(),
+    let mut gate = if bf16_geglu_tactic_uses_gate(plan.tactic) {
+        Some(output_buffer(ctx, bf16_geglu_gate_bytes(m, full_n)?)?)
+    } else {
+        None
+    };
+    let output = output_buffer(
+        ctx,
+        m.checked_mul(n)
+            .and_then(|elements| elements.checked_mul(DType::BF16.size_in_bytes()))
+            .ok_or_else(|| Error::Other("BF16 GeGLU output size overflow".into()))?,
+    )?;
+    if crate::workspace::may_prepare_native_resources() {
+        prepare_bf16_geglu_tactic(&key, &plain_key, plain_plan.as_ref(), plan.tactic)?;
+    }
+    if let Err(error) = launch_bf16_geglu_tactic(
+        ctx,
+        &key,
+        plain_plan.as_ref(),
+        &activation_buffer,
+        plain_weight,
+        dual_weight,
+        sm89_interleaved.as_ref(),
+        gate.as_ref(),
+        &output,
+        plan.tactic,
+    ) {
+        if plan.tactic == default || plain_weight.is_none() {
+            return Err(error);
+        }
+        eprintln!(
+            "[apxinf] BF16 GeGLU tactic {:?} failed for {key:?}: {error}; using decomposed fallback",
+            plan.tactic
+        );
+        ctx.gemm_plans()
+            .fallback_to(ctx, &key, decomposed_geglu_tactic())?;
+        if plain_plan.is_none() {
+            plain_plan = plain_weight
+                .map(|weight| resolve_bf16_plan(ctx, &plain_key, &activation_buffer, weight))
+                .transpose()?;
+        }
+        if gate.is_none() {
+            gate = Some(output_buffer(ctx, bf16_geglu_gate_bytes(m, full_n)?)?);
+        }
+        prepare_bf16_geglu_tactic(
+            &key,
+            &plain_key,
+            plain_plan.as_ref(),
+            decomposed_geglu_tactic(),
+        )?;
+        launch_bf16_geglu_tactic(
+            ctx,
+            &key,
+            plain_plan.as_ref(),
+            &activation_buffer,
+            plain_weight,
+            dual_weight,
+            sm89_interleaved.as_ref(),
+            gate.as_ref(),
+            &output,
+            decomposed_geglu_tactic(),
+        )?;
+    }
+    Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
+}
+
+fn bf16_geglu_tactic_uses_gate(tactic: TacticId) -> bool {
+    matches!(
+        tactic.backend,
+        TacticBackend::GemmThenGeGlu | TacticBackend::CublasLtCustomSplitGeGluCutlassBf16
+    )
+}
+
+fn bf16_geglu_gate_bytes(m: usize, full_n: usize) -> Result<usize> {
+    m.checked_mul(full_n)
+        .and_then(|elements| elements.checked_mul(DType::BF16.size_in_bytes()))
+        .ok_or_else(|| Error::Other("BF16 GeGLU gate size overflow".into()))
+}
+
+fn default_bf16_geglu_tactic(
+    ctx: &CudaContext,
+    key: &GemmTuningKey,
+    has_plain_weight: bool,
+    has_dual_weight: bool,
+    has_sm89_weight: bool,
+) -> Result<TacticId> {
+    if has_plain_weight {
+        return Ok(decomposed_geglu_tactic());
+    }
+    if ctx.caps().sm == 110 && has_dual_weight {
+        let backend = match key.m {
+            522 => TacticBackend::CutlassBf16DualGeGluM522,
+            533 => TacticBackend::CutlassBf16DualGeGluM533,
+            _ => {
+                return Err(Error::Other(format!(
+                    "BF16 interleaved-only GeGLU has no implementation for {key:?}"
+                )))
+            }
+        };
+        return Ok(TacticId { backend, value: 0 });
+    }
+    if ctx.caps().sm == 89 && has_sm89_weight {
+        return Ok(TacticId {
+            backend: TacticBackend::CutlassBf16GeGluSm89,
+            value: 0,
         });
     }
-    if ctx.caps().sm == 89 && ((full_n, k) == (8192, 1024) || (full_n, k) == (32768, 2048)) {
-        let Some(sm89_weight) = bf16_sm89_geglu_interleaved else {
-            return Ok(None);
-        };
-        if sm89_weight.dtype() != DType::BF16 || sm89_weight.shape().dims() != b {
-            return Err(Error::Other(format!(
-                "BF16 SM89 GeGLU selected weight must be BF16 {b:?}, got {} {:?}",
-                sm89_weight.dtype(),
-                sm89_weight.shape().dims()
-            )));
+    Err(Error::Other(format!(
+        "BF16 GeGLU has no safe implementation for {key:?}"
+    )))
+}
+
+fn prepare_bf16_geglu_tactic(
+    key: &GemmTuningKey,
+    plain_key: &GemmTuningKey,
+    plain_plan: Option<&super::PreparedGemmPlan>,
+    tactic: TacticId,
+) -> Result<()> {
+    if tactic.backend == TacticBackend::GemmThenGeGlu {
+        let plan = plain_plan.ok_or_else(|| {
+            Error::Other("decomposed BF16 GeGLU has no plain-weight GEMM plan".into())
+        })?;
+        return super::providers::prepare(plain_key, plan.tactic);
+    }
+    super::providers::prepare(key, tactic)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_bf16_geglu_tactic(
+    ctx: &CudaContext,
+    key: &GemmTuningKey,
+    plain_plan: Option<&super::PreparedGemmPlan>,
+    activation: &CudaBuffer,
+    plain_weight: Option<&CudaBuffer>,
+    dual_weight: Option<&CudaBuffer>,
+    sm89_weight: Option<&CudaBuffer>,
+    gate: Option<&CudaBuffer>,
+    output: &CudaBuffer,
+    tactic: TacticId,
+) -> Result<()> {
+    let n = key.n / 2;
+    match tactic.backend {
+        TacticBackend::GemmThenGeGlu => {
+            let gate = gate
+                .ok_or_else(|| Error::Other("decomposed BF16 GeGLU has no gate buffer".into()))?;
+            let plain_plan = plain_plan.ok_or_else(|| {
+                Error::Other("decomposed BF16 GeGLU has no prepared GEMM plan".into())
+            })?;
+            let plain_weight = plain_weight.ok_or_else(|| {
+                Error::Other("decomposed BF16 GeGLU has no plain-layout weight".into())
+            })?;
+            launch_tactic_bf16(
+                ctx,
+                &plain_plan.key,
+                activation,
+                plain_weight,
+                gate,
+                plain_plan.tactic,
+            )?;
+            unsafe {
+                ffi::check_cuda(ffi::apxinf_static_geglu_bf16(
+                    gate.ptr(),
+                    output.ptr(),
+                    key.m as i32,
+                    n as i32,
+                    ctx.stream().handle(),
+                ))
+                .map_err(Error::Cuda)
+            }
         }
-        if sm89_weight.device() != expected_device {
-            return Err(Error::DeviceMismatch {
-                expected: expected_device,
-                got: sm89_weight.device(),
+        TacticBackend::CutlassBf16DualGeGluM522 | TacticBackend::CutlassBf16DualGeGluM533 => {
+            let expected_m = if tactic.backend == TacticBackend::CutlassBf16DualGeGluM522 {
+                522
+            } else {
+                533
+            };
+            validate_bf16_dual_geglu_shape(key.m, key.n, key.k, expected_m)?;
+            let weight = dual_weight.ok_or_else(|| {
+                Error::Other("BF16 dual-GEMM GeGLU has no interleaved weight".into())
+            })?;
+            #[cfg(apxinf_cutlass_gemm)]
+            {
+                let status = unsafe {
+                    ffi::apxinf_static_cutlass_bf16_dual_gemm_geglu(
+                        activation.ptr(),
+                        weight.ptr(),
+                        output.ptr(),
+                        key.m as i32,
+                        n as i32,
+                        key.k as i32,
+                        key.n as i32,
+                        ctx.stream().handle(),
+                    )
+                };
+                if status == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::Cuda(format!(
+                        "BF16 dual-GEMM GeGLU rejected [{},{},{}] ({status})",
+                        key.m, n, key.k
+                    )))
+                }
+            }
+            #[cfg(not(apxinf_cutlass_gemm))]
+            {
+                let _ = weight;
+                Err(Error::Other(
+                    "BF16 dual GeGLU requires the SM100-family CUTLASS build".into(),
+                ))
+            }
+        }
+        TacticBackend::CutlassBf16GeGluSm89 => {
+            let weight = sm89_weight
+                .ok_or_else(|| Error::Other("BF16 SM89 GeGLU has no interleaved weight".into()))?;
+            #[cfg(apxinf_cutlass_bf16_sm89)]
+            {
+                let status = unsafe {
+                    ffi::apxinf_static_cutlass_bf16_interleaved_geglu_sm89(
+                        activation.ptr(),
+                        weight.ptr(),
+                        output.ptr(),
+                        key.m as i32,
+                        n as i32,
+                        key.k as i32,
+                        key.n as i32,
+                        tactic.value,
+                        ctx.stream().handle(),
+                    )
+                };
+                if status == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::Cuda(format!(
+                        "BF16 SM89 GeGLU rejected [{},{},{}] ({status})",
+                        key.m, n, key.k
+                    )))
+                }
+            }
+            #[cfg(not(apxinf_cutlass_bf16_sm89))]
+            {
+                let _ = weight;
+                Err(Error::Other(
+                    "BF16 SM89 GeGLU requires the SM89 CUTLASS build".into(),
+                ))
+            }
+        }
+        TacticBackend::CublasLtCustomSplitGeGluCutlassBf16 => {
+            let gate =
+                gate.ok_or_else(|| Error::Other("split BF16 GeGLU has no gate buffer".into()))?;
+            let weight = plain_weight.ok_or_else(|| {
+                Error::Other("split BF16 GeGLU has no plain-layout weight".into())
+            })?;
+            if (key.m, key.n, key.k) != (789, 32768, 2048) {
+                return Err(Error::Other(format!(
+                    "split BF16 GeGLU tactic requires [789,2048] @ [2048,32768], got [{},{}] @ [{},{}]",
+                    key.m, key.k, key.k, key.n
+                )));
+            }
+            #[cfg(apxinf_cutlass_gemm)]
+            {
+                unsafe {
+                    ffi::check_cublas(ffi::apxinf_static_bf16_gemm_split_first(
+                        activation.ptr(),
+                        weight.ptr(),
+                        gate.ptr(),
+                        key.m as i32,
+                        key.n as i32,
+                        key.k as i32,
+                        1.0,
+                        ctx.stream().handle(),
+                    ))
+                    .map_err(Error::Cuda)?;
+                }
+                let status = unsafe {
+                    ffi::apxinf_static_cutlass_bf16_gemm_geglu(
+                        activation.ptr(),
+                        weight.ptr(),
+                        gate.ptr(),
+                        output.ptr(),
+                        key.m as i32,
+                        n as i32,
+                        key.k as i32,
+                        key.n as i32,
+                        0,
+                        ctx.stream().handle(),
+                    )
+                };
+                if status == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::Cuda(format!(
+                        "split BF16 GeGLU tactic {:?} rejected {:?} ({status})",
+                        tactic, key
+                    )))
+                }
+            }
+            #[cfg(not(apxinf_cutlass_gemm))]
+            {
+                let _ = weight;
+                Err(Error::Other(
+                    "split BF16 GeGLU requires the SM100-family CUTLASS build".into(),
+                ))
+            }
+        }
+        _ => Err(Error::Other(format!(
+            "BF16 GeGLU online autotune cannot execute {tactic:?}"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn autotune_request_bf16_geglu(
+    ctx: &CudaContext,
+    key: &GemmTuningKey,
+    plain_key: &GemmTuningKey,
+    plain_plan: Option<&super::PreparedGemmPlan>,
+    activation: &CudaBuffer,
+    plain_weight: Option<&CudaBuffer>,
+    dual_weight: Option<&CudaBuffer>,
+    sm89_weight: Option<&CudaBuffer>,
+    preferred: Option<TacticId>,
+) -> Result<TuningOutcome> {
+    let output_elements = key
+        .m
+        .checked_mul(key.n / 2)
+        .ok_or_else(|| Error::Other("BF16 GeGLU autotune output size overflow".into()))?;
+    let gate = CudaBuffer::alloc_zeros(
+        key.m
+            .checked_mul(key.n)
+            .and_then(|elements| elements.checked_mul(DType::BF16.size_in_bytes()))
+            .ok_or_else(|| Error::Other("BF16 GeGLU autotune gate size overflow".into()))?,
+        ctx.device_id(),
+    )
+    .map_err(Error::Cuda)?;
+    let bytes = output_elements
+        .checked_mul(DType::BF16.size_in_bytes())
+        .ok_or_else(|| Error::Other("BF16 GeGLU autotune output size overflow".into()))?;
+    let reference_output = CudaBuffer::alloc_zeros(bytes, ctx.device_id()).map_err(Error::Cuda)?;
+    let candidate_output = CudaBuffer::alloc_zeros(bytes, ctx.device_id()).map_err(Error::Cuda)?;
+    let reference_tactic = default_bf16_geglu_tactic(
+        ctx,
+        key,
+        plain_plan.is_some() && plain_weight.is_some(),
+        dual_weight.is_some(),
+        sm89_weight.is_some(),
+    )?;
+    prepare_bf16_geglu_tactic(key, plain_key, plain_plan, reference_tactic)?;
+    launch_bf16_geglu_tactic(
+        ctx,
+        key,
+        plain_plan,
+        activation,
+        plain_weight,
+        dual_weight,
+        sm89_weight,
+        Some(&gate),
+        &reference_output,
+        reference_tactic,
+    )?;
+    ctx.synchronize().map_err(Error::Cuda)?;
+    let reference = copy_bf16_output(&reference_output, output_elements)?;
+
+    let candidates = super::providers::geglu_candidates(key)
+        .into_iter()
+        .filter(|candidate| {
+            candidate.tactic.backend != TacticBackend::GemmThenGeGlu
+                || (plain_plan.is_some() && plain_weight.is_some())
+        })
+        .filter(|candidate| {
+            !matches!(
+                candidate.tactic.backend,
+                TacticBackend::CutlassBf16DualGeGluM522 | TacticBackend::CutlassBf16DualGeGluM533
+            ) || dual_weight.is_some()
+        })
+        .filter(|candidate| {
+            candidate.tactic.backend != TacticBackend::CutlassBf16GeGluSm89 || sm89_weight.is_some()
+        });
+    let events = CudaEventPair::new()?;
+    let mut evictor = ColdL2Evictor::new(ctx)?;
+    let engine = AutoTuneEngine::new(AutoTuneConfig::default())?;
+    engine.tune_with_preferred(key, preferred, candidates, |candidate, config| {
+        prepare_bf16_geglu_tactic(key, plain_key, plain_plan, candidate.tactic)?;
+        launch_bf16_geglu_tactic(
+            ctx,
+            key,
+            plain_plan,
+            activation,
+            plain_weight,
+            dual_weight,
+            sm89_weight,
+            Some(&gate),
+            &candidate_output,
+            candidate.tactic,
+        )?;
+        ctx.synchronize().map_err(Error::Cuda)?;
+        let actual = copy_bf16_output(&candidate_output, output_elements)?;
+        let correct = crate::tuning::outputs_are_close(&reference, &actual, 0.01, 0.9999);
+        if !correct {
+            return Ok(CandidateMeasurement {
+                tactic: candidate.tactic,
+                milliseconds: None,
+                correct: false,
             });
         }
-
-        #[cfg(not(apxinf_cutlass_bf16_sm89))]
-        return Err(Error::Other(
-            "BF16 SM89 fused GeGLU requires the SM89 CUTLASS adapter build".into(),
-        ));
-
-        #[cfg(apxinf_cutlass_bf16_sm89)]
-        {
-            super::observe_bf16(activation, packed_weight)?;
-            let n = full_n / 2;
-            let output = output_buffer(
+        for _ in 0..config.warmup_iterations {
+            evictor.evict(ctx)?;
+            launch_bf16_geglu_tactic(
                 ctx,
-                m.checked_mul(n)
-                    .and_then(|elements| elements.checked_mul(DType::BF16.size_in_bytes()))
-                    .ok_or_else(|| {
-                        Error::Other("BF16 SM89 fused GeGLU output size overflow".into())
-                    })?,
+                key,
+                plain_plan,
+                activation,
+                plain_weight,
+                dual_weight,
+                sm89_weight,
+                Some(&gate),
+                &candidate_output,
+                candidate.tactic,
             )?;
-            let activation_buffer = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
-            let weight_buffer = CudaBuffer::from_tensor(sm89_weight).map_err(Error::Cuda)?;
-            let status = unsafe {
-                ffi::apxinf_static_cutlass_bf16_interleaved_geglu_sm89(
-                    activation_buffer.ptr(),
-                    weight_buffer.ptr(),
-                    output.ptr(),
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    full_n as i32,
-                    0,
-                    ctx.stream().handle(),
+        }
+        ctx.synchronize().map_err(Error::Cuda)?;
+        let mut milliseconds = 0.0;
+        for _ in 0..config.benchmark_iterations {
+            milliseconds += events.measure(ctx, &mut evictor, || {
+                launch_bf16_geglu_tactic(
+                    ctx,
+                    key,
+                    plain_plan,
+                    activation,
+                    plain_weight,
+                    dual_weight,
+                    sm89_weight,
+                    Some(&gate),
+                    &candidate_output,
+                    candidate.tactic,
                 )
-            };
-            if status != 0 {
-                return Err(Error::Cuda(format!(
-                    "BF16 SM89 interleaved GeGLU rejected [{m},{n},{k}] ({status})"
-                )));
-            }
-            return Ok(Some(
-                output.into_tensor(Shape::new(vec![m, n]), DType::BF16),
-            ));
+            })?;
         }
-    }
-
-    if !bf16_split_evt && !bf16_dual_geglu {
-        return Ok(None);
-    }
-    if let Some(expected_m) = bf16_dual_geglu_expected_m {
-        validate_bf16_dual_geglu_shape(m, full_n, k, expected_m)?;
-        #[cfg(not(apxinf_cutlass_gemm))]
-        return Err(Error::Other(
-            "BF16 dual GeGLU requires the SM100-family CUTLASS build".into(),
-        ));
-        #[cfg(apxinf_cutlass_gemm)]
-        {
-            super::observe_bf16(activation, packed_weight)?;
-            let n = full_n / 2;
-            let output = output_buffer(
-                ctx,
-                m.checked_mul(n)
-                    .and_then(|elements| elements.checked_mul(DType::BF16.size_in_bytes()))
-                    .ok_or_else(|| Error::Other("BF16 dual GeGLU output size overflow".into()))?,
-            )?;
-            let activation_buffer = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
-            let weight_buffer = CudaBuffer::from_tensor(selected_weight).map_err(Error::Cuda)?;
-            let status = unsafe {
-                ffi::apxinf_static_cutlass_bf16_dual_gemm_geglu(
-                    activation_buffer.ptr(),
-                    weight_buffer.ptr(),
-                    output.ptr(),
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    full_n as i32,
-                    ctx.stream().handle(),
-                )
-            };
-            if status != 0 {
-                return Err(Error::Cuda(format!(
-                    "BF16 dual-GEMM GeGLU rejected [{m},{n},{k}] ({status})"
-                )));
-            }
-            return Ok(Some(
-                output.into_tensor(Shape::new(vec![m, n]), DType::BF16),
-            ));
-        }
-    }
-    if (m, full_n, k) != (789, 32768, 2048) {
-        return Err(Error::Other(format!(
-            "fused BF16 GeGLU is tuned only for [789,2048] @ [2048,32768], got [{m},{k}] @ [{k},{full_n}]"
-        )));
-    }
-
-    #[cfg(not(apxinf_cutlass_gemm))]
-    {
-        let _ = ctx;
-        return Err(Error::Other(
-            "BF16 fused GeGLU requires the SM100-family CUTLASS build".into(),
-        ));
-    }
-
-    #[cfg(apxinf_cutlass_gemm)]
-    {
-        super::observe_bf16(activation, packed_weight)?;
-        let n = full_n / 2;
-        let gate = output_buffer(
-            ctx,
-            m.checked_mul(full_n)
-                .and_then(|elements| elements.checked_mul(DType::BF16.size_in_bytes()))
-                .ok_or_else(|| Error::Other("BF16 fused GeGLU gate size overflow".into()))?,
-        )?;
-        let output = output_buffer(
-            ctx,
-            m.checked_mul(n)
-                .and_then(|elements| elements.checked_mul(DType::BF16.size_in_bytes()))
-                .ok_or_else(|| Error::Other("BF16 fused GeGLU output size overflow".into()))?,
-        )?;
-        let activation_buffer = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
-        let weight_buffer = CudaBuffer::from_tensor(selected_weight).map_err(Error::Cuda)?;
-        unsafe {
-            ffi::check_cublas(ffi::apxinf_static_bf16_gemm_split_first(
-                activation_buffer.ptr(),
-                weight_buffer.ptr(),
-                gate.ptr(),
-                m as i32,
-                full_n as i32,
-                k as i32,
-                1.0,
-                ctx.stream().handle(),
-            ))
-            .map_err(Error::Cuda)?;
-        }
-        // Tactic 0 is the bitwise-exact 128x256x64, c1x2, explicit-1SM winner
-        // selected by the five-run alternating direct comparison.
-        let cutlass_tactic = 0;
-        let status = unsafe {
-            ffi::apxinf_static_cutlass_bf16_gemm_geglu(
-                activation_buffer.ptr(),
-                weight_buffer.ptr(),
-                gate.ptr(),
-                output.ptr(),
-                m as i32,
-                n as i32,
-                k as i32,
-                full_n as i32,
-                cutlass_tactic,
-                ctx.stream().handle(),
-            )
-        };
-        if status != 0 {
-            return Err(Error::Cuda(format!(
-                "BF16 fused GeGLU CUTLASS fused GeGLU rejected [{m},{n},{k}] ({status})"
-            )));
-        }
-        Ok(Some(
-            output.into_tensor(Shape::new(vec![m, n]), DType::BF16),
-        ))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Bf16DualGeGluMode {
-    Auto,
-    Off,
-    On,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Bf16DualGeGluWeightRoute {
-    Plain,
-    InterleavedPrimary,
-    InterleavedAuto,
-}
-
-fn parse_bf16_dual_geglu_mode(value: Option<&str>) -> Result<Bf16DualGeGluMode> {
-    match value {
-        None | Some("auto") => Ok(Bf16DualGeGluMode::Auto),
-        Some("0" | "off") => Ok(Bf16DualGeGluMode::Off),
-        Some("1" | "on") => Ok(Bf16DualGeGluMode::On),
-        Some(value) => Err(Error::Other(format!(
-            "APXINF_PI05_BF16_DUAL_GEGLU must be auto, 0/off, or 1/on; got {value}"
-        ))),
-    }
-}
-
-fn bf16_dual_geglu_mode() -> Result<Bf16DualGeGluMode> {
-    const NAME: &str = "APXINF_PI05_BF16_DUAL_GEGLU";
-    match std::env::var(NAME) {
-        Err(std::env::VarError::NotPresent) => parse_bf16_dual_geglu_mode(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            Err(Error::Other(format!("{NAME} must be valid Unicode")))
-        }
-        Ok(value) => parse_bf16_dual_geglu_mode(Some(&value)),
-    }
-}
-
-fn bf16_dual_geglu_weight_route(
-    mode: Bf16DualGeGluMode,
-    dual: bool,
-    primary_interleaved: bool,
-    auto_interleaved_available: bool,
-) -> Result<Bf16DualGeGluWeightRoute> {
-    match (
-        mode,
-        dual,
-        primary_interleaved,
-        auto_interleaved_available,
-    ) {
-        (Bf16DualGeGluMode::Off, false, false, false) => Ok(Bf16DualGeGluWeightRoute::Plain),
-        (Bf16DualGeGluMode::On, true, true, false) => Ok(Bf16DualGeGluWeightRoute::InterleavedPrimary),
-        (Bf16DualGeGluMode::Auto, false, false, false) => Ok(Bf16DualGeGluWeightRoute::Plain),
-        (Bf16DualGeGluMode::Auto, false, false, true) => Ok(Bf16DualGeGluWeightRoute::Plain),
-        (Bf16DualGeGluMode::Auto, true, false, true) => Ok(Bf16DualGeGluWeightRoute::InterleavedAuto),
-        _ => Err(Error::Other(format!(
-            "BF16 dual GeGLU config/layout mismatch: mode={mode:?}, backend_dual={dual}, primary_interleaved={primary_interleaved}, auto_interleaved={auto_interleaved_available}"
-        ))),
-    }
+        Ok(CandidateMeasurement {
+            tactic: candidate.tactic,
+            milliseconds: Some(milliseconds / config.benchmark_iterations as f64),
+            correct: true,
+        })
+    })
 }
 
 fn validate_bf16_dual_geglu_shape(
@@ -802,71 +1060,12 @@ mod bf16_dual_geglu_tests {
     use super::*;
 
     #[test]
-    fn bf16_dual_geglu_mode_parser_is_strict_and_defaults_auto() {
-        assert_eq!(
-            parse_bf16_dual_geglu_mode(None).unwrap(),
-            Bf16DualGeGluMode::Auto
-        );
-        assert_eq!(
-            parse_bf16_dual_geglu_mode(Some("auto")).unwrap(),
-            Bf16DualGeGluMode::Auto
-        );
-        assert_eq!(
-            parse_bf16_dual_geglu_mode(Some("0")).unwrap(),
-            Bf16DualGeGluMode::Off
-        );
-        assert_eq!(
-            parse_bf16_dual_geglu_mode(Some("off")).unwrap(),
-            Bf16DualGeGluMode::Off
-        );
-        assert_eq!(
-            parse_bf16_dual_geglu_mode(Some("1")).unwrap(),
-            Bf16DualGeGluMode::On
-        );
-        assert_eq!(
-            parse_bf16_dual_geglu_mode(Some("on")).unwrap(),
-            Bf16DualGeGluMode::On
-        );
-        assert!(parse_bf16_dual_geglu_mode(Some("invalid")).is_err());
-    }
-
-    #[test]
-    fn bf16_dual_geglu_route_truth_table_covers_all_twenty_four_states() {
-        for mode in [
-            Bf16DualGeGluMode::Auto,
-            Bf16DualGeGluMode::Off,
-            Bf16DualGeGluMode::On,
-        ] {
-            for dual in [false, true] {
-                for primary in [false, true] {
-                    for automatic in [false, true] {
-                        let expected = match (mode, dual, primary, automatic) {
-                            (Bf16DualGeGluMode::Off, false, false, false) => {
-                                Some(Bf16DualGeGluWeightRoute::Plain)
-                            }
-                            (Bf16DualGeGluMode::On, true, true, false) => {
-                                Some(Bf16DualGeGluWeightRoute::InterleavedPrimary)
-                            }
-                            (Bf16DualGeGluMode::Auto, false, false, false) => {
-                                Some(Bf16DualGeGluWeightRoute::Plain)
-                            }
-                            (Bf16DualGeGluMode::Auto, false, false, true) => {
-                                Some(Bf16DualGeGluWeightRoute::Plain)
-                            }
-                            (Bf16DualGeGluMode::Auto, true, false, true) => {
-                                Some(Bf16DualGeGluWeightRoute::InterleavedAuto)
-                            }
-                            _ => None,
-                        };
-                        let actual = bf16_dual_geglu_weight_route(mode, dual, primary, automatic);
-                        match expected {
-                            Some(route) => assert_eq!(actual.unwrap(), route),
-                            None => assert!(actual.is_err()),
-                        }
-                    }
-                }
-            }
-        }
+    fn dual_fused_tactic_does_not_require_gate_buffer() {
+        assert!(!bf16_geglu_tactic_uses_gate(TacticId {
+            backend: TacticBackend::CutlassBf16DualGeGluM522,
+            value: 0,
+        }));
+        assert!(bf16_geglu_tactic_uses_gate(decomposed_geglu_tactic()));
     }
 
     #[test]

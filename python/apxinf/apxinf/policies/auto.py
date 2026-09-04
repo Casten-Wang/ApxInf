@@ -1,8 +1,6 @@
-"""``AutoPolicy``: build the right concrete policy from a checkpoint.
+"""Build the registered concrete policy identified by a checkpoint layout.
 
-Mirrors the Rust ``AutoModel`` frontend at the Python policy layer. Read the
-checkpoint's ``config.json`` model type, look up the registered policy class, and
-defer to its ``from_pretrained``:
+The model type comes from ``config.json`` or supported layout metadata:
 
     policy = AutoPolicy.from_pretrained("pi05_libero_base", precision="bf16")
 
@@ -20,6 +18,7 @@ from typing import Optional
 
 from .base import Policy
 from .registry import available_policies, get_policy
+from ..checkpoints import OPENPI_PYTORCH, CheckpointError, detect_checkpoint
 
 __all__ = ["AutoPolicy"]
 
@@ -29,7 +28,7 @@ _MODEL_TYPE_KEYS = ("type", "model_type", "model")
 
 
 class AutoPolicy:
-    """Checkpoint -> concrete policy, dispatched by ``config.json`` model type."""
+    """Checkpoint-to-policy dispatch through the registered model type."""
 
     def __new__(cls, *args, **kwargs):  # noqa: D401 - guard, not a constructor
         raise TypeError("AutoPolicy is not instantiable; use AutoPolicy.from_pretrained(...)")
@@ -38,9 +37,8 @@ class AutoPolicy:
     def from_pretrained(model_dir, *, model_type: Optional[str] = None, **kwargs) -> Policy:
         """Construct the registered policy for ``model_dir``.
 
-        ``model_type`` overrides the value read from ``config.json`` (use it when
-        the config lacks a type field). Extra ``kwargs`` pass through to the
-        concrete policy's ``from_pretrained``.
+        ``model_type`` overrides the value detected from the checkpoint. Extra
+        ``kwargs`` pass through to the concrete policy's ``from_pretrained``.
 
         Built-in policies register themselves when :mod:`apxinf.policies` is
         imported (which always happens before this method is reachable), so the
@@ -55,6 +53,19 @@ class AutoPolicy:
 def _read_model_type(model_dir: Path) -> str:
     config_path = model_dir / "config.json"
     if not config_path.is_file():
+        # OpenPI PyTorch exports declare their model type in metadata.pt.
+        try:
+            layout = detect_checkpoint(model_dir)
+        except CheckpointError as exc:
+            raise FileNotFoundError(
+                f"AutoPolicy: no config.json in {model_dir} and its layout could not "
+                f"be identified ({exc}); pass model_type= explicitly "
+                f"(known: {available_policies()})"
+            ) from exc
+        if layout.format == OPENPI_PYTORCH:
+            # train_config_facts already refused anything that is not pi05
+            # (pi05=False, or a backbone this runtime is not built for).
+            return "pi05"
         raise FileNotFoundError(
             f"AutoPolicy: no config.json in {model_dir}; pass model_type= explicitly "
             f"(known: {available_policies()})"

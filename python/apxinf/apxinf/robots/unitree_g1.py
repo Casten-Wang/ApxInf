@@ -1,36 +1,38 @@
-"""Unitree G1 adapter: wire the G1 steps onto a pi05 policy.
+"""Unitree G1 policy adapter.
 
-Assembles the robot-specific steps in
-:mod:`apxinf.processors.robots.unitree_g1` with a generic
-:class:`~apxinf.policies.impls.pi05.Pi05Policy`. Only the primary serving path
-(3 cameras, ``adapt_to_pi=True``, no fixed-hand override) is wired — that is what
-the shipped ``pi05_UnitreeG1_groundwire`` config uses; the integrator's
-``_NoLeftCam`` / ``fixed_hand`` variants are training-data cleaning knobs, not
-serving paths, so they are intentionally omitted.
+This module is the *robot* half of the robot/model split. It knows the G1 body —
+16 DoF laid out ``[L-arm 7, L-gripper 1, R-arm 7, R-gripper 1]``, three cameras,
+delta joint actions — and it knows nothing about the model serving it. It names
+no model class, no step inside the model's chain, and no checkpoint layout:
+:class:`~apxinf.policies.auto.AutoPolicy` decides which policy the directory
+holds, and :meth:`~apxinf.policies.base.ComposablePolicy.with_adapter` wraps the
+G1 steps around that policy's own pre/post chain.
 
-.. note::
-   With a stand-in pi05 checkpoint (no real G1 weights / norm_stats) this adapter
-   validates *plumbing and shape* (G1 obs -> ``[action_horizon, 16]``), not G1
-   action values. Numeric parity needs the integrator's real gripper limits
-   **and** the G1 checkpoint/norm_stats; the same adapter code then runs
-   unchanged.
+Wire keys are supplied by a :class:`~apxinf.conventions.Convention`.
+
+The nesting is the entire coupling, and it is an ordering rule, not a naming one:
+
+    decode G1 state  ->  [ whatever the model does ]  ->  delta->absolute -> 32->16
+
+The model policy owns tokenization, state encoding, and model-specific steps.
+
+The adapter supports the three-camera serving path with optional
+``adapt_to_pi`` and delta-to-absolute processing.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
-from ..policies.impls.pi05 import Pi05Policy
-from ..processors import Pipeline
+from ..policies.auto import AutoPolicy
+from ..policies.base import ComposablePolicy, Policy
+from ..processors.base import StepSpec
 from ..processors.robots.unitree_g1 import (
-    G1_CAMERAS,
     G1_ROBOT_DIM,
-    G1_STATE_KEY,
     UnitreeG1AbsoluteActions,
     UnitreeG1DecodeState,
     UnitreeG1EncodeActions,
 )
-from ..processors.transforms import Unnormalize
 
 __all__ = ["build_unitree_g1_policy"]
 
@@ -38,75 +40,96 @@ __all__ = ["build_unitree_g1_policy"]
 def build_unitree_g1_policy(
     model_dir,
     *,
+    state_key: str,
+    image_keys: Sequence[str],
+    prompt_key: str = "prompt",
     use_delta_joint_actions: bool = True,
     adapt_to_pi: bool = True,
-    state_key: str = G1_STATE_KEY,
-    prompt_key: str = "prompt",
-    image_keys: Sequence[str] = G1_CAMERAS,
     discrete_state: bool = True,
     action_dim: Optional[int] = None,
-    unnormalizer: Optional[Unnormalize] = None,
     metadata: Optional[dict] = None,
-    **from_pretrained_kwargs: Any,
-) -> Pi05Policy:
-    """Build a :class:`Pi05Policy` wired with the Unitree G1 pre/post adapter.
+    **load_kwargs: Any,
+) -> Policy:
+    """Load ``model_dir`` and wrap the Unitree G1 pre/post adapter around it.
 
-    Loads the checkpoint through the generic :meth:`Pi05Policy.from_pretrained`
-    (full model-width unnormalizer, so the delta->absolute step sees the whole
-    action before the 32->16 robot truncation), then swaps in the G1 pipelines:
+    The checkpoint is loaded through :class:`~apxinf.policies.auto.AutoPolicy`, so
+    the model type comes from ``config.json`` (or an explicit ``model_type=``)
+    rather than from this file. ``action_dim=None`` lets the checkpoint's action
+    transform determine the intermediate width; ``UnitreeG1EncodeActions`` then
+    emits 16 channels. A deployment therefore needs action statistics at least
+    16 channels wide, or an injected ``unnormalizer`` with a compatible width.
 
-    * **input**  — ``[image_stack, g1_decode_state?, tokenize]``; PI0.5 samples
-      its latent internally unless the caller supplies ``noise``
-    * **output** — ``[unnormalize, g1_absolute?, g1_encode]``
+    The resulting chain is the model's own, wrapped:
+
+    * **input**  — ``[g1_decode_state?, <the model's input steps>]``
+    * **output** — ``[<the model's output steps>, g1_absolute?, g1_encode?]``
 
     ``adapt_to_pi=False`` drops the decode/encode conventions (raw robot space);
     ``use_delta_joint_actions=False`` drops the delta->absolute step (the model
     already emits absolute actions). ``action_dim`` is the **deployable** width
-    reported to clients and defaults to :data:`G1_ROBOT_DIM` — the model always
-    runs at full width internally, and ``UnitreeG1EncodeActions`` performs the
-    truncation. By default the unnormalizer comes from the checkpoint's
-    ``norm_stats["actions"]``, so a real deployment needs G1 norm_stats at least
-    ``16`` wide; pass ``unnormalizer=`` to inject one (e.g. a full-width identity
-    for a shape/plumbing test on a stand-in checkpoint).
+    reported to clients: it defaults to :data:`G1_ROBOT_DIM` when ``adapt_to_pi``
+    wires the truncating encode step, and otherwise to whatever the model's own
+    chain emits — a policy must not advertise a width no step produces.
 
-    Defaults match what an unmodified openpi G1 client sends: the nested
-    ``obs["images"][...]`` cameras, a flat ``"state"``, and state discretized into
-    the prompt. Serving with ``discrete_state=False`` silently drops state, which
-    also makes ``use_delta_joint_actions`` a no-op (a delta cannot be resolved
-    without the current joint positions).
+    Extra ``load_kwargs`` reach the concrete policy's ``from_pretrained``
+    (``device`` / ``precision`` / ``checkpoint`` / ``model_type`` / a pre-built
+    ``model=`` handle / an injected ``unnormalizer=``, ...).
+
+    ``state_key`` and ``image_keys`` are **required and have no defaults**. They
+    are a recording convention, not a fact about this body: the G1 client's
+    dialect lives in :data:`apxinf.conventions.UNITREE_G1`, and defaulting to it
+    here would rebuild the robot↔dataset coupling one layer up. Pass
+    ``**vars(...)`` of a convention, or let
+    :func:`~apxinf.robots.presets.build_robot_policy` do it from the preset
+    table::
+
+        from apxinf.conventions import UNITREE_G1 as G1_KEYS
+        policy = build_unitree_g1_policy(
+            ckpt, state_key=G1_KEYS.state_key, image_keys=G1_KEYS.image_keys
+        )
+
+    Serving with ``discrete_state=False`` silently drops state, which also makes
+    ``use_delta_joint_actions`` a no-op (a delta cannot be resolved without the
+    current joint positions).
     """
-    base = Pi05Policy.from_pretrained(
+    base = AutoPolicy.from_pretrained(
         model_dir,
         image_keys=tuple(image_keys),
-        action_dim=None,  # keep full model width; the g1_encode step truncates to 16
+        action_dim=None,  # let checkpoint stats define the width before g1_encode
         state_key=state_key,
         prompt_key=prompt_key,
         discrete_state=discrete_state,
-        **from_pretrained_kwargs,
+        **load_kwargs,
     )
-    if unnormalizer is None:
-        unnormalizer = base.output_pipeline["unnormalize"]
-
-    input_pipeline = base.input_pipeline
-    if adapt_to_pi:
-        input_pipeline = input_pipeline.insert_before(
-            "tokenize", ("g1_decode_state", UnitreeG1DecodeState(state_key))
+    if not isinstance(base, ComposablePolicy):
+        raise TypeError(
+            f"the Unitree G1 adapter has to run its steps around the model's, which "
+            f"{type(base).__name__} (loaded from {model_dir}) does not allow: it has no "
+            "with_adapter(). The loaded policy must implement ComposablePolicy."
         )
 
-    output_steps = [("unnormalize", unnormalizer)]
-    if use_delta_joint_actions:
-        output_steps.append(("g1_absolute", UnitreeG1AbsoluteActions(state_key)))
+    before: List[StepSpec] = []
     if adapt_to_pi:
-        output_steps.append(("g1_encode", UnitreeG1EncodeActions()))
-    output_pipeline = Pipeline(output_steps)
+        # Ahead of the model's own steps, so both the (optional) state
+        # discretization and the delta->absolute output step read decoded state.
+        before.append(("g1_decode_state", UnitreeG1DecodeState(state_key)))
 
-    return Pi05Policy(
-        base.model,
-        input_pipeline=input_pipeline,
-        output_pipeline=output_pipeline,
-        image_keys=tuple(image_keys),
-        prompt_key=prompt_key,
-        state_key=state_key,
-        action_dim=G1_ROBOT_DIM if action_dim is None else int(action_dim),
+    after: List[StepSpec] = []
+    if use_delta_joint_actions:
+        after.append(("g1_absolute", UnitreeG1AbsoluteActions(state_key)))
+    if adapt_to_pi:
+        after.append(("g1_encode", UnitreeG1EncodeActions()))
+
+    if action_dim is not None:
+        width: Optional[int] = int(action_dim)
+    elif adapt_to_pi:
+        width = G1_ROBOT_DIM  # g1_encode does the truncation
+    else:
+        width = None  # no truncating step is wired; keep the model chain's width
+
+    return base.with_adapter(
+        before=before,
+        after=after,
+        action_dim=width,
         metadata={"robot": "unitree_g1", **(metadata or {})},
     )

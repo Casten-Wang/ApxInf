@@ -21,19 +21,24 @@ impl crate::kernels::gemm::Bf16ActivationObserver for CountingObserver {
 }
 
 #[test]
-fn bf16_geglu_fallback_observes_activation_once() {
+fn bf16_geglu_cold_autotune_resolves_dependencies_without_reentering_tune_lock() {
     const M: usize = 3;
     const K: usize = 5;
     const FULL_N: usize = 14;
 
     let backend = CudaBackend::new(0).unwrap();
+    crate::kernels::gemm::configure_tuning(
+        backend.context(),
+        crate::tuning::TuningMode::AutoTune,
+        &[],
+        None,
+    )
+    .unwrap();
     let activation = backend
         .to_device(&Tensor::from_bf16(vec![M, K], &vec![bf16::ZERO; M * K]).unwrap())
         .unwrap();
     let weight = backend
-        .to_device(
-            &Tensor::from_bf16(vec![K, FULL_N], &vec![bf16::ZERO; K * FULL_N]).unwrap(),
-        )
+        .to_device(&Tensor::from_bf16(vec![K, FULL_N], &vec![bf16::ZERO; K * FULL_N]).unwrap())
         .unwrap();
     let observer = Rc::new(CountingObserver(Cell::new(0)));
     let _guard = crate::kernels::gemm::install_bf16_observer(observer.clone()).unwrap();
@@ -47,11 +52,29 @@ fn bf16_geglu_fallback_observes_activation_once() {
         None,
     )
     .unwrap();
-    assert!(fused.is_none());
-    assert_eq!(observer.0.get(), 0, "a rejected fused probe must not observe");
-
-    crate::kernels::gemm::bf16(backend.context(), &activation, &weight).unwrap();
-    assert_eq!(observer.0.get(), 1, "the fallback must observe exactly once");
+    assert_eq!(fused.shape().dims(), [M, FULL_N / 2]);
+    assert_eq!(
+        observer.0.get(),
+        1,
+        "the decomposed GeGLU path must observe exactly once"
+    );
+    for epilogue in [Epilogue::None, Epilogue::GeGlu] {
+        let key = GemmTuningKey {
+            op: GemmOp::Bf16,
+            device: DeviceFingerprint::from(backend.context().caps()),
+            m: M,
+            n: FULL_N,
+            k: K,
+            activation_dtype: TuningDType::Bf16,
+            weight_dtype: TuningDType::Bf16,
+            output_dtype: TuningDType::Bf16,
+            layout: GemmLayout::RowMajor,
+            scale_mode: ScaleMode::None,
+            epilogue,
+            workspace_limit: usize::MAX,
+        };
+        assert!(backend.context().tuning().lookup_gemm_exact(&key).is_some());
+    }
 }
 
 #[test]

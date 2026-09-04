@@ -248,6 +248,11 @@ class WallossPolicy:
             "action_dim": self._action_dim, "model_action_dim": model.action_dim,
             "num_views": model.num_views, "image_keys": list(processor.image_keys),
             "state_key": processor.state_key, "prompt_key": processor.prompt_key,
+            **(
+                {"state_dim": int(processor.propri_min.size)}
+                if hasattr(processor, "propri_min")
+                else {}
+            ),
             "dof_mask_key": "dof_mask",
             "discrete_state": True,
             "state_bins": processor.state_bins,

@@ -7,7 +7,8 @@ For config-driven dispatch that does not name the model class, see
 ``autopolicy_infer.py``.
 
 Requires the ``apxinf_py`` CUDA binding (``maturin develop`` of crates/apxinf-py)
-and a pi05 checkpoint directory (model + tokenizer + norm_stats.json).
+and a compatible PI0.5 checkpoint directory. Pass a local tokenizer when it is
+not stored with the checkpoint.
 
     python examples/pi05policy_infer.py --model-dir /path/to/checkpoint
 """
@@ -25,6 +26,7 @@ from apxinf import Pi05Policy
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True, type=pathlib.Path)
+    parser.add_argument("--tokenizer", type=pathlib.Path)
     parser.add_argument("--precision", choices=("auto", "fp8", "bf16", "int8"), default="bf16")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -44,12 +46,13 @@ def main() -> None:
         args.model_dir,
         device=args.device,
         precision=args.precision,
+        tokenizer_path=args.tokenizer,
         action_dim=(args.action_dim or None),
     )
     try:
         print("metadata:", policy.metadata)
 
-        observation = synthetic_observation(image_keys=policy.image_keys)
+        observation = synthetic_observation(image_keys=policy.image_keys, state_key=policy.state_key)
         result = policy.infer(observation)
 
         actions = result["actions"]

@@ -67,8 +67,8 @@ python scripts/pi05_openpi_websocket_server.py \
   absent view and masks it; a masked view is excluded from attention, occupies no
   RoPE position, and the vision tower has no per-slot parameters) while skipping
   that view's 256 patch tokens every step. It must equal the number of image
-  keys, and it is deliberately required rather than inferred, so a *forgotten*
-  camera key is an error instead of a quiet accuracy loss.
+  keys. The explicit value prevents a missing camera key from silently reducing
+  the loaded view count.
 - `--host 0.0.0.0` accepts remote clients (split deployment); `127.0.0.1` for a
   local-only test.
 - Health check: `curl http://<host>:8000/healthz` → `OK`.
@@ -103,8 +103,10 @@ result["policy_timing"]   # {'infer_ms': bare model, 'policy_ms': full policy}
 The metadata **is** the wire contract — assert against `meta["image_keys"]` /
 `meta["state_key"]` instead of hardcoding keys, so a server/client mismatch shows
 up as a failed assertion at startup rather than as degraded accuracy in the
-field. Sending a key the server does not serve raises a `KeyError` naming both
-sides; sending an *extra* key is silently ignored (matching openpi).
+field. A `state_key` of `null` is not a gap: it says the served policy drops
+state, so there is no key to send one under. Sending a key the server does not
+serve raises a `KeyError` naming both sides; sending an *extra* key is silently
+ignored (matching openpi).
 
 **Images are RGB.** Neither this server nor openpi converts colour: an `H×W×3`
 uint8 array is taken as RGB as-is. A client reading frames with OpenCV must
@@ -194,6 +196,7 @@ A working G1 example ships in-tree — copy and adapt it:
 ```
 python/apxinf/apxinf/processors/robots/unitree_g1.py   # robot-specific ProcessorSteps
 python/apxinf/apxinf/robots/unitree_g1.py              # build_unitree_g1_policy factory
+python/apxinf/apxinf/conventions.py                    # the G1 client's wire keys
 ```
 
 ### 5.1 Two landing spots
@@ -202,6 +205,7 @@ python/apxinf/apxinf/robots/unitree_g1.py              # build_unitree_g1_policy
 |---|---|---|
 | **robot-specific step** (pure numpy, per-embodiment, model-agnostic) | `python/apxinf/apxinf/processors/robots/<robot>.py` | `ProcessorStep` subclasses: decode-state / delta→absolute / encode-actions |
 | **assembly factory** (wires the steps onto `Pi05Policy`) | `python/apxinf/apxinf/robots/<robot>.py` | a `build_<robot>_policy(...)` that rewrites the pre/post pipelines after `from_pretrained` |
+| **recording convention** (the wire keys your client sends) | `python/apxinf/apxinf/conventions.py` | a `Convention`; it belongs to the *dataset*, so no step and no factory may hardcode it |
 
 ### 5.2 OpenPI transform → apxinf equivalent (G1 as the sample)
 
@@ -247,46 +251,45 @@ Port **placeholder calibration** faithfully as a hook (in G1 the flip mask is al
 Default pi05 pipelines: input `[image_stack, tokenize]`, output
 `[trim, unnormalize]`. Noise is generated inside the runtime unless the caller
 passes it explicitly; a custom host sampler can still be inserted as a pipeline
-step. `Pipeline` offers
-`insert_before/insert_after/replace/override/remove/reorder` (each returns a new
-pipeline). The factory does three things: load full-width → insert decode on the
-input → rewrite the output pipeline:
+step.
+
+Robot adapters use
+[`ComposablePolicy.with_adapter`](../policies/base.py) to prepend input steps
+and append output steps without depending on model-specific step names. The
+factory loads the full-width policy through `AutoPolicy` and wraps it:
 
 ```python
-from ..policies.impls.pi05 import Pi05Policy
-from ..processors import Pipeline
+from ..policies.auto import AutoPolicy
+from ..policies.base import ComposablePolicy
 from ..processors.robots.my_robot import (
-    MyRobotDecodeState, MyRobotAbsoluteActions, MyRobotEncodeActions,
-    ROBOT_CAMERAS, ROBOT_DIM,
+    MyRobotDecodeState, MyRobotAbsoluteActions, MyRobotEncodeActions, ROBOT_DIM,
 )
 
-def build_my_robot_policy(model_dir, *, use_delta_joint_actions=True, adapt_to_pi=True,
-                          state_key="observation/state", image_keys=ROBOT_CAMERAS, **kw):
-    base = Pi05Policy.from_pretrained(
+# state_key and image_keys come from the selected Convention (§5.6).
+def build_my_robot_policy(model_dir, *, state_key, image_keys,
+                          use_delta_joint_actions=True, adapt_to_pi=True, **kw):
+    base = AutoPolicy.from_pretrained(
         model_dir,
         image_keys=tuple(image_keys),
         action_dim=None,        # keep full 32 dims; the encode step trims to ROBOT_DIM
         state_key=state_key,
         **kw,
     )
-    input_pipeline = base.input_pipeline
-    if adapt_to_pi:
-        input_pipeline = input_pipeline.insert_before(
-            "tokenize", ("decode_state", MyRobotDecodeState(state_key)))
+    if not isinstance(base, ComposablePolicy):
+        raise TypeError(f"{type(base).__name__} has no with_adapter(); ...")
 
-    output_steps = [("unnormalize", base.output_pipeline["unnormalize"])]   # full width
+    before = [("decode_state", MyRobotDecodeState(state_key))] if adapt_to_pi else []
+    after = []
     if use_delta_joint_actions:
-        output_steps.append(("absolute", MyRobotAbsoluteActions(state_key)))
+        after.append(("absolute", MyRobotAbsoluteActions(state_key)))
     if adapt_to_pi:
-        output_steps.append(("encode", MyRobotEncodeActions()))
+        after.append(("encode", MyRobotEncodeActions()))
 
-    return Pi05Policy(
-        base.model,
-        input_pipeline=input_pipeline,
-        output_pipeline=Pipeline(output_steps),
-        image_keys=tuple(image_keys),
-        state_key=state_key,
-        action_dim=ROBOT_DIM,
+    return base.with_adapter(
+        before=before,
+        after=after,
+        # Report the width produced by the appended encode step.
+        action_dim=ROBOT_DIM if adapt_to_pi else None,
         metadata={"robot": "my_robot"},
     )
 ```
@@ -294,9 +297,12 @@ def build_my_robot_policy(model_dir, *, use_delta_joint_actions=True, adapt_to_p
 Resulting pipelines:
 
 ```
-input : [image_stack, decode_state, tokenize]
-output: [unnormalize, absolute, encode]   # normalized[H,32] -> actions[H,ROBOT_DIM]
+input : [decode_state, image_stack, tokenize]
+output: [trim, unnormalize, absolute, encode]   # normalized[H,32] -> actions[H,ROBOT_DIM]
 ```
+
+`trim` is the model's own step at full width (a no-op when `norm_stats` is as
+wide as the model), so `absolute` still sees the whole action.
 
 ### 5.5 One general framework hook (built in, nothing to change)
 
@@ -314,29 +320,58 @@ wrong is silent. Add one entry to
 contract becomes `--robot <name>`:
 
 ```python
+MY_ROBOT_BODY = Embodiment(                       # the hardware: survives a re-record
+    name="my_robot",
+    num_cameras=2,
+    action_dim=None,                              # None: the encode step trims
+    builder=build_my_robot_policy,
+    builder_kwargs={"use_delta_joint_actions": True, "adapt_to_pi": True},
+)
+
+# In apxinf/conventions.py — the dataset dialect: survives a re-body.
+MY_ROBOT_KEYS = Convention(
+    name="my_dataset",
+    image_keys=("images/cam_high", "images/cam_left_wrist"),  # in model view-slot order
+    state_key="state",
+    discrete_state=True,                          # False *drops* state entirely
+)
+
 MY_ROBOT = RobotPreset(
     name="my_robot",                              # <arm>_<key convention> if the arm is shared
-    slots=(                                       # (model view slot, wire key), in slot order
-        ("base_0_rgb",        "images/cam_high"),
-        ("left_wrist_0_rgb",  "images/cam_left_wrist"),
-    ),
-    state_key="state",
-    action_dim=None,                              # None: the encode step trims
-    discrete_state=True,                          # False *drops* state entirely
-    builder=build_my_robot_policy,
+    embodiment=MY_ROBOT_BODY,
+    convention=MY_ROBOT_KEYS,
     summary="My robot: 2 cameras, 14-DoF state, delta joint actions",
-    builder_kwargs={"use_delta_joint_actions": True, "adapt_to_pi": True},
 )
 
 ROBOT_PRESETS = {p.name: p for p in (FRANKA_LIBERO, UNITREE_G1, MY_ROBOT)}
 ```
 
-Naming each wire key with the **model view slot** it fills is the point: the
-tuple is order-significant (entry *i* becomes model view slot *i*), and a wrong
-order still stacks, still has the right shape, and silently feeds the wrong
-camera to each slot. The pairing is validated — slots must be a prefix of
-`base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb` in order, with no duplicate
-wire keys.
+An `Embodiment` defines the robot body and processing requirements. A
+`Convention` defines dataset wire keys and state routing. `RobotPreset` registers
+a supported pairing, which is selected with `--robot`.
+
+For a robot implemented in another package, register the convention and preset
+when that package is imported:
+
+```python
+from apxinf import Convention, Embodiment, RobotPreset
+from apxinf import register_convention, register_robot_preset
+
+MY_KEYS = register_convention(Convention(name="my_dataset", ...))
+MY_ROBOT = register_robot_preset(
+    RobotPreset(name="myarm_my_dataset", embodiment=MY_ARM, convention=MY_KEYS),
+    aliases=("myarm",),
+)
+```
+
+Re-registering a name requires `replace=True`; aliases cannot shadow canonical
+preset names. Registration is process-local, so `--robot` sees presets from
+modules imported by the server process.
+
+`image_keys` is order-significant: entry *i* becomes model view slot *i*
+(`base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb`). `preset.slots` renders this
+pairing for logs. Registration validates duplicate keys, view-count limits, and
+agreement between the convention and embodiment camera counts.
 
 Wire keys may be written **flat** (`"observation/image"` — the slash is part of
 the name, as LIBERO and DROID send it) or as a **nested path**
@@ -351,8 +386,23 @@ startup, so a client can assert it.
 
 ```python
 from apxinf import build_unitree_g1_policy          # shipped G1 example
-policy = build_unitree_g1_policy("<g1-ckpt>", use_delta_joint_actions=True, adapt_to_pi=True)
+from apxinf.conventions import UNITREE_G1 as G1_KEYS
+
+policy = build_unitree_g1_policy(
+    "<g1-ckpt>",
+    state_key=G1_KEYS.state_key,                    # required: a dataset fact, not a body's
+    image_keys=G1_KEYS.image_keys,
+    use_delta_joint_actions=True,
+    adapt_to_pi=True,
+)
 actions = policy.infer(obs)["actions"]               # [H, 16]
+```
+
+Or let the preset table supply both, which is what the server does:
+
+```python
+from apxinf import build_robot_policy
+policy = build_robot_policy("unitree_g1", "<g1-ckpt>")
 ```
 
 Served the same way, once §5.6 is done:

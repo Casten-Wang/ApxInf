@@ -12,20 +12,29 @@ between its input and output transforms.
 This makes the whole pre/post chain reorderable, insertable, and replaceable
 through the ordinary ``Pipeline`` machinery — a custom high-performance resize or
 tokenizer drops in with ``input_pipeline.replace(...)`` / ``insert_after(...)``
-without forking the framework.
+without forking the framework. Those verbs address steps *by name*, so they are
+for callers who know this chain. A caller who only needs to run steps **around**
+it — a robot adapter — uses :meth:`Pi05Policy.with_adapter`
+(:class:`~apxinf.policies.base.ComposablePolicy`) instead and stays ignorant of
+what the chain contains.
 
 Domain contract: the model returns a **normalized-domain** action; this policy
 returns the **unnormalized-domain** chunk. The intermediate normalized action is
 also returned (``normalized_actions``) so the layering invariant
 ``L2 minus unnormalize == L1`` can be checked directly.
 
-**State injection (opt-in, off by default):** ``observation/state`` is dropped by
-default so the numerics match today's serving link. Enable it with
-``discrete_state=True``: the raw state is first mapped to ``[-1, 1]`` by a
-``state_normalizer`` (a :class:`~apxinf.processors.Normalizer` over
-``norm_stats["state"]`` by default), then discretized into the prompt — matching
-openpi's "normalize then discretize" order. This path does **not** assume the
-incoming state is already in ``[-1, 1]``.
+**State injection (opt-in, off by default):** state is dropped by default.
+Enable it with ``discrete_state=True``: the
+raw state is first mapped to ``[-1, 1]`` by a ``state_normalizer`` (a
+:class:`~apxinf.processors.Normalizer` over ``norm_stats["state"]`` by default),
+then discretized into the prompt — matching openpi's "normalize then discretize"
+order. This path does **not** assume the incoming state is already in ``[-1, 1]``.
+
+**This module defines no dataset wire keys.** ``image_keys`` falls back to the
+model's own :data:`~apxinf.policies.base.VIEW_SLOTS`, and ``state_key`` has no
+fallback at all — it is required exactly when state is read and may stay ``None``
+when state is dropped. Wire keys belong to :mod:`apxinf.conventions`; a robot
+preset pairs one with a body.
 
 This module registers ``Pi05Policy`` under ``model_type="pi05"`` so
 :class:`~apxinf.policies.auto.AutoPolicy` can dispatch to it.
@@ -33,6 +42,7 @@ This module registers ``Pi05Policy`` under ``model_type="pi05"`` so
 
 from __future__ import annotations
 
+import logging
 import time
 import warnings
 from pathlib import Path
@@ -42,7 +52,23 @@ import numpy as np
 
 from ...calibration import CalibrationContext, CalibrationPlan
 from ..._tactics import resolve_pi05_tactics
-from ..base import BareModel
+from ...checkpoints import (
+    CheckpointError,
+    OpenPINormalizationError,
+    detect_checkpoint,
+    has_layout_metadata,
+    load_normalization_plan,
+    resolve_tokenizer,
+)
+from ...checkpoints.descriptor import (
+    IDENTITY,
+    IDENTITY_MISSING_STATS,
+    MEAN_STD,
+    QUANTILE,
+    NormalizationPlan,
+    TransformSpec,
+)
+from ..base import VIEW_SLOTS, BareModel
 from ...processors import (
     GaussianNoise,
     ImageStack,
@@ -57,6 +83,7 @@ from ...processors import (
     Trim,
     Unnormalizer,
 )
+from ...processors.base import StepSpec
 from ...processors.transforms import (
     ACTIONS,
     NOISE,
@@ -73,9 +100,75 @@ from ..registry import register_policy
 
 __all__ = ["Pi05Policy"]
 
-_DEFAULT_IMAGE_KEYS = ("observation/image", "observation/wrist_image")
-_STATE_KEY = "observation/state"
+_LOGGER = logging.getLogger("apxinf.policies.pi05")
+
+#: ``prompt`` is openpi's *protocol*-level name for the instruction field — every
+#: dialect on this wire uses it — so unlike the camera and state keys it is not
+#: any one dataset's convention and keeps a default here.
 _PROMPT_KEY = "prompt"
+
+
+def _normalizer_from_transform(spec: TransformSpec, *, dtype=None) -> Optional[Normalizer]:
+    """Materialize a canonical checkpoint transform as an ApxInf processor."""
+    if spec.mode == IDENTITY:
+        return None
+    if spec.mode == QUANTILE:
+        return Normalizer(
+            q01=spec.values["q01"],
+            q99=spec.values["q99"],
+            mode=QUANTILE,
+            eps=spec.eps,
+            dtype=dtype,
+        )
+    if spec.mode == MEAN_STD:
+        std = np.asarray(spec.values["std"], dtype=np.float64) + spec.eps
+        return Normalizer(
+            mean=spec.values["mean"],
+            std=std,
+            mode=MEAN_STD,
+            eps=0.0,
+            dtype=dtype,
+        )
+    raise ValueError(f"unsupported state transform mode {spec.mode!r}")
+
+
+def _unnormalizer_from_transform(
+    spec: TransformSpec, *, dims: Optional[int] = None, dtype=None
+) -> Unnormalizer:
+    """Materialize action transform, preserving an explicit identity width."""
+    width = spec.width if dims is None else int(dims)
+    if width <= 0 or width > spec.width:
+        raise ValueError(
+            f"action_dim={width} is incompatible with checkpoint normalization width {spec.width}"
+        )
+    if spec.mode == IDENTITY:
+        return Unnormalizer(
+            q01=[-1.0] * width,
+            q99=[1.0] * width,
+            mode=QUANTILE,
+            eps=0.0,
+            dtype=dtype,
+        )
+    common = {"mode": spec.mode, "dims": width, "eps": spec.eps, "dtype": dtype}
+    if spec.mode == QUANTILE:
+        return Unnormalizer(
+            q01=spec.values["q01"],
+            q99=spec.values["q99"],
+            mode=QUANTILE,
+            dims=width,
+            eps=spec.eps,
+            dtype=dtype,
+        )
+    if spec.mode == MEAN_STD:
+        return Unnormalizer(mean=spec.values["mean"], std=spec.values["std"], **common)
+    raise ValueError(f"unsupported action transform mode {spec.mode!r}")
+
+
+def _normalization_metadata(plan) -> Mapping[str, str]:
+    def render(spec):
+        return "absent" if spec is None else f"{spec.mode}/{spec.status}"
+
+    return {"state": render(plan.state), "action": render(plan.action)}
 
 
 @register_policy("pi05")
@@ -88,16 +181,18 @@ class Pi05Policy:
         *,
         input_pipeline: Pipeline,
         output_pipeline: Pipeline,
-        image_keys: Sequence[str] = _DEFAULT_IMAGE_KEYS,
+        image_keys: Optional[Sequence[str]] = None,
         prompt_key: str = _PROMPT_KEY,
-        state_key: str = _STATE_KEY,
+        state_key: Optional[str] = None,
         action_dim: Optional[int] = None,
         metadata: Optional[Mapping[str, Any]] = None,
     ):
         self.model = model
         self.input_pipeline = input_pipeline
         self.output_pipeline = output_pipeline
-        self.image_keys = tuple(image_keys)
+        self.image_keys = tuple(
+            image_keys if image_keys is not None else _default_image_keys(model.num_views)
+        )
         self.prompt_key = prompt_key
         self.state_key = state_key
         self.action_dim_out = (
@@ -110,8 +205,35 @@ class Pi05Policy:
         tokenizer = getattr(tokenize, "tokenizer", None)
         self.discrete_state = bool(getattr(tokenizer, "discrete_state", False))
         state_normalized = getattr(tokenize, "state_normalizer", None) is not None
+        if self.discrete_state and self.state_key is None:
+            # The chain reads state but nothing says from where. Left alone this
+            # would serve a policy whose published state_key is null while its
+            # tokenizer quietly injects nothing — proprioception lost in silence.
+            raise ValueError(
+                "Pi05Policy: this chain discretizes state into the prompt but no "
+                "state_key was given. Name the wire key your client sends (see "
+                "apxinf.conventions, or a robot preset), or build the policy with "
+                "discrete_state=False to drop state deliberately."
+            )
 
+        # Kept apart from the derived half so ``with_adapter`` can carry the
+        # caller's description forward while the rewired policy recomputes what
+        # it actually serves.
+        self._extra_metadata = dict(metadata) if metadata else {}
         self.metadata = {
+            **self._derived_metadata(model, input_pipeline, output_pipeline, state_normalized),
+            **self._extra_metadata,
+        }
+
+    def _derived_metadata(
+        self,
+        model: BareModel,
+        input_pipeline: Pipeline,
+        output_pipeline: Pipeline,
+        state_normalized: bool,
+    ) -> dict:
+        """Return metadata derived from the policy's active model and pipelines."""
+        return {
             "model_type": "pi05",
             "action_horizon": model.action_horizon,
             "action_dim": self.action_dim_out,
@@ -127,7 +249,6 @@ class Pi05Policy:
             "state_normalized": state_normalized,
             "input_pipeline": input_pipeline.names,
             "output_pipeline": output_pipeline.names,
-            **(dict(metadata) if metadata else {}),
         }
 
     # --- construction ------------------------------------------------------
@@ -142,8 +263,8 @@ class Pi05Policy:
         image_pipeline: Optional[Pipeline] = None,
         noise: Optional[GaussianNoise] = None,
         state_normalizer: Optional[Normalizer] = None,
-        image_keys: Sequence[str] = _DEFAULT_IMAGE_KEYS,
-        state_key: str = _STATE_KEY,
+        image_keys: Optional[Sequence[str]] = None,
+        state_key: Optional[str] = None,
     ) -> Tuple[Pipeline, Pipeline]:
         """Assemble the default ``(input_pipeline, output_pipeline)`` from parts.
 
@@ -153,12 +274,25 @@ class Pi05Policy:
         fewer. Absent cameras are never sent, so there is no padding: the model
         runs the real view shape directly.
 
+        Omitting ``image_keys`` names the cameras after the model's own
+        :data:`~apxinf.policies.base.VIEW_SLOTS`, because this layer has no
+        business guessing anyone's wire keys — see :func:`_default_image_keys`.
+        A real deployment states them, usually via a robot preset.
+
+        ``state_key`` has no such fallback and none is possible: there is no
+        model-side vocabulary for a state key the way ``VIEW_SLOTS`` is one for
+        cameras. It is therefore required exactly when it is read — i.e. when
+        ``state_normalizer`` / the tokenizer put state into the prompt — and may
+        stay ``None`` when state is dropped, in which case nothing looks it up.
+
         A deployment with *fewer* cameras than the checkpoint declares is served
         by loading with ``num_views=`` (``--num-views`` on the server), which
         drops the trailing view slots at load time rather than zero-filling them
         per request.
         """
-        image_keys = tuple(image_keys)
+        image_keys = tuple(
+            image_keys if image_keys is not None else _default_image_keys(model.num_views)
+        )
         if len(image_keys) != model.num_views:
             fix = (
                 f"load with num_views={len(image_keys)} to serve fewer cameras "
@@ -179,9 +313,7 @@ class Pi05Policy:
             ("image_stack", ImageStack(image_pipeline, image_keys, model.image_size)),
             ("tokenize", Tokenize(tokenizer, state_normalizer, state_key)),
         ]
-        # The default leaves noise absent so the binding fills the stable latent
-        # buffer with its backend-native generator. Supplying an explicit sampler
-        # preserves the old host-generated/custom-processor path.
+        # Without an explicit sampler, the binding uses its backend-native RNG.
         if noise is not None:
             input_steps.append(("sample_noise", SampleNoise(noise)))
         input_pipeline = Pipeline(input_steps)
@@ -208,6 +340,7 @@ class Pi05Policy:
         autotune: bool = False,
         tokenizer_path=None,
         norm_key: str = "actions",
+        unnormalizer: Optional[Unnormalizer] = None,
         action_dim: Optional[int] = None,
         action_horizon: Optional[int] = None,
         num_flow_steps: Optional[int] = None,
@@ -215,32 +348,51 @@ class Pi05Policy:
         seed: int = 0,
         discrete_state: bool = False,
         state_norm_key: str = "state",
+        norm_dtype: Optional[str] = None,
         image_pipeline: Optional[Pipeline] = None,
-        image_keys: Sequence[str] = _DEFAULT_IMAGE_KEYS,
+        image_keys: Optional[Sequence[str]] = None,
         prompt_key: str = _PROMPT_KEY,
-        state_key: str = _STATE_KEY,
+        state_key: Optional[str] = None,
         num_views: Optional[int] = None,
+        checkpoint_format: Optional[str] = None,
+        asset_id: Optional[str] = None,
+        norm_stats=None,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> "Pi05Policy":
         """Build the **default** policy from a checkpoint directory.
 
         This is the from-disk convenience path: it loads the ``apxinf_py`` model
         (unless one is passed in), builds the SentencePiece tokenizer and the
-        action quantiles from files under ``model_dir``, assembles the default
+        declared normalization transforms from files under ``model_dir``, assembles the default
         pre/post chains via :meth:`default_pipelines`, and constructs the policy.
         Its many parameters are exactly the knobs for *building processors from
         disk* (``norm_key``/``action_dim``/``discrete_state``/``tokenizer_path``/
         ``state_norm_key``) — only this method knows ``model_dir``.
 
-        ``action_dim`` trims the unnormalizer to the task's action width (e.g. 7
-        for LIBERO); ``None`` keeps the full vector. ``action_horizon`` overrides
+        ``action_dim`` trims the checkpoint's action transform to the deployable
+        width; ``None`` uses the transform's full width. ``unnormalizer`` replaces
+        that action transform and determines the width, so it cannot be combined
+        with ``action_dim``.
+        ``action_horizon`` overrides
         the checkpoint's chunk length: ``None`` runs the native ``config.json``
         value, an explicit value outranks it (the horizon is a sequence length,
         not a weight dimension, so the same weights run at any horizon the config
         validator accepts). State injection is off by default; with
-        ``discrete_state=True`` a state normalizer is built from
-        ``norm_stats[state_norm_key]`` to map raw state to ``[-1, 1]`` before it is
-        discretized into the prompt.
+        ``discrete_state=True`` a state normalizer is built from the checkpoint's
+        selected normalization source to map raw state before it is discretized
+        into the prompt, and ``state_key`` becomes **required** —
+        there is no dataset-neutral name to fall back to, and guessing one would
+        drop proprioception silently.
+
+        ``norm_dtype`` pins the dtype both normalizers compute in; the default
+        follows the input, so a float32 observation is normalized in float32.
+        ``"float64"`` reproduces openpi, which parses ``norm_stats.json`` into
+        float64 and never demotes it. The difference is ~1e-7 either way and is
+        invisible on the output side, but on the input side normalization feeds
+        the state discretizer, whose bins are 1/128 apart: an element near a bin
+        edge crosses it, and the prompt — hence the entire rollout — changes.
+        A checkpoint whose statistics came from openpi wants ``"float64"``; the
+        preset table sets it per embodiment.
 
         ``num_views`` loads the checkpoint for fewer cameras than it declares, for
         a deployment that has fewer. It must equal ``len(image_keys)``. This drops
@@ -254,11 +406,58 @@ class Pi05Policy:
         A checkpoint-local ``tactics.json`` takes precedence over source-tree
         defaults, so normal Python and serving callers share the same routing.
 
+        ``checkpoint_format`` / ``asset_id`` / ``norm_stats`` control how the
+        directory is read (see :mod:`apxinf.checkpoints`). By default the layout
+        is detected: an openpi PyTorch export declares its architecture in
+        ``metadata.pt`` and keeps its statistics under
+        ``assets/<asset_id>/norm_stats.json``, and both are picked up without any
+        flag. ``checkpoint_format`` pins the answer instead of sniffing it,
+        ``asset_id`` overrides the one the checkpoint names (for assets moved
+        after export), and ``norm_stats`` is an explicit path that outranks every
+        convention. The first two make detection strict — an unreadable layout
+        raises rather than falling back — because both assert that the directory
+        *has* a layout. ``norm_stats`` does not: it names a single file, so it
+        also works on a flat directory that declares nothing about itself.
+
         For a **fully custom** pre/post chain, do not funnel it through here:
         build the parts yourself and use :meth:`default_pipelines` +
         :meth:`__init__` (or mutate ``policy.input_pipeline`` after construction).
         """
         model_dir = Path(model_dir)
+        if discrete_state and state_key is None:
+            # Caught here rather than deeper in Tokenize so the message can name
+            # the two flags the caller actually passed. discrete_state=True with
+            # no key would inject nothing and publish state_key=null.
+            raise ValueError(
+                "Pi05Policy.from_pretrained: discrete_state=True needs a state_key — "
+                "the wire key your client sends state under (see apxinf.conventions, "
+                "or use a robot preset via build_robot_policy). Pass "
+                "discrete_state=False to drop state instead."
+            )
+        if unnormalizer is not None and action_dim is not None and int(action_dim) != unnormalizer.width:
+            # Both name the deployable width; an injected map already fixes it, so
+            # a disagreeing action_dim would silently lose to the injection.
+            raise ValueError(
+                f"Pi05Policy.from_pretrained: action_dim={action_dim} conflicts with the "
+                f"supplied unnormalizer's width {unnormalizer.width}; the injected map "
+                "already sets the deployable width, so pass only one"
+            )
+
+        # Declared layouts are validated before loading weights. Flat native
+        # directories remain valid and may supply ``norm_stats`` directly.
+        layout = None
+        if checkpoint_format or asset_id or has_layout_metadata(model_dir):
+            layout = detect_checkpoint(
+                model_dir,
+                checkpoint_format=checkpoint_format,
+                asset_id=asset_id,
+                norm_stats=norm_stats,
+                norm_key=norm_key,
+                state_norm_key=state_norm_key if discrete_state else None,
+            )
+            for note in layout.notes:
+                _LOGGER.info("checkpoint %s: %s", model_dir, note)
+
         if model is None:
             import apxinf_py  # lazy: processor-only users never import the binding
 
@@ -270,6 +469,7 @@ class Pi05Policy:
                 override=Path(tactics) if tactics is not None else None,
                 allow_missing=bool(autotune),
             )
+            config_json = layout.config_json_text() if layout is not None else None
             model = apxinf_py.Model.load(
                 model_name,
                 ckpt,
@@ -278,6 +478,10 @@ class Pi05Policy:
                 **({"calibration": str(calibration)} if calibration else {}),
                 **({"tactics": str(tactics)} if tactics else {}),
                 autotune=bool(autotune),
+                # An openpi export has no config.json, so without this the Rust
+                # loader silently ran Pi05Config::default(). The constants come
+                # from the checkpoint's own metadata.pt.
+                **({"config_json": config_json} if config_json else {}),
                 **({"action_horizon": int(action_horizon)} if action_horizon else {}),
                 **({"num_views": int(num_views)} if num_views is not None else {}),
                 **({"num_flow_steps": int(num_flow_steps)} if num_flow_steps is not None else {}),
@@ -326,10 +530,73 @@ class Pi05Policy:
             max_token_len=model.max_token_len if hasattr(model, "max_token_len") else 200,
             discrete_state=discrete_state,
         )
-        unnormalizer = Unnormalizer.from_norm_stats(model_dir, key=norm_key, dims=action_dim)
-        state_normalizer = (
-            Normalizer.from_norm_stats(model_dir, key=state_norm_key) if discrete_state else None
-        )
+        # Declared layouts carry canonical normalization facts. Flat native
+        # directories may use a root or explicitly named norm_stats file.
+        plan = layout.normalization if layout is not None else None
+        injected_unnormalizer = unnormalizer is not None
+        if plan is None:
+            stats_path = (
+                Path(norm_stats)
+                if norm_stats is not None
+                else model_dir / "norm_stats.json"
+            )
+            if stats_path.is_file():
+                try:
+                    plan = load_normalization_plan(
+                        stats_path,
+                        action_key=norm_key,
+                        state_key=state_norm_key if discrete_state else None,
+                    )
+                except OpenPINormalizationError as exc:
+                    raise CheckpointError(str(exc)) from exc
+            elif norm_stats is not None:
+                raise CheckpointError(f"norm_stats path {stats_path} does not exist")
+        if plan is None:
+            # Missing statistics are load-compatible. This mirrors LeRobot's
+            # stateless base checkpoints: preserve normalized model actions and
+            # raw state rather than guessing another embodiment's statistics.
+            width = (
+                unnormalizer.width
+                if unnormalizer is not None
+                else int(action_dim) if action_dim is not None else int(model.action_dim)
+            )
+            plan = NormalizationPlan(
+                state=None,
+                action=TransformSpec.identity(
+                    norm_key,
+                    width,
+                    source=str(layout.root if layout is not None else model_dir),
+                    status=IDENTITY_MISSING_STATS,
+                ),
+            )
+        if plan is not None:
+            unnormalizer = (
+                unnormalizer
+                if unnormalizer is not None
+                else _unnormalizer_from_transform(
+                    plan.action, dims=action_dim, dtype=norm_dtype
+                )
+            )
+            state_normalizer = (
+                _normalizer_from_transform(plan.state, dtype=norm_dtype)
+                if discrete_state and plan.state is not None
+                else None
+            )
+            missing_state_stats = discrete_state and (
+                plan.state is None or plan.state.status == IDENTITY_MISSING_STATS
+            )
+            missing_action_stats = (
+                not injected_unnormalizer
+                and plan.action.status == IDENTITY_MISSING_STATS
+            )
+            if missing_state_stats or missing_action_stats:
+                _LOGGER.warning(
+                    "checkpoint %s lacks statistics for one or more transforms; "
+                    "using identity passthrough for those transforms. This is "
+                    "load-compatible, not evidence of "
+                    "embodiment-level parity.",
+                    model_dir,
+                )
         reset_sampling = getattr(model, "reset_sampling", None)
         if callable(reset_sampling):
             reset_sampling(int(seed))
@@ -344,6 +611,10 @@ class Pi05Policy:
             state_key=state_key,
         )
 
+        normalization_metadata = dict(_normalization_metadata(plan))
+        if injected_unnormalizer:
+            normalization_metadata["action"] = "custom/injected"
+
         return cls(
             model,
             input_pipeline=input_pipeline,
@@ -352,7 +623,11 @@ class Pi05Policy:
             prompt_key=prompt_key,
             state_key=state_key,
             action_dim=unnormalizer.width,
-            metadata=metadata,
+            metadata={
+                "normalization": normalization_metadata,
+                **({"state_dim": plan.state.width} if plan.state is not None else {}),
+                **(dict(metadata) if metadata else {}),
+            },
         )
 
     @classmethod
@@ -365,7 +640,7 @@ class Pi05Policy:
         seed: int = 0,
         image_keys: Optional[Sequence[str]] = None,
         prompt_key: str = _PROMPT_KEY,
-        state_key: str = _STATE_KEY,
+        state_key: Optional[str] = None,
         metadata: Optional[Mapping[str, Any]] = None,
         warn: bool = True,
     ) -> "Pi05Policy":
@@ -402,7 +677,9 @@ class Pi05Policy:
             reset_sampling(int(seed))
 
         if image_keys is None:
-            image_keys = _synthetic_image_keys(model.num_views)
+            # Resolved here rather than left to the two consumers below, so the
+            # published metadata and the ImageStack step cannot drift apart.
+            image_keys = _default_image_keys(model.num_views)
 
         input_pipeline, output_pipeline = cls.default_pipelines(
             model,
@@ -419,6 +696,48 @@ class Pi05Policy:
             state_key=state_key,
             action_dim=width,
             metadata={"weights": "synthetic", **(dict(metadata) if metadata else {})},
+        )
+
+    # --- composition -------------------------------------------------------
+
+    def with_adapter(
+        self,
+        *,
+        before: Sequence[StepSpec] = (),
+        after: Sequence[StepSpec] = (),
+        action_dim: Optional[int] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> "Pi05Policy":
+        """Return a copy running ``before`` ahead of, and ``after`` behind, this chain.
+
+        Implements :class:`~apxinf.policies.base.ComposablePolicy`. This is how a
+        robot adapter wires its body-specific steps without importing this class
+        or naming any step inside it: ``before`` lands ahead of ``image_stack``
+        (so it sees the raw client observation and can rewrite it before anything
+        model-specific reads it) and ``after`` lands behind ``unnormalize`` (so it
+        sees deployable-domain actions). That nesting is openpi's
+        ``data_transforms`` outside ``model_transforms``, and it is the whole of
+        what a robot needs from a model.
+
+        ``after`` steps receive the post-input observation alongside the actions
+        (see :meth:`infer`), so a delta→absolute step reads the same decoded
+        state the ``before`` steps produced.
+
+        ``action_dim`` declares the deployable width the appended steps leave
+        behind — pass it whenever ``after`` changes the width, since the derived
+        value would otherwise report this policy's pre-adapter width. The model
+        handle is **shared**, not reloaded: this is a rewiring, not a second load,
+        so only one of the two policies should be ``close()``d.
+        """
+        return type(self)(
+            self.model,
+            input_pipeline=self.input_pipeline.prepend(*before),
+            output_pipeline=self.output_pipeline.append(*after),
+            image_keys=self.image_keys,
+            prompt_key=self.prompt_key,
+            state_key=self.state_key,
+            action_dim=self.action_dim_out if action_dim is None else int(action_dim),
+            metadata={**self._extra_metadata, **(dict(metadata) if metadata else {})},
         )
 
     # --- inference ---------------------------------------------------------
@@ -613,26 +932,28 @@ class Pi05Policy:
         )
 
 
-def _synthetic_image_keys(num_views: int) -> Tuple[str, ...]:
-    """Generate exactly ``num_views`` camera keys for a checkpoint-free policy.
+def _default_image_keys(num_views: int) -> Tuple[str, ...]:
+    """Name exactly ``num_views`` cameras when the caller names none.
 
-    Reuses the default ``image``/``wrist_image`` names for the first two views and
-    appends ``image_2``, ``image_3``, ... beyond that, so ``default_pipelines``'
+    Returns the model's own :data:`~apxinf.policies.base.VIEW_SLOTS` vocabulary,
+    truncated to the loaded view count. A client using different keys receives a
+    ``KeyError`` that reports both contracts.
+
+    Beyond the declared slots the names continue as ``view_3_rgb``, ... so the
     ``len(image_keys) == model.num_views`` contract holds for any view count.
     """
-    base = list(_DEFAULT_IMAGE_KEYS)
-    if num_views <= len(base):
-        return tuple(base[:num_views])
-    extra = [f"observation/image_{i}" for i in range(len(base), num_views)]
-    return tuple(base + extra)
+    if num_views <= len(VIEW_SLOTS):
+        return tuple(VIEW_SLOTS[:num_views])
+    extra = [f"view_{index}_rgb" for index in range(len(VIEW_SLOTS), num_views)]
+    return tuple(VIEW_SLOTS) + tuple(extra)
 
 
 def _resolve_tokenizer(model_dir: Path, tokenizer_path) -> Path:
-    if tokenizer_path is not None:
-        return Path(tokenizer_path)
-    candidates = (model_dir / "tokenizer.model", model_dir / "paligemma_tokenizer.model")
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    rendered = ", ".join(str(path) for path in candidates)
-    raise FileNotFoundError(f"no SentencePiece tokenizer found under {model_dir}; checked {rendered}")
+    """Locate the SentencePiece model: explicit path, ``APXINF_TOKENIZER``, then the dir.
+
+    Delegates to :func:`apxinf.checkpoints.resolve_tokenizer` so the "where do I
+    get this file" message is written once. No pi05 checkpoint ships a tokenizer
+    — openpi downloads it from GCS and LeRobot from a gated HF repo — so the
+    error has to name both sources, and apxinf downloads neither.
+    """
+    return resolve_tokenizer(model_dir, tokenizer_path)

@@ -26,7 +26,7 @@ steps' keys.
 
 from __future__ import annotations
 
-from typing import Any, Mapping, MutableMapping, Sequence
+from typing import Any, Mapping, MutableMapping, Optional, Sequence
 
 import numpy as np
 
@@ -175,20 +175,30 @@ class ImageStack(ProcessorStep):
 class Tokenize(ProcessorStep):
     """Tokenize the prompt (optionally injecting discretized state) into ``token_ids``.
 
-    Mirrors the policy's old state routing: when the tokenizer runs in
-    ``discrete_state`` mode and a ``state_normalizer`` is set, the raw state is
+    When the tokenizer runs in ``discrete_state`` mode and a
+    ``state_normalizer`` is set, the raw state is
     first mapped to ``[-1, 1]`` before discretization; otherwise state is dropped.
+
+    ``state_key`` has no default because it names a dataset wire key. ``None`` is
+    allowed only when the tokenizer does not read state.
     """
 
     def __init__(
         self,
         tokenizer,
         state_normalizer=None,
-        state_key: str = "observation/state",
+        state_key: Optional[str] = None,
         *,
         observation_key: str = OBSERVATION,
         prompt_key: str = PROMPT,
     ):
+        if state_key is None and getattr(tokenizer, "discrete_state", False):
+            raise ValueError(
+                "Tokenize: the tokenizer discretizes state into the prompt but no "
+                "state_key was given, so there is no key to read it from. Name the "
+                "wire key your client sends (see apxinf.conventions), or use a "
+                "tokenizer with discrete_state=False to drop state deliberately."
+            )
         self.tokenizer = tokenizer
         self.state_normalizer = state_normalizer
         self.state_key = state_key
@@ -201,7 +211,12 @@ class Tokenize(ProcessorStep):
             observation = _require(data, self.observation_key, "Tokenize")
             state = lookup_key(observation, self.state_key, None)
             if self.state_normalizer is not None and state is not None:
-                state = self.state_normalizer(np.asarray(state, dtype=np.float32))
+                # No dtype coercion: the state only ever reaches the model as
+                # prompt tokens, and openpi normalizes/discretizes it in whatever
+                # dtype its own transforms produced (float64 for adapt_to_pi
+                # robots). Forcing float32 here shifts values by ~1e-7, which is
+                # enough to land on the other side of a discretization bin edge.
+                state = self.state_normalizer(np.asarray(state))
             data[TOKEN_IDS] = self.tokenizer(prompt, state=state)
         else:
             data[TOKEN_IDS] = self.tokenizer(prompt)

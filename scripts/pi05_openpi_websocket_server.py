@@ -7,9 +7,6 @@ All reusable logic lives in the library: the transport shell in
 :mod:`apxinf.robots.presets`. This file is only argument parsing + wiring — load
 an **in-process** policy through the ``apxinf_py`` PyO3 binding and serve it.
 
-The old subprocess + stdio hop (``ApxInfStdioEngine`` + ``pi05_libero_server``)
-is gone; so are the script's private resize/tokenize/unnormalize copies.
-
 **Embodiment:** ``--robot`` selects the wire keys and the robot pre/post steps,
 the way openpi's ``serve_policy.py --policy.config <TrainConfig>`` does. It
 defaults to ``franka_libero``; a checkpoint fine-tuned for another robot **must**
@@ -21,8 +18,7 @@ fixed dialect.
 **State:** each preset decides whether ``state`` is injected (discretized into
 the prompt, normalized to [-1, 1] from ``norm_stats``) or dropped —
 ``--discrete-state`` / ``--no-discrete-state`` override it. ``franka_libero``
-drops state to match the numerics of the prior serving link; a joint-space robot
-needs it.
+drops state; a joint-space robot needs it.
 
 **Images are RGB.** Neither this server nor openpi converts colour: an
 ``H×W×3`` uint8 array is taken as RGB as-is. A client reading frames with
@@ -47,6 +43,8 @@ if _APXINF_PKG.is_dir() and str(_APXINF_PKG) not in sys.path:
     sys.path.insert(0, str(_APXINF_PKG))
 
 from apxinf import Pi05Policy  # noqa: E402
+from apxinf.checkpoints import FORMATS as CHECKPOINT_FORMATS  # noqa: E402
+from apxinf.robots.preflight import FAIL, WARN, check_checkpoint, format_findings  # noqa: E402
 from apxinf.robots.presets import (  # noqa: E402
     ROBOT_PRESETS,
     available_robots,
@@ -103,7 +101,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="serve a checkpoint-free engine with deterministic random weights and "
         "synthetic processors (latency-only; actions are numerically meaningless). "
-        "No --model-dir needed.",
+        "Reproduces --robot's wire keys and view count but not its robot pre/post "
+        "steps, which need a checkpoint; the served metadata says robot_steps=false "
+        "and startup warns per gap. No --model-dir needed.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -112,12 +112,36 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-type",
-        help="policy model_type; default reads MODEL_DIR/config.json (e.g. pi05)",
+        help="policy model_type; default reads MODEL_DIR/config.json, or metadata.pt "
+        "for an openpi export, which has no config.json (e.g. pi05)",
     )
     parser.add_argument(
         "--tokenizer",
         type=pathlib.Path,
-        help="SentencePiece model (auto-detected under MODEL_DIR by default)",
+        help="SentencePiece model (auto-detected under MODEL_DIR, or APXINF_TOKENIZER)",
+    )
+    parser.add_argument(
+        "--ckpt-format",
+        choices=CHECKPOINT_FORMATS,
+        default="auto",
+        help="how to read MODEL_DIR. 'auto' (default) picks openpi_pytorch when a "
+        "metadata.pt is present and lerobot when a config.json is. Pin it when a "
+        "directory carries both and the wrong one wins.",
+    )
+    parser.add_argument(
+        "--asset-id",
+        default=None,
+        help="override the asset_id the checkpoint names, which is what selects "
+        "assets/<asset_id>/norm_stats.json. For assets reorganized after export.",
+    )
+    parser.add_argument(
+        "--norm-stats",
+        type=pathlib.Path,
+        default=None,
+        help="explicit OpenPI-style norm_stats.json, outranking every path convention. "
+        "LeRobot processor state is discovered from policy_preprocessor.json and "
+        "policy_postprocessor.json instead; a base checkpoint with no declared "
+        "processor state uses LeRobot-compatible identity transforms.",
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -150,8 +174,9 @@ def parse_args() -> argparse.Namespace:
         "--action-horizon",
         type=int,
         default=None,
-        help="chunk length to serve. Default: the checkpoint's config.json value, "
-        "or 50 with --random-weights. An explicit value outranks the checkpoint "
+        help="chunk length to serve. Default: the checkpoint's own value (config.json, "
+        "or metadata.pt for an openpi export), or 50 with --random-weights. An "
+        "explicit value outranks the checkpoint "
         "(the horizon is a sequence length, not a weight dimension).",
     )
     parser.add_argument(
@@ -243,18 +268,28 @@ def main() -> None:
         # The preset's cameras define the synthetic view count unless --num-views is
         # given explicitly, so --robot alone yields a servable synthetic engine.
         num_views = args.num_views if args.num_views is not None else len(image_keys)
-        # The synthetic tokenizer emits a fixed token stream and never reads state,
-        # so this server cannot reproduce a discrete-state preset. Say so: the
-        # published metadata is the wire contract, and silently serving
-        # discrete_state=False for a preset that declares True is precisely the
-        # mismatch --robot exists to prevent.
-        if discrete_state:
+        # A checkpoint-free engine still serves the preset's *deployable* width, so a
+        # client previews the action shape it will get in production. --action-dim
+        # outranks it (and also sets the synthetic model's own width).
+        model_dim = args.action_dim or 32
+        trim_dim = args.action_dim if args.action_dim is not None else preset.action_dim
+        served_dim = trim_dim or model_dim
+        # The synthetic path reproduces the preset's wire keys and view count and
+        # nothing else: the tokenizer emits a fixed token stream and never reads
+        # state, and preset.builder never runs. The published metadata is the wire
+        # contract, so name every gap and mark robot_steps=False below — silently
+        # serving half an embodiment under its own name is precisely the mismatch
+        # --robot exists to prevent.
+        gaps = preset.synthetic_gaps(
+            discrete_state=discrete_state, served_action_dim=served_dim
+        )
+        if gaps:
             logging.warning(
-                "--random-weights cannot honour %s's discrete_state=True: the "
-                "synthetic tokenizer ignores state, so the served metadata will "
-                "say discrete_state=False. Use a checkpoint to preview the real "
-                "contract.",
+                "--random-weights cannot honour %s: %s. The wire keys and view count "
+                "are real; the action semantics are not. Use a checkpoint to preview "
+                "the full contract.",
                 preset.name,
+                "; ".join(gaps),
             )
         logging.info(
             "serving checkpoint-free %s random-weights engine (views=%d, H=%d, T=%d) "
@@ -271,7 +306,7 @@ def main() -> None:
             num_views=num_views,
             image_size=args.image_size,
             action_horizon=action_horizon,
-            action_dim=(args.action_dim or 32),
+            action_dim=model_dim,
             num_flow_steps=args.num_flow_steps,
             max_token_len=args.max_token_len,
             calibration=calibration,
@@ -282,13 +317,38 @@ def main() -> None:
         policy = Pi05Policy.from_random(
             handle,
             token_count=args.token_count,
-            action_dim=(args.action_dim or None),
+            action_dim=(trim_dim or None),
             seed=args.seed,
             image_keys=image_keys[:num_views],
             state_key=state_key,
-            metadata={**metadata, "robot": preset.name},
+            metadata={**metadata, "robot": preset.name, "robot_steps": False},
         )
     else:
+        # Validate checkpoint and embodiment metadata before loading weights.
+        findings = check_checkpoint(
+            args.model_dir,
+            preset.name,
+            norm_key=args.norm_key,
+            discrete_state=discrete_state,
+            image_keys=image_keys,
+            action_dim=args.action_dim,
+            tokenizer_path=args.tokenizer,
+            checkpoint_format=args.ckpt_format,
+            asset_id=args.asset_id,
+            norm_stats=args.norm_stats,
+        )
+        fatal = [f for f in findings if f.level == FAIL]
+        if fatal:
+            raise SystemExit(
+                f"preflight: {args.model_dir} does not match --robot {preset.name}\n"
+                + format_findings(findings, include_info=False)
+            )
+        for finding in findings:
+            level = logging.ERROR if finding.level == FAIL else (
+                logging.WARNING if finding.level == WARN else logging.INFO
+            )
+            logging.log(level, "preflight %s", finding)
+
         logging.info(
             "loading %s policy in-process from %s as robot=%s",
             args.precision,
@@ -311,20 +371,28 @@ def main() -> None:
             tactics=args.tactics,
             autotune=args.autotune,
             tokenizer_path=args.tokenizer,
+            checkpoint_format=args.ckpt_format,
+            asset_id=args.asset_id,
+            norm_stats=args.norm_stats,
             norm_key=args.norm_key,
             action_horizon=args.action_horizon,
             seed=args.seed,
             metadata=metadata,
         )
     # Clients read the served wire contract off this metadata rather than assuming
-    # one: a key mismatch is silent on the wire but visible here.
+    # one: a key mismatch is silent on the wire but visible here. A null state_key
+    # is not a gap — it says this policy drops state, so there is no key to send
+    # one under; rendered as "(dropped)" so the log line cannot read as an omission.
+    served_state_key = policy.metadata["state_key"]
     logging.info(
-        "serving robot=%s H=%d x D=%d image_keys=%s state=%s discrete_state=%s",
+        "serving robot=%s robot_steps=%s H=%d x D=%d image_keys=%s state=%s "
+        "discrete_state=%s",
         policy.metadata.get("robot", preset.name),
+        policy.metadata.get("robot_steps"),
         policy.metadata["action_horizon"],
         policy.metadata["action_dim"],
         policy.metadata["image_keys"],
-        policy.metadata["state_key"],
+        served_state_key if served_state_key is not None else "(dropped)",
         policy.metadata["discrete_state"],
     )
     server = WebsocketPolicyServer(policy, args.host, args.port)

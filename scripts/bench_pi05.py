@@ -152,6 +152,11 @@ def parse_args() -> argparse.Namespace:
     source.add_argument(
         "--random-weights", action="store_true", help="checkpoint-free engine (L0/L1/L2)"
     )
+    p.add_argument(
+        "--tokenizer",
+        type=pathlib.Path,
+        help="local SentencePiece model for checkpoint L2 (otherwise resolve beside the checkpoint)",
+    )
 
     # Calibration is public for synthetic FP8 latency runs. Tactics are routed
     # internally by CUDA SM + precision below.
@@ -397,6 +402,7 @@ def main() -> None:
 
             options = {
                 "tactics": args.tactics,
+                "tokenizer_path": args.tokenizer,
                 "action_dim": (args.action_dim or None),
                 "action_horizon": args.action_horizon,
             }

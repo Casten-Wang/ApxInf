@@ -590,6 +590,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_config_json_synthesised_from_an_openpi_metadata_pt() {
+        // Shape emitted by `apxinf.checkpoints.train_config_facts`.
+        let cfg = Pi05Config::from_json_str(
+            r#"{"action_dim": 32, "action_horizon": 50, "discrete_state_input": true,
+                "max_token_len": 200, "num_views": 3}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.action_dim, 32);
+        assert_eq!(cfg.action_horizon, 50);
+        assert_eq!(cfg.max_token_len, 200);
+        assert_eq!(cfg.num_views, 3);
+        assert!(cfg.discrete_state_input);
+    }
+
+    #[test]
     fn language_dual_geglu_shapes_are_reachable_only_for_two_view_profile() {
         assert!(Pi05Config::thor_two_view().language_dual_geglu_shape_possible());
         assert!(!Pi05Config::default().language_dual_geglu_shape_possible());
