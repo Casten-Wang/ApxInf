@@ -150,15 +150,15 @@ copy:
 - `cargo check -p apxinf-py` (non-CUDA build);
 - `cargo check -p apxinf-py --features cuda`;
 - `cargo check -p apxinf-model --features cuda --example gr00t_fixture_bench`;
-- `cargo test -p apxinf-model --lib`: 74/74;
-- `cargo test -p apxinf-model --features cuda --lib`: 88/88;
+- `cargo test -p apxinf-model --features cuda --lib`: 103/103;
 - model-family boundary and unified-input integration tests: 13/13;
 - `cargo test -p apxinf-py --features cuda --lib`: 4/4;
-- `cargo test -p apxinf-cuda --lib -- --test-threads=1`: 113/113;
+- `cargo test -p apxinf-cuda --lib -- --test-threads=1`: 128/128;
 - GR00T Python policy/audit tests: 23 passed, 2 optional real-checkpoint tests
   skipped when checkpoint/native-smoke environment variables are absent;
-- real-checkpoint Orin native smoke: BF16 whole-graph 2/2, BF16 split-graph
-  2/2 and INT8 whole-graph 2/2.
+- real-checkpoint Orin Rust fixture smoke: BF16 whole-graph and INT8
+  whole-graph each produced two deterministic finite actions; same-input INT8
+  versus BF16 cosine was `0.9995748826` and relative L2 was `0.0296116949`.
 
 The opt-in native smoke covers the complete user-facing call boundary—official
 processor, Python policy, PyO3 binding, Rust/CUDA Model Core, action decode and
@@ -210,3 +210,19 @@ The corresponding Orin report SHA-256 values are:
 | BF16/2 | `72c9c7b58d4dbac0edc15257b66f4b595802b1bf6ed6c6a2bab93cfee51199bf` |
 | INT8/1 | `4a1129b18422c430f9604d79aca1bdcbb55f25f117b9aa613fbb86d1b9131e50` |
 | INT8/2 | `2c4dd6adbaf8e463f2c34731d0df369c2fbe1bcc88f049a10cdb3eed3c06e52c` |
+
+The original Orin delivery binary was rerun read-only on 2026-09-04 using the
+same LIBERO checkpoint, two-view fixture, 30-record BF16 tactic database,
+batch size one, four flow steps, 10 warmups and 50 whole-graph replays.  The
+binary SHA-256 was
+`5254dac1517fc612cd1b21c46931c61bca18a28cc7dd09c4f537711e8bc0fc27`.
+BF16 reproduced at P50 `87.474436 ms` with action sum
+`-17.202308654785156`; INT8 reproduced at P50 `70.229443 ms` with action sum
+`-17.022119522094727`.  Every replay within each run produced the same action
+sum, and both sums exactly match their corresponding original delivery report.
+
+The archived delivery parity reports compare those outputs with the NVIDIA
+BF16 reference on identical processor tensors and initial noise.  BF16 passes
+with cosine `0.999825140` and relative L2 `0.018713091`; INT8 passes with
+cosine `0.999605250` and relative L2 `0.028381493`.  Therefore the original
+Orin performance rows remain valid engineering measurements.

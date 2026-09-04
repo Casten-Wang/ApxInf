@@ -113,6 +113,10 @@ not raw-camera Full E2E latency.
 These rows must be rerun from the exact unchanged PR candidate before they are
 promoted to release results. The older reports identify the fixture and binary
 outputs, but do not bind the executable to a clean ApxInf source revision.
+The original Orin delivery binary was rerun on the same fixture on 2026-09-04:
+BF16 reproduced at P50 `87.474 ms` and INT8 at P50 `70.229 ms`, with action
+checksums exactly matching the corresponding original reports. See
+[`validation.md`](validation.md) for hashes and same-input reference metrics.
 
 ## Validation status
 
