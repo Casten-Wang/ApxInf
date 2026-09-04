@@ -962,6 +962,9 @@ fn dynamic_fp8_row_channel_scales_match_bf16_reference() {
     const K: usize = 2048;
     const K_PADDED: usize = 2048;
     let backend = CudaBackend::new(0).unwrap();
+    if backend.context().caps().arch_family != CudaArchFamily::Sm100 {
+        return;
+    }
     let activation = (0..M * K)
         .map(|index| {
             let row = index / K;

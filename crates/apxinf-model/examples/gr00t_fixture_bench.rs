@@ -293,9 +293,12 @@ fn install_tactics_from_env(
     let backend = apxinf_cuda::CudaBackend::new(device_id)?;
     let database = apxinf_cuda::tuning::TuningDb::from_json_file(Path::new(&path))?;
     apxinf_cuda::kernels::gemm::install_tuning_db(backend.context(), &database)?;
-    let installed_records = apxinf_cuda::tuning::installed()
-        .map(|store| store.gemm_records().count())
-        .unwrap_or_default();
+    let installed_records = backend
+        .context()
+        .tuning()
+        .snapshot()?
+        .gemm_records()
+        .count();
     if installed_records == 0 {
         return Err("GR00T BF16 tactic database installed no records".into());
     }

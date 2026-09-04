@@ -14,6 +14,7 @@ use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::cublas::CublasTranspose;
 use crate::tuning::{TacticStore, TuningDb, TuningMode, TuningPaths, TuningSession};
+use crate::workspace::output_buffer;
 
 pub(crate) use fp8::resolve_fused_plan as resolve_fused_fp8_plan;
 pub(crate) use plan::GemmPlanCache;

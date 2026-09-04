@@ -24,6 +24,10 @@ pub(super) fn prepare(key: &GemmTuningKey, tactic: TacticId) -> Result<()> {
                 )
             }
         }
+        (GemmOp::Fp8Bf16, TacticBackend::CublasLt) if key.epilogue == Epilogue::None => {
+            fp8::set_cublaslt_fp8_bf16_gemm_heuristic(key.m, key.n, key.k, tactic.value)?;
+            fp8::prepare_cublaslt_fp8_gemm_bf16(key.m, key.n, key.k)
+        }
         (GemmOp::Bf16, TacticBackend::CublasLtCustom) => {
             bf16::set_cublaslt_gemm_custom(key.m, key.n, key.k, tactic.value)?;
             bf16::prepare_cublaslt_gemm(key.m, key.n, key.k, false)

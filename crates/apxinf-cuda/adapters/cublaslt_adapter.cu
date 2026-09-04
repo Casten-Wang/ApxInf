@@ -1524,6 +1524,21 @@ extern "C" int apxinf_static_set_cublaslt_gemm_heuristic(
   return static_cast<int>(CUBLAS_STATUS_SUCCESS);
 }
 
+extern "C" int apxinf_static_set_cublaslt_fp8_gemm_bf16_heuristic(
+    int m, int n, int k, int heuristic_rank) {
+  if (m <= 0 || n <= 0 || k <= 0 || heuristic_rank < 0 ||
+      heuristic_rank >= 64) return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
+  ShapeKey key{m, n, k};
+  auto rank_it = g_fp8_bf16_cublaslt_ranks.find(key);
+  if (rank_it != g_fp8_bf16_cublaslt_ranks.end() &&
+      rank_it->second == heuristic_rank) {
+    return static_cast<int>(CUBLAS_STATUS_SUCCESS);
+  }
+  g_fp8_bf16_cublaslt_ranks[key] = heuristic_rank;
+  invalidate_fp8_bf16_shape_plans(key);
+  return static_cast<int>(CUBLAS_STATUS_SUCCESS);
+}
+
 extern "C" int apxinf_static_set_cublaslt_fp8_fused_heuristic(
     int m, int n, int k, int epilogue, int heuristic_rank) {
   if (m <= 0 || n <= 0 || k <= 0 || heuristic_rank < 0 ||

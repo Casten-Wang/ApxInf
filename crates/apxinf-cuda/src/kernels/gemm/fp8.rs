@@ -1400,7 +1400,7 @@ fn configured_fp8_bf16_heuristic(m: usize, n: usize, k: usize) -> Result<Option<
     parse_fp8_bf16_heuristic(&spec, m, n, k)
 }
 
-fn set_cublaslt_fp8_bf16_gemm_heuristic(
+pub(super) fn set_cublaslt_fp8_bf16_gemm_heuristic(
     m: usize,
     n: usize,
     k: usize,
@@ -1480,10 +1480,11 @@ pub fn gemm_fp8_bf16(
     let weight_buffer = CudaBuffer::from_tensor(weight.values_e4m3).map_err(Error::Cuda)?;
     if crate::workspace::may_prepare_native_resources() {
         let configured_rank = configured_fp8_bf16_heuristic(m, n, k)?;
-        let persisted_rank =
-            crate::tuning::lookup_gemm_exact(&bf16_output_tuning_key(ctx, m, n, k))
-                .filter(|tactic| tactic.backend == TacticBackend::CublasLt)
-                .map(|tactic| tactic.value);
+        let persisted_rank = ctx
+            .tuning()
+            .lookup_gemm_exact(&bf16_output_tuning_key(ctx, m, n, k))
+            .filter(|tactic| tactic.backend == TacticBackend::CublasLt)
+            .map(|tactic| tactic.value);
         if let Some(rank) = configured_rank.or(persisted_rank) {
             set_cublaslt_fp8_bf16_gemm_heuristic(m, n, k, rank)?;
         }
@@ -1569,10 +1570,11 @@ pub fn gemm_fp8_bias_bf16(
     let bias_buffer = CudaBuffer::from_tensor(bias).map_err(Error::Cuda)?;
     if crate::workspace::may_prepare_native_resources() {
         let configured_rank = configured_fp8_bf16_heuristic(m, n, k)?;
-        let persisted_rank =
-            crate::tuning::lookup_gemm_exact(&bf16_output_tuning_key(ctx, m, n, k))
-                .filter(|tactic| tactic.backend == TacticBackend::CublasLt)
-                .map(|tactic| tactic.value);
+        let persisted_rank = ctx
+            .tuning()
+            .lookup_gemm_exact(&bf16_output_tuning_key(ctx, m, n, k))
+            .filter(|tactic| tactic.backend == TacticBackend::CublasLt)
+            .map(|tactic| tactic.value);
         if let Some(rank) = configured_rank.or(persisted_rank) {
             set_cublaslt_fp8_bf16_gemm_heuristic(m, n, k, rank)?;
         }

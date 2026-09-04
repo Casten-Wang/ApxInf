@@ -164,7 +164,15 @@ int fa2(
               q, k, v, output, softmax_lse, batch, query_tokens,
               key_tokens, query_heads, kv_heads, head_dim, softmax_scale,
               IsCausal);
-  if (head_dim <= 96) {
+  if constexpr (IsCausal) {
+    if (head_dim <= 96) {
+      FLASH_NAMESPACE::run_mha_fwd_<Element, 96, true>(params, stream);
+    } else if (head_dim <= 128) {
+      FLASH_NAMESPACE::run_mha_fwd_<Element, 128, true>(params, stream);
+    } else {
+      FLASH_NAMESPACE::run_mha_fwd_<Element, 256, true>(params, stream);
+    }
+  } else if (head_dim <= 96) {
     FLASH_NAMESPACE::run_mha_fwd_<Element, 96, false>(params, stream);
   } else if (head_dim <= 128) {
     FLASH_NAMESPACE::run_mha_fwd_<Element, 128, false>(params, stream);

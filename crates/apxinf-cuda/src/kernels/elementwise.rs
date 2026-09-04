@@ -401,7 +401,12 @@ pub fn prepare_row_indices(
     })
 }
 
-pub fn gather_rows_bf16(
+/// Gather BF16 rows using a caller-owned device `u32` index buffer.
+///
+/// This is the low-level path used by model implementations that already keep
+/// their row order on the GPU. Safe callers with host indices should use
+/// [`gather_rows_bf16`] or [`gather_rows_bf16_prepared`] instead.
+pub fn gather_rows_bf16_device_indices(
     ctx: &CudaContext,
     input: &Tensor,
     indices: &CudaBuffer,
@@ -433,6 +438,16 @@ pub fn gather_rows_bf16(
     Ok(matrix_tensor(ctx, rows, cols, output))
 }
 
+/// Gather arbitrary rows from a BF16 matrix without staging tensor data on CPU.
+pub fn gather_rows_bf16(ctx: &CudaContext, input: &Tensor, rows: &[usize]) -> Result<Tensor> {
+    let (input_rows, _) = matrix_shape(input, "row gather")?;
+    if input.dtype() != DType::BF16 {
+        return Err(Error::Other("CUDA row gather requires BF16 input".into()));
+    }
+    let indices = prepare_row_indices(ctx, rows, input_rows)?;
+    gather_rows_bf16_prepared(ctx, input, &indices)
+}
+
 pub fn gather_rows_bf16_prepared(
     ctx: &CudaContext,
     input: &Tensor,
@@ -445,7 +460,44 @@ pub fn gather_rows_bf16_prepared(
         ));
     }
     indices.validate(ctx, input_rows, "CUDA prepared row gather")?;
-    gather_rows_bf16(ctx, input, &indices.buffer, indices.row_count)
+    gather_rows_bf16_device_indices(ctx, input, &indices.buffer, indices.row_count)
+}
+
+/// Scatter BF16 source rows into a copy of `destination` on device.
+///
+/// Row indices must be unique so overwrite and additive modes are deterministic.
+pub fn scatter_rows_bf16(
+    ctx: &CudaContext,
+    destination: &Tensor,
+    rows: &[usize],
+    source: &Tensor,
+    add: bool,
+) -> Result<Tensor> {
+    let (destination_rows, columns) = matrix_shape(destination, "row scatter destination")?;
+    let (source_rows, source_columns) = matrix_shape(source, "row scatter source")?;
+    if destination.dtype() != DType::BF16
+        || source.dtype() != DType::BF16
+        || source_rows != rows.len()
+        || source_columns != columns
+    {
+        return Err(Error::Other(format!(
+            "CUDA row scatter expects BF16 [{}, {columns}] source, got {} {:?}",
+            rows.len(),
+            source.dtype(),
+            source.shape().dims()
+        )));
+    }
+    let unique = rows
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    if unique.len() != rows.len() {
+        return Err(Error::Other(
+            "CUDA row scatter requires unique destination rows".into(),
+        ));
+    }
+    let indices = prepare_row_indices(ctx, rows, destination_rows)?;
+    scatter_rows_bf16_prepared(ctx, destination, &indices, source, add)
 }
 
 pub fn scatter_rows_bf16_prepared(
@@ -546,6 +598,44 @@ pub fn replace_rows_bf16(
         .map_err(Error::Cuda)?;
     }
     Ok(matrix_tensor(ctx, rows, cols, output))
+}
+
+/// Return a zero-copy view over contiguous rows of a CUDA matrix.
+pub fn contiguous_rows(
+    ctx: &CudaContext,
+    input: &Tensor,
+    first_row: usize,
+    row_count: usize,
+) -> Result<Tensor> {
+    let (rows, columns) = matrix_shape(input, "contiguous row slice")?;
+    let end = first_row
+        .checked_add(row_count)
+        .ok_or_else(|| Error::Other("CUDA row slice range overflow".into()))?;
+    if row_count == 0 || end > rows {
+        return Err(Error::Other(format!(
+            "CUDA row slice [{first_row}..{end}] is outside 0..{rows}"
+        )));
+    }
+    if input.device() != Device::Cuda(ctx.device_id()) {
+        return Err(Error::DeviceMismatch {
+            expected: Device::Cuda(ctx.device_id()),
+            got: input.device(),
+        });
+    }
+    let row_bytes = columns
+        .checked_mul(input.dtype().size_in_bytes())
+        .ok_or_else(|| Error::Other("CUDA row slice byte width overflow".into()))?;
+    let byte_offset = first_row
+        .checked_mul(row_bytes)
+        .ok_or_else(|| Error::Other("CUDA row slice byte offset overflow".into()))?;
+    let byte_len = row_count
+        .checked_mul(row_bytes)
+        .ok_or_else(|| Error::Other("CUDA row slice byte length overflow".into()))?;
+    let buffer = CudaBuffer::from_tensor(input)
+        .map_err(Error::Cuda)?
+        .view(byte_offset, byte_len)
+        .map_err(Error::Cuda)?;
+    Ok(buffer.into_tensor(Shape::new(vec![row_count, columns]), input.dtype()))
 }
 
 pub fn euler_update_bf16(
