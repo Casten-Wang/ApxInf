@@ -293,13 +293,15 @@ extern "C" cudaError_t apxinf_static_bias_residual_bf16(
     const void* projection, const void* bias, const void* residual,
     void* output, int rows, int cols, cudaStream_t stream) {
   const int64_t count = static_cast<int64_t>(rows) * cols;
+  // The packed4 fast path stays on by default and is toggled only by its own
+  // dedicated APXINF_BIAS_RESIDUAL_BF16_PACKED4 override. The former code also
+  // consulted the process-global APXINF_GR00T_PRECISION here, but GR00T never
+  // calls this kernel (it uses bias_then_residual_bf16); that dead branch only
+  // let a GR00T env setting perturb Pi0.5/WallOSS/Qwen3-VL in the same process.
   const char* packed4_value = std::getenv("APXINF_BIAS_RESIDUAL_BF16_PACKED4");
-  const char* precision = std::getenv("APXINF_GR00T_PRECISION");
-  const bool ordinary_fp8 = precision != nullptr &&
-      std::strcmp(precision, "fp8") == 0;
   const bool packed4_enabled = packed4_value != nullptr
       ? std::strcmp(packed4_value, "0") != 0
-      : !ordinary_fp8;
+      : true;
   const uintptr_t pointers = reinterpret_cast<uintptr_t>(projection) |
       reinterpret_cast<uintptr_t>(residual) |
       reinterpret_cast<uintptr_t>(output) |

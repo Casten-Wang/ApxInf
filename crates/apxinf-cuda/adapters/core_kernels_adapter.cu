@@ -555,10 +555,12 @@ extern "C" cudaError_t apxinf_layer_norm_bf16(
     // One cooperative block computes each row's statistics once. The former
     // tiled implementation redundantly recomputed them for every column.
     const size_t shared_bytes = static_cast<size_t>(cols) * sizeof(float);
-    const char* precision = std::getenv("APXINF_GR00T_PRECISION");
-    const bool gr00t_bf16 =
-        precision != nullptr && std::strcmp(precision, "bf16") == 0;
-    const int threads = gr00t_bf16 ? 512 : BLOCK_SIZE;
+    // Fixed launch geometry. The former variant read a process-global
+    // APXINF_GR00T_PRECISION env var to widen bf16 blocks to 512 threads,
+    // which perturbed other in-process models and made the shipped output
+    // diverge from the benchmarked value. Threads are now a fixed constant so
+    // every caller (shipped Gr00tPolicy included) uses one deterministic path.
+    const int threads = BLOCK_SIZE;
     layer_norm_bf16_kernel<<<rows, threads, shared_bytes, (cudaStream_t)stream>>>(
         (const __nv_bfloat16*)input, (const __nv_bfloat16*)weight,
         (const __nv_bfloat16*)bias, (__nv_bfloat16*)output,
@@ -573,10 +575,12 @@ extern "C" cudaError_t apxinf_adaptive_layer_norm_bf16(
     if (rows == 0 || cols == 0 || !(eps > 0.0f)) {
         return cudaErrorInvalidConfiguration;
     }
-    const char* precision = std::getenv("APXINF_GR00T_PRECISION");
-    const bool gr00t_bf16 =
-        precision != nullptr && std::strcmp(precision, "bf16") == 0;
-    const int threads = gr00t_bf16 ? 512 : BLOCK_SIZE;
+    // Fixed launch geometry. The former variant read a process-global
+    // APXINF_GR00T_PRECISION env var to widen bf16 blocks to 512 threads,
+    // which perturbed other in-process models and made the shipped output
+    // diverge from the benchmarked value. Threads are now a fixed constant so
+    // every caller (shipped Gr00tPolicy included) uses one deterministic path.
+    const int threads = BLOCK_SIZE;
     adaptive_layer_norm_bf16_kernel<<<rows, threads, 0, (cudaStream_t)stream>>>(
         (const __nv_bfloat16*)input, (const __nv_bfloat16*)modulation,
         (__nv_bfloat16*)output, rows, cols, eps);
