@@ -19,6 +19,19 @@ use super::Gr00tLinearWeights;
 const CALIBRATION_SCHEMA: &str = "apxinf.gr00t-n1.7.fp8-calibration.v1";
 const E4M3_MAX: f32 = 448.0;
 
+/// Derives the per-tensor E4M3 weight scale that maps the maximum-magnitude
+/// weight onto the largest representable E4M3 value. A zero-magnitude tensor
+/// yields a unit scale so quantization stays finite. Shared by every FP8
+/// weight path so the calibration math has a single definition and a single
+/// place to test.
+fn e4m3_weight_scale(max_abs: f32) -> f32 {
+    if max_abs == 0.0 {
+        1.0
+    } else {
+        max_abs / E4M3_MAX
+    }
+}
+
 /// GR00T-local output-channel-quantized W8A8 weights.
 ///
 /// The layout matches the model-neutral CUDA W8A8 kernel contract. Keeping the
@@ -383,11 +396,7 @@ impl Gr00tDeviceLinearWeights {
             .to_f32_vec()?
             .into_iter()
             .fold(0.0f32, |value, next| value.max(next.abs()));
-        let weight_scale = if maximum == 0.0 {
-            1.0
-        } else {
-            maximum / E4M3_MAX
-        };
+        let weight_scale = e4m3_weight_scale(maximum);
         let weight = backend.to_device(&weights.weight)?;
         let weight =
             kernels::quantization::quantize_bf16_e4m3(backend.context(), &weight, weight_scale)?;
@@ -413,11 +422,7 @@ impl Gr00tDeviceLinearWeights {
             .to_f32_vec()?
             .into_iter()
             .fold(0.0f32, |value, next| value.max(next.abs()));
-        let weight_scale = if maximum == 0.0 {
-            1.0
-        } else {
-            maximum / E4M3_MAX
-        };
+        let weight_scale = e4m3_weight_scale(maximum);
         let weight = backend.to_device(weight)?;
         let weight =
             kernels::quantization::quantize_bf16_e4m3(backend.context(), &weight, weight_scale)?;
@@ -718,10 +723,38 @@ fn validate_sha256(field: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        quantize_output_channels, CalibrationDocument, Gr00tFp8Calibration, CALIBRATION_SCHEMA,
+        e4m3_weight_scale, quantize_output_channels, CalibrationDocument, Gr00tFp8Calibration,
+        CALIBRATION_SCHEMA, E4M3_MAX,
     };
     use apxinf_core::Tensor;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn e4m3_weight_scale_maps_max_abs_onto_representable_maximum() {
+        // A non-zero maximum magnitude scales so the largest weight lands on
+        // E4M3_MAX; the derivation matches the inline math every FP8 path used.
+        let scale = e4m3_weight_scale(8.96);
+        assert_eq!(scale, 8.96f32 / E4M3_MAX);
+        assert!((8.96f32 / scale - E4M3_MAX).abs() <= f32::EPSILON * E4M3_MAX);
+        // A zero-magnitude tensor falls back to a unit scale so quantization
+        // stays finite instead of dividing by zero.
+        assert_eq!(e4m3_weight_scale(0.0), 1.0);
+    }
+
+    #[test]
+    fn e4m3_weight_scale_keeps_scaled_weights_within_e4m3_range() {
+        // Every finite weight divided by the derived scale stays inside the
+        // representable E4M3 range, for both signs and the extreme value.
+        let weights = [-8.96f32, -3.5, -0.0, 0.0, 1.25, 8.96];
+        let maximum = weights
+            .iter()
+            .fold(0.0f32, |value, next| value.max(next.abs()));
+        let scale = e4m3_weight_scale(maximum);
+        for &weight in &weights {
+            let scaled = weight / scale;
+            assert!(scaled.abs() <= E4M3_MAX + f32::EPSILON * E4M3_MAX);
+        }
+    }
 
     fn document() -> CalibrationDocument {
         CalibrationDocument {
