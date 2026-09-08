@@ -22,6 +22,17 @@ import numpy as np
 import torch
 
 
+def _round_to_bf16(value: np.ndarray) -> np.ndarray:
+    """Round f32 to BF16 (round-to-nearest-even), matching Gr00tPolicy.
+
+    Mirrors ``apxinf.policies.impls.gr00t._round_to_bf16`` byte-for-byte so the
+    LIBERO rollout consumes the exact noise the deployed policy produces.
+    """
+    bits = np.ascontiguousarray(value, dtype=np.float32).view(np.uint32)
+    rounded = bits + np.uint32(0x7FFF) + ((bits >> 16) & np.uint32(1))
+    return (rounded & np.uint32(0xFFFF0000)).view(np.float32)
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -210,21 +221,20 @@ def main() -> None:
                 args.precision,
                 args.calibration,
             )
-            self.generator = torch.Generator(device="cpu")
-            self.generator.manual_seed(args.seed)
-            self.fixed_noise = (
-                torch.randn(
+            # Match the shipped Gr00tPolicy noise path exactly: numpy
+            # default_rng draws (not torch) rounded through BF16 with the same
+            # round-to-nearest-even helper, so this harness validates the noise
+            # sequence the deployed policy actually consumes.
+            self._rng = np.random.default_rng(args.seed)
+            self.fixed_noise = _round_to_bf16(
+                self._rng.standard_normal(
                     (1, self.model.action_horizon, self.model.action_dim),
-                    generator=self.generator,
-                    dtype=torch.float32,
+                    dtype=np.float32,
                 )
-                .to(torch.bfloat16)
-                .float()
-                .numpy()
             )
             # Keep stream mode's first draw identical to the historical seeded
             # sequence; constructing the fixed tensor must not advance it.
-            self.generator.manual_seed(args.seed)
+            self._rng = np.random.default_rng(args.seed)
             self.inference_count = 0
             self.inference_seconds = 0.0
             self.first_normalized_action = None
@@ -248,15 +258,11 @@ def main() -> None:
                 inputs = self.collate_fn([processed])["inputs"]
                 noise = self.fixed_noise.copy()
                 if args.noise_mode == "stream":
-                    noise = (
-                        torch.randn(
+                    noise = _round_to_bf16(
+                        self._rng.standard_normal(
                             (1, self.model.action_horizon, self.model.action_dim),
-                            generator=self.generator,
-                            dtype=torch.float32,
+                            dtype=np.float32,
                         )
-                        .to(torch.bfloat16)
-                        .float()
-                        .numpy()
                     )
                 pixel_values = inputs["pixel_values"].float().cpu().numpy()
                 image_grid_thw = inputs["image_grid_thw"].to(torch.uint32).cpu().numpy()
