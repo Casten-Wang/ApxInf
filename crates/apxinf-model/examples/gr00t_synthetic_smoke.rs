@@ -95,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         precision: ModelPrecision::Bf16,
         backbone_path: Some(backbone_path),
         fp8_calibration_path: None,
+        tuning_path: std::env::var_os("APXINF_GR00T_BF16_TACTICS").map(PathBuf::from),
     };
 
     let mut runtime = Gr00tVlaRuntime::from_dir(checkpoint, options, Device::Cuda(device_id))?;

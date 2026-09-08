@@ -35,6 +35,7 @@ def main() -> None:
         "--precision", choices=("bf16", "fp8", "int8"), default="bf16"
     )
     parser.add_argument("--calibration", type=Path)
+    parser.add_argument("--tactics", type=Path)
     parser.add_argument(
         "--action-dim",
         type=int,
@@ -49,6 +50,7 @@ def main() -> None:
         backbone=args.backbone,
         precision=args.precision,
         calibration=args.calibration,
+        tactics=args.tactics,
         action_dim=args.action_dim,
         noise_mode="fixed",
     )

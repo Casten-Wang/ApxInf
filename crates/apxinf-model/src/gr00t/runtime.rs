@@ -14,7 +14,8 @@ use half::bf16;
 
 use crate::accelerator::create_backend;
 use crate::accelerator::cuda::{
-    downcast_arc, kernels, transfers, DeviceBuffer, KvCache as DeviceKvCache, RuntimeBackend,
+    downcast_arc, kernels, transfers, tuning, DeviceBuffer, KvCache as DeviceKvCache,
+    RuntimeBackend,
 };
 use crate::qwen3vl::general::transfer_weights as transfer_text_weights;
 use crate::qwen3vl::vision;
@@ -279,6 +280,7 @@ pub struct Gr00tVlaRuntime {
     w8a8: bool,
     fp8_calibration: Option<Gr00tFp8Calibration>,
     fp8_collector: Option<Gr00tFp8Collector>,
+    tuning_records: usize,
 }
 
 impl Gr00tVlaRuntime {
@@ -349,6 +351,25 @@ impl Gr00tVlaRuntime {
         let backend = create_backend(Device::Cuda(device_id))?;
         let backend = downcast_arc(backend)
             .ok_or_else(|| Error::Other("GR00T CUDA backend downcast failed".into()))?;
+        let tuning_records = if let Some(path) = options.tuning_path.as_deref() {
+            let database = tuning::TuningDb::from_json_file(path)?;
+            kernels::gemm::install_tuning_db(backend.context(), &database)?;
+            let records = backend
+                .context()
+                .tuning()
+                .snapshot()?
+                .gemm_records()
+                .count();
+            if records == 0 {
+                return Err(Error::Other(format!(
+                    "GR00T tactic database {} installed no compatible records",
+                    path.display()
+                )));
+            }
+            records
+        } else {
+            0
+        };
         let Gr00tWeights {
             backbone_text,
             backbone_vision,
@@ -397,11 +418,18 @@ impl Gr00tVlaRuntime {
             w8a8: options.precision == ModelPrecision::W8A8,
             fp8_calibration,
             fp8_collector,
+            tuning_records,
         })
     }
 
     pub fn config(&self) -> &Gr00tConfig {
         &self.config
+    }
+
+    /// Compatible GEMM tactic records installed in this runtime's CUDA
+    /// context. This is exposed for benchmark provenance checks.
+    pub fn tuning_record_count(&self) -> usize {
+        self.tuning_records
     }
 
     pub fn inference_spec(&self, observation: &Gr00tObservation) -> Result<Gr00tInferenceSpec> {

@@ -93,6 +93,7 @@ class Gr00tPolicy:
         device: str = "cuda:0",
         precision: str = "bf16",
         calibration=None,
+        tactics=None,
         embodiment: str = "libero_sim",
         image_keys: Sequence[str] = _DEFAULT_IMAGE_KEYS,
         state_key: str = _STATE_KEY,
@@ -146,6 +147,7 @@ class Gr00tPolicy:
                 device,
                 precision,
                 Path(calibration) if calibration is not None else None,
+                Path(tactics) if tactics is not None else None,
             )
         return cls(
             model,

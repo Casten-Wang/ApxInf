@@ -24,6 +24,9 @@ pub struct Gr00tLoadOptions {
     /// Keep this per-load instead of using process-global environment state so
     /// multiple policies can be constructed safely in one Python process.
     pub fp8_calibration_path: Option<PathBuf>,
+    /// Optional hardware-specific GEMM tactic database. The runtime installs
+    /// this database into the same CUDA context that owns model execution.
+    pub tuning_path: Option<PathBuf>,
 }
 
 impl Default for Gr00tLoadOptions {
@@ -33,6 +36,7 @@ impl Default for Gr00tLoadOptions {
             precision: ModelPrecision::Auto,
             backbone_path: None,
             fp8_calibration_path: None,
+            tuning_path: None,
         }
     }
 }

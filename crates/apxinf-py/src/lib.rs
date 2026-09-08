@@ -145,13 +145,14 @@ pub struct Gr00tModel {
 #[pymethods]
 impl Gr00tModel {
     #[staticmethod]
-    #[pyo3(signature = (checkpoint, backbone, device="cuda:0", precision="bf16", calibration=None))]
+    #[pyo3(signature = (checkpoint, backbone, device="cuda:0", precision="bf16", calibration=None, tactics=None))]
     fn load(
         checkpoint: PathBuf,
         backbone: PathBuf,
         device: &str,
         precision: &str,
         calibration: Option<PathBuf>,
+        tactics: Option<PathBuf>,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         let config =
@@ -161,6 +162,7 @@ impl Gr00tModel {
             precision: parse_precision(precision)?,
             backbone_path: Some(backbone),
             fp8_calibration_path: calibration,
+            tuning_path: tactics,
         };
         let runtime =
             Gr00tVlaRuntime::from_dir(&checkpoint, options, device).map_err(runtime_err)?;

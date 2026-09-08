@@ -42,17 +42,15 @@ struct TensorEntry {
     dtype: String,
 }
 
-struct InstalledTactics {
-    _backend: apxinf_cuda::CudaBackend,
+struct TacticProvenance {
     path: PathBuf,
     sha256: String,
-    records: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = parse_arguments()?;
     let precision = precision_from_env()?;
-    let installed_tactics = install_tactics_from_env(arguments.device_id)?;
+    let tactics = tactic_provenance_from_env()?;
     let manifest_path = arguments.fixture.join("manifest.json");
     let manifest_bytes = std::fs::read(&manifest_path)?;
     let manifest: Value = serde_json::from_slice(&manifest_bytes)?;
@@ -80,6 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         precision,
         backbone_path: Some(arguments.backbone.clone()),
         fp8_calibration_path: calibration_path.clone(),
+        tuning_path: tactics.as_ref().map(|tactics| tactics.path.clone()),
     };
 
     let load_start = Instant::now();
@@ -144,10 +143,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ExecutionMode::Graph => "auto-graph",
             ExecutionMode::Eager => "forced-eager-device-input",
         },
-        "tactics": installed_tactics.as_ref().map(|tactics| serde_json::json!({
+        "tactics": tactics.as_ref().map(|tactics| serde_json::json!({
             "path": tactics.path.display().to_string(),
             "sha256": tactics.sha256,
-            "records": tactics.records,
+            "runtime_records": runtime.tuning_record_count(),
         })),
         "provenance": {
             "benchmark_binary": {
@@ -284,36 +283,13 @@ fn precision_from_env() -> Result<ModelPrecision, Box<dyn std::error::Error>> {
     }
 }
 
-fn install_tactics_from_env(
-    device_id: usize,
-) -> Result<Option<InstalledTactics>, Box<dyn std::error::Error>> {
+fn tactic_provenance_from_env() -> Result<Option<TacticProvenance>, Box<dyn std::error::Error>> {
     let Some(path) = std::env::var_os("APXINF_GR00T_BF16_TACTICS") else {
         return Ok(None);
     };
-    let backend = apxinf_cuda::CudaBackend::new(device_id)?;
-    let database = apxinf_cuda::tuning::TuningDb::from_json_file(Path::new(&path))?;
-    apxinf_cuda::kernels::gemm::install_tuning_db(backend.context(), &database)?;
-    let installed_records = backend
-        .context()
-        .tuning()
-        .snapshot()?
-        .gemm_records()
-        .count();
-    if installed_records == 0 {
-        return Err("GR00T BF16 tactic database installed no records".into());
-    }
-    eprintln!(
-        "installed {installed_records} GR00T BF16 tactic records from {}",
-        Path::new(&path).display()
-    );
     let path = PathBuf::from(path);
     let sha256 = sha256_file(&path)?;
-    Ok(Some(InstalledTactics {
-        _backend: backend,
-        path,
-        sha256,
-        records: installed_records,
-    }))
+    Ok(Some(TacticProvenance { path, sha256 }))
 }
 
 fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {

@@ -114,9 +114,10 @@ def test_int8_precision_name_is_accepted(tmp_path, monkeypatch):
 
     class Native:
         @staticmethod
-        def load(checkpoint, backbone, device, precision, calibration):
+        def load(checkpoint, backbone, device, precision, calibration, tactics):
             assert precision == "int8"
             assert calibration is None
+            assert tactics is None
             return _FakeModel()
 
     monkeypatch.setitem(
