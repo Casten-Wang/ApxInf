@@ -131,11 +131,12 @@ The processor checkout was clean at revision
 the Python extension SHA-256 was
 `723809ce749a76baf942be4673ecfb70738e337f4a0b6b6aa2deae764ad13c15`.
 
-This Orin run is not yet the final PR gate: its ApxInf checkout was dirty and
-based on revision `16d9eab8b274c31d4e5d7d797bda7018d907608f`, while the local
-PR candidate is being scoped on a newer upstream base. The numbers are retained
-as audited engineering evidence, but the final table must come from the exact
-unchanged commit and extension submitted for review.
+The Orin INT8 parity numbers above are retained as historical engineering
+evidence only: that run predates the PR#42 branch (it was taken on a dirty
+checkout at revision `16d9eab`, which does not contain the PR#42 commits).
+The final acceptance gate below is run on the exact Thor PR#42 candidate
+(clean tree, commits through the vision-FA2 and dual-geglu-test fixes), which
+is the sm_110 target this PR ships for.
 
 Before merge, replace every pending or stage-evidence row with a result from the
 final unchanged candidate and record the campaign manifest, audit report,
@@ -144,16 +145,20 @@ revision or runtime binary must not be silently combined.
 
 ## Candidate verification status
 
-The scoped source currently passes these checks in the isolated Orin audit
-copy:
+The PR#42 candidate passes these checks on the clean Thor sm_110 tree
+(HEAD through the vision-FA2 and dual-geglu-test-fix commits):
 
 - `cargo check -p apxinf-py` (non-CUDA build);
 - `cargo check -p apxinf-py --features cuda`;
 - `cargo check -p apxinf-model --features cuda --example gr00t_fixture_bench`;
-- `cargo test -p apxinf-model --features cuda --lib`: 103/103;
+- `cargo test -p apxinf-model --features cuda --lib`: 108/108;
 - model-family boundary and unified-input integration tests: 13/13;
 - `cargo test -p apxinf-py --features cuda --lib`: 4/4;
-- `cargo test -p apxinf-cuda --lib -- --test-threads=1`: 128/128;
+- `cargo test -p apxinf-cuda --lib -- --test-threads=1`: 138/138 (this target
+  previously failed to compile: two orphan tests referenced a dual-geglu API
+  that da9cae0 refactored away, silently disabling the whole gate; the tests
+  are removed and the surviving validate_fp8_dual_geglu_record path retains the
+  coverage);
 - GR00T Python policy/audit tests: 23 passed, 2 optional real-checkpoint tests
   skipped when checkpoint/native-smoke environment variables are absent;
 - real-checkpoint Orin Rust fixture smoke: BF16 whole-graph and INT8
