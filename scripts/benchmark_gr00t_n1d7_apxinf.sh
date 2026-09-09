@@ -3,7 +3,8 @@ set -euo pipefail
 
 usage() {
     echo "usage: $0 {bf16|fp8|int8} {1|2} OUTPUT_JSON [WARMUP] [ITERATIONS]" >&2
-    echo "required env: APXINF_GR00T_CHECKPOINT APXINF_GR00T_COSMOS APXINF_GR00T_FIXTURE APXINF_GR00T_BF16_TACTICS_FILE" >&2
+    echo "required env: APXINF_GR00T_CHECKPOINT APXINF_GR00T_COSMOS APXINF_GR00T_FIXTURE" >&2
+    echo "tactics: set APXINF_GR00T_BF16_TACTICS_FILE, or APXINF_GR00T_DISABLE_TACTICS=1 for the control run" >&2
     echo "FP8 additionally requires APXINF_GR00T_CALIBRATION and may set APXINF_GR00T_TACTICS" >&2
 }
 
@@ -36,11 +37,16 @@ fi
 : "${APXINF_GR00T_CHECKPOINT:?set APXINF_GR00T_CHECKPOINT to the GR00T N1.7 checkpoint directory}"
 : "${APXINF_GR00T_COSMOS:?set APXINF_GR00T_COSMOS to the Cosmos-Reason2-2B directory}"
 : "${APXINF_GR00T_FIXTURE:?set APXINF_GR00T_FIXTURE to the prepared fixture directory}"
-: "${APXINF_GR00T_BF16_TACTICS_FILE:?set APXINF_GR00T_BF16_TACTICS_FILE to the accepted tactic database}"
 checkpoint=$APXINF_GR00T_CHECKPOINT
 cosmos=$APXINF_GR00T_COSMOS
 fixture=$APXINF_GR00T_FIXTURE
-bf16_tactics=$APXINF_GR00T_BF16_TACTICS_FILE
+disable_tactics=${APXINF_GR00T_DISABLE_TACTICS:-0}
+if [[ $disable_tactics == 1 ]]; then
+    bf16_tactics=
+else
+    : "${APXINF_GR00T_BF16_TACTICS_FILE:?set APXINF_GR00T_BF16_TACTICS_FILE, or APXINF_GR00T_DISABLE_TACTICS=1 for the control run}"
+    bf16_tactics=$APXINF_GR00T_BF16_TACTICS_FILE
+fi
 add_bf16_packed4_override=${APXINF_ADD_BF16_PACKED4:-}
 bias_residual_bf16_packed4_override=${APXINF_BIAS_RESIDUAL_BF16_PACKED4:-}
 precomputed_qwen_mrope_override=${APXINF_GR00T_PRECOMPUTED_QWEN_MROPE:-}
@@ -132,7 +138,9 @@ case $tier in
     bf16)
         export APXINF_GR00T_PRECISION=bf16
         unset APXINF_GR00T_FP8_CALIBRATION
-        export APXINF_GR00T_BF16_TACTICS=$bf16_tactics
+        if [[ -n $bf16_tactics ]]; then
+            export APXINF_GR00T_BF16_TACTICS=$bf16_tactics
+        fi
         if [[ $platform == thor ]]; then
             export APXINF_BIAS_ACTIVATION_BLOCK_CAP=80
             export APXINF_SILU_MUL_SEPARATE_BF16_PACKED4=1
@@ -148,7 +156,9 @@ case $tier in
         : "${APXINF_GR00T_CALIBRATION:?set APXINF_GR00T_CALIBRATION for FP8}"
         export APXINF_GR00T_PRECISION=fp8
         export APXINF_GR00T_FP8_CALIBRATION=$APXINF_GR00T_CALIBRATION
-        export APXINF_GR00T_BF16_TACTICS=${APXINF_GR00T_TACTICS:-$bf16_tactics}
+        if [[ $disable_tactics != 1 ]]; then
+            export APXINF_GR00T_BF16_TACTICS=${APXINF_GR00T_TACTICS:-$bf16_tactics}
+        fi
         export APXINF_GR00T_FP8_FUSED_LINEAR_BIAS=1
         ;;
     int8)
@@ -158,7 +168,9 @@ case $tier in
         fi
         export APXINF_GR00T_PRECISION=int8
         unset APXINF_GR00T_FP8_CALIBRATION
-        export APXINF_GR00T_BF16_TACTICS=$bf16_tactics
+        if [[ -n $bf16_tactics ]]; then
+            export APXINF_GR00T_BF16_TACTICS=$bf16_tactics
+        fi
         ;;
     *)
         usage

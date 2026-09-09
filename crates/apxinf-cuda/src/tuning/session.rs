@@ -30,6 +30,19 @@ pub struct ResolvedTactic {
     pub source: TacticMatch,
 }
 
+/// Process-local lookup counters for proving that an installed tuning database
+/// is actually consulted by a runtime. These are diagnostics only; graph
+/// replay does not touch them because plans are resolved before capture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TuningLookupStats {
+    pub exact: u64,
+    pub bucket: u64,
+    pub miss: u64,
+    /// Exact persisted tactics accepted by direct kernels that do not use the
+    /// generic prepared-plan cache.
+    pub applied_exact: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuningPaths {
     pub directory: PathBuf,
@@ -70,6 +83,10 @@ pub struct TuningSession {
     store: RwLock<TacticStore>,
     tune_lock: Mutex<()>,
     generation: AtomicU64,
+    exact_lookups: AtomicU64,
+    bucket_lookups: AtomicU64,
+    missed_lookups: AtomicU64,
+    applied_exact: AtomicU64,
     paths: Option<TuningPaths>,
 }
 
@@ -80,6 +97,10 @@ impl TuningSession {
             store: RwLock::new(store),
             tune_lock: Mutex::new(()),
             generation: AtomicU64::new(0),
+            exact_lookups: AtomicU64::new(0),
+            bucket_lookups: AtomicU64::new(0),
+            missed_lookups: AtomicU64::new(0),
+            applied_exact: AtomicU64::new(0),
             paths,
         }
     }
@@ -102,22 +123,46 @@ impl TuningSession {
 
     pub fn lookup_gemm(&self, key: &GemmTuningKey) -> Option<ResolvedTactic> {
         let store = self.store.read().ok()?;
-        store
-            .lookup_gemm_exact(key)
-            .map(|tactic| ResolvedTactic {
+        if let Some(tactic) = store.lookup_gemm_exact(key) {
+            self.exact_lookups.fetch_add(1, Ordering::Relaxed);
+            Some(ResolvedTactic {
                 tactic,
                 source: TacticMatch::Exact,
             })
-            .or_else(|| {
-                store.lookup_gemm_bucket(key).map(|tactic| ResolvedTactic {
-                    tactic,
-                    source: TacticMatch::Bucket,
-                })
+        } else if let Some(tactic) = store.lookup_gemm_bucket(key) {
+            self.bucket_lookups.fetch_add(1, Ordering::Relaxed);
+            Some(ResolvedTactic {
+                tactic,
+                source: TacticMatch::Bucket,
             })
+        } else {
+            self.missed_lookups.fetch_add(1, Ordering::Relaxed);
+            None
+        }
     }
 
     pub fn lookup_gemm_exact(&self, key: &GemmTuningKey) -> Option<TacticId> {
-        self.store.read().ok()?.lookup_gemm_exact(key)
+        let tactic = self.store.read().ok()?.lookup_gemm_exact(key);
+        if tactic.is_some() {
+            self.exact_lookups.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.missed_lookups.fetch_add(1, Ordering::Relaxed);
+        }
+        tactic
+    }
+
+    pub fn lookup_stats(&self) -> TuningLookupStats {
+        TuningLookupStats {
+            exact: self.exact_lookups.load(Ordering::Relaxed),
+            bucket: self.bucket_lookups.load(Ordering::Relaxed),
+            miss: self.missed_lookups.load(Ordering::Relaxed),
+            applied_exact: self.applied_exact.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Record a persisted exact tactic accepted by a direct kernel path.
+    pub fn record_exact_application(&self) {
+        self.applied_exact.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Tune one exact miss from the real operands which triggered it. Calls
@@ -344,5 +389,39 @@ mod tests {
             session.lookup_gemm(&key()).unwrap().source,
             TacticMatch::Exact
         );
+    }
+
+    #[test]
+    fn lookup_stats_distinguish_exact_bucket_and_miss() {
+        let mut store = TacticStore::default();
+        assert!(store.upsert_gemm(record()));
+        let session = TuningSession::inference(store);
+
+        assert_eq!(
+            session.lookup_gemm(&key()).unwrap().source,
+            TacticMatch::Exact
+        );
+
+        let mut bucket_key = key();
+        bucket_key.m = 700;
+        assert_eq!(
+            session.lookup_gemm(&bucket_key).unwrap().source,
+            TacticMatch::Bucket
+        );
+
+        let mut missing_key = key();
+        missing_key.n = 12345;
+        assert!(session.lookup_gemm(&missing_key).is_none());
+        assert_eq!(
+            session.lookup_stats(),
+            TuningLookupStats {
+                exact: 1,
+                bucket: 1,
+                miss: 1,
+                applied_exact: 0,
+            }
+        );
+        session.record_exact_application();
+        assert_eq!(session.lookup_stats().applied_exact, 1);
     }
 }

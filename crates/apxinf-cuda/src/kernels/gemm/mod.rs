@@ -18,7 +18,7 @@ use crate::workspace::output_buffer;
 
 pub(crate) use fp8::resolve_fused_plan as resolve_fused_fp8_plan;
 pub(crate) use plan::GemmPlanCache;
-pub use plan::{PlanSource, PreparedGemmPlan};
+pub use plan::{GemmPlanStats, PlanSource, PreparedGemmPlan};
 
 pub use bf16::{gemm_bf16 as bf16, gemm_bf16_geglu_fused as bf16_geglu_fused};
 #[cfg(test)]
