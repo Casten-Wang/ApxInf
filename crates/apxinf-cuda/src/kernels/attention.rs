@@ -379,29 +379,51 @@ pub fn vision(
     if head_dim != 64 {
         return Err(Error::Other("vision_sdpa: head_dim must be 64".into()));
     }
-    let out_bytes = seq_len * n_heads * head_dim * DType::BF16.size_in_bytes();
-    let out_buf = output_buffer(ctx, out_bytes)?;
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-    unsafe {
-        let res = ffi::apxinf_vision_sdpa_bf16(
-            gpu_ptr(q)?,
-            gpu_ptr(k)?,
-            gpu_ptr(v)?,
-            out_buf.ptr(),
-            seq_len as u32,
-            n_heads as u32,
-            head_dim as u32,
-            scale,
-            ctx.stream().handle(),
-        );
-        ffi::check_cuda(res).map_err(Error::Cuda)?;
+
+    // FA2 fast path: Qwen3-VL vision attention is a non-causal full-segment
+    // forward. On sm80/sm100 FA2 builds, route through the vendored
+    // FlashAttention-2 kernel (head_dim=64 dispatches to the hdim96 kernel via
+    // d_rounded), matching the pre-rebase 56ms baseline which ran vision on
+    // apxinf_fa2::flash_fwd_kernel<96,..>. The single-warp naive
+    // noncausal_sdpa_bf16_kernel below is ~43ms for 48 segments and is kept
+    // only for portable (non-FA2) builds.
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        let hidden_size = n_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| Error::Other("vision_sdpa: hidden size overflow".into()))?;
+        let output = fa2_attention(
+            ctx, q, k, v, 1, seq_len, seq_len, n_heads, n_heads, head_dim,
+        )?;
+        return output.reshape(vec![seq_len, hidden_size]);
     }
-    Ok(make_gpu_tensor(
-        Shape::new(vec![seq_len, n_heads * head_dim]),
-        DType::BF16,
-        ctx.device_id(),
-        out_buf,
-    ))
+
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    {
+        let out_bytes = seq_len * n_heads * head_dim * DType::BF16.size_in_bytes();
+        let out_buf = output_buffer(ctx, out_bytes)?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        unsafe {
+            let res = ffi::apxinf_vision_sdpa_bf16(
+                gpu_ptr(q)?,
+                gpu_ptr(k)?,
+                gpu_ptr(v)?,
+                out_buf.ptr(),
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                scale,
+                ctx.stream().handle(),
+            );
+            ffi::check_cuda(res).map_err(Error::Cuda)?;
+        }
+        Ok(make_gpu_tensor(
+            Shape::new(vec![seq_len, n_heads * head_dim]),
+            DType::BF16,
+            ctx.device_id(),
+            out_buf,
+        ))
+    }
 }
 
 /// Causal attention mask on CUDA. Dispatches on dtype.
