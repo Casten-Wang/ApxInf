@@ -69,25 +69,6 @@ def test_policy_contract_and_raw_observation_call():
     assert result["metadata"]["model_type"] == "gr00t"
     assert policy.action_horizon == 4
     assert result["metadata"]["model_action_horizon"] == 4
-    assert "model_inputs" not in result
-
-    diagnostic = policy.infer(
-        {
-            "observation/image": np.zeros((32, 32, 3), np.uint8),
-            "observation/wrist_image": np.zeros((32, 32, 3), np.uint8),
-            "observation/state": np.zeros(6, np.float32),
-            "prompt": "pick up the object",
-        },
-        include_model_inputs=True,
-    )
-    assert set(diagnostic["model_inputs"]) == {
-        "pixel_values",
-        "image_grid_thw",
-        "token_ids",
-        "attention_mask",
-        "state",
-        "embodiment_id",
-    }
 
 
 def test_fixed_noise_repeats_and_stream_noise_advances():
@@ -148,36 +129,6 @@ def test_int8_precision_name_is_accepted(tmp_path, monkeypatch):
         tmp_path, backbone=tmp_path, precision="int8", action_dim=3
     )
     assert policy.metadata["precision"] == "int8"
-
-
-def test_tactics_path_is_forwarded_to_native_runtime(tmp_path, monkeypatch):
-    from apxinf.policies.impls.gr00t import _NvidiaProcessorAdapter
-
-    monkeypatch.setattr(_NvidiaProcessorAdapter, "load", lambda *args, **kwargs: _FakeProcessor())
-    tactics = tmp_path / "tactics.json"
-    tactics.write_text('{"records": []}')
-
-    class Native:
-        @staticmethod
-        def load(checkpoint, backbone, device, precision, calibration, tactics_path):
-            assert precision == "bf16"
-            assert calibration is None
-            assert tactics_path == tactics
-            return _FakeModel()
-
-    monkeypatch.setitem(
-        __import__("sys").modules,
-        "apxinf_py",
-        SimpleNamespace(Gr00tModel=Native),
-    )
-    policy = Gr00tPolicy.from_pretrained(
-        tmp_path,
-        backbone=tmp_path,
-        precision="bf16",
-        tactics=tactics,
-        action_dim=3,
-    )
-    assert policy.metadata["precision"] == "bf16"
 
 
 def test_fp8_requires_calibration(tmp_path):
@@ -288,7 +239,6 @@ def test_real_libero_processor_accepts_friendly_observation():
 def test_real_libero_policy_runs_native_model_core_and_decode():
     precision = os.environ.get("APXINF_GR00T_PRECISION", "bf16")
     calibration = os.environ.get("APXINF_GR00T_CALIBRATION")
-    tactics = os.environ.get("APXINF_GR00T_TACTICS")
     if precision == "fp8" and not calibration:
         pytest.skip("APXINF_GR00T_CALIBRATION is required for FP8 native smoke")
     policy = Gr00tPolicy.from_pretrained(
@@ -296,7 +246,6 @@ def test_real_libero_policy_runs_native_model_core_and_decode():
         backbone=Path(os.environ["APXINF_GR00T_BACKBONE"]),
         precision=precision,
         calibration=Path(calibration) if calibration else None,
-        tactics=Path(tactics) if tactics else None,
         noise_mode="fixed",
     )
     try:

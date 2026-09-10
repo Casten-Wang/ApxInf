@@ -19,16 +19,6 @@ pub enum PlanSource {
     Default,
 }
 
-/// Unique prepared GEMM plans grouped by their final source. Unlike tuning
-/// lookup counters, this reflects the plan retained after provider validation
-/// and any fallback from a rejected persisted tactic.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GemmPlanStats {
-    pub exact: usize,
-    pub bucket: usize,
-    pub default: usize,
-}
-
 /// A tactic resolved and validated for one physical GEMM key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedGemmPlan {
@@ -44,22 +34,6 @@ pub struct GemmPlanCache {
 }
 
 impl GemmPlanCache {
-    pub fn stats(&self) -> Result<GemmPlanStats> {
-        let plans = self
-            .plans
-            .lock()
-            .map_err(|_| Error::Other("CUDA GEMM plan cache lock is poisoned".into()))?;
-        let mut stats = GemmPlanStats::default();
-        for plan in plans.values() {
-            match plan.source {
-                PlanSource::Exact => stats.exact += 1,
-                PlanSource::Bucket => stats.bucket += 1,
-                PlanSource::Default => stats.default += 1,
-            }
-        }
-        Ok(stats)
-    }
-
     #[cfg(test)]
     pub fn resolve(
         &self,
@@ -309,46 +283,5 @@ mod tests {
         assert!(!prepare_called);
         assert!(error.to_string().contains("plan cache miss"));
         assert!(error.to_string().contains("before capture"));
-    }
-
-    #[test]
-    fn stats_report_retained_plan_sources() {
-        let cache = GemmPlanCache::default();
-        let exact = crate::tuning::ResolvedTactic {
-            tactic: default_bf16_tactic(),
-            source: TacticMatch::Exact,
-        };
-        cache
-            .prepare_and_cache_with(
-                &key(),
-                default_bf16_tactic(),
-                Some(exact),
-                0,
-                true,
-                |_, _| Ok(()),
-            )
-            .unwrap();
-
-        let mut default_key = key();
-        default_key.m = 2;
-        cache
-            .prepare_and_cache_with(
-                &default_key,
-                default_bf16_tactic(),
-                None,
-                0,
-                true,
-                |_, _| Ok(()),
-            )
-            .unwrap();
-
-        assert_eq!(
-            cache.stats().unwrap(),
-            GemmPlanStats {
-                exact: 1,
-                bucket: 0,
-                default: 1,
-            }
-        );
     }
 }

@@ -82,16 +82,16 @@ topology is two physical cameras (`image`, `wrist_image`), ten tasks and 50
 episodes per task.
 
 ```bash
-python3 scripts/run_gr00t_n1d7_libero_campaign.py \
+# Run the shipped policy once per LIBERO-10 task/precision, e.g. by looping
+# eval_gr00t_n1d7_libero.py over the ten task ids (see calibrate_gr00t_n1d7_libero.py
+# for the task list and per-task invocation shape).
+python3 scripts/eval_gr00t_n1d7_libero.py \
   --python "$GR00T_PYTHON" \
   --source-dir "$ISAAC_GR00T_SOURCE" \
   --checkpoint "$GR00T_LIBERO_CHECKPOINT" \
   --backbone "$GR00T_BACKBONE" \
-  --calibration "$GR00T_FP8_CALIBRATION" \
   --tactics "$GR00T_TACTICS" \
-  --precisions bf16 fp8 \
-  --output-dir "$THOR_CAMPAIGN_DIR" \
-  --episodes-per-task 50 --n-envs 10 --seed 7 --resume
+  --episodes-per-task 50 --n-envs 10 --seed 7
 ```
 
 The Orin campaign uses `bf16 int8` as its public precision names and does not

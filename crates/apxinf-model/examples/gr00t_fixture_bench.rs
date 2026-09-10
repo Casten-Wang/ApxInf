@@ -110,8 +110,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let model_core = latency_summary(&model_core_samples)?;
-    let tuning_lookups = runtime.tuning_lookup_stats();
-    let gemm_plans = runtime.gemm_plan_stats()?;
     let model_core_median = model_core["median"]
         .as_f64()
         .ok_or("model-core latency summary is missing a numeric median")?;
@@ -149,17 +147,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "path": tactics.path.display().to_string(),
             "sha256": tactics.sha256,
             "runtime_records": runtime.tuning_record_count(),
-            "lookups": {
-                "exact": tuning_lookups.exact,
-                "bucket": tuning_lookups.bucket,
-                "miss": tuning_lookups.miss,
-                "direct_exact_applied": tuning_lookups.applied_exact,
-            },
-            "prepared_plans": {
-                "exact": gemm_plans.exact,
-                "bucket": gemm_plans.bucket,
-                "default": gemm_plans.default,
-            },
         })),
         "provenance": {
             "benchmark_binary": {

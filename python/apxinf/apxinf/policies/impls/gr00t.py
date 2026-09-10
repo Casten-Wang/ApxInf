@@ -164,7 +164,6 @@ class Gr00tPolicy:
         observation: Mapping[str, Any],
         *,
         noise: Optional[np.ndarray] = None,
-        include_model_inputs: bool = False,
     ) -> dict[str, Any]:
         """Return deployable actions for one raw RGB/state/prompt observation."""
         if not isinstance(observation, Mapping):
@@ -231,26 +230,13 @@ class Gr00tPolicy:
                 f"expected {self.action_dim_out}; pass action_dim= for this embodiment"
             )
         total_ms = (time.perf_counter() - started) * 1000.0
-        result = {
+        return {
             "actions": actions,
             "normalized_actions": normalized,
             "noise": noise,
             "timing": {"model_ms": model_ms, "total_ms": total_ms},
             "metadata": dict(self.metadata),
         }
-        if include_model_inputs:
-            result["model_inputs"] = {
-                key: encoded[key]
-                for key in (
-                    "pixel_values",
-                    "image_grid_thw",
-                    "token_ids",
-                    "attention_mask",
-                    "state",
-                    "embodiment_id",
-                )
-            }
-        return result
 
     __call__ = infer
 
@@ -300,14 +286,7 @@ class _NvidiaProcessorAdapter:
         self.prompt_key = prompt_key
         configs = processor.get_modality_configs()[embodiment_tag.value]
         self.modality_configs = {key: value for key, value in configs.items() if key != "rl_info"}
-        available_video_keys = list(self.modality_configs["video"].modality_keys)
-        if len(self.image_keys) > len(available_video_keys):
-            raise ValueError(
-                f"Gr00tPolicy: checkpoint exposes only {len(available_video_keys)} views "
-                f"{available_video_keys}, but image_keys has {len(self.image_keys)} entries"
-            )
-        self.video_keys = available_video_keys[: len(self.image_keys)]
-        self.modality_configs["video"].modality_keys = self.video_keys
+        self.video_keys = list(self.modality_configs["video"].modality_keys)
         self.state_keys = list(self.modality_configs["state"].modality_keys)
         self.action_keys = list(self.modality_configs["action"].modality_keys)
         self.action_horizon = len(self.modality_configs["action"].delta_indices)
@@ -320,6 +299,11 @@ class _NvidiaProcessorAdapter:
             key: _statistics_dim(statistics["action"][key])
             for key in self.action_keys
         }
+        if len(self.image_keys) != len(self.video_keys):
+            raise ValueError(
+                f"Gr00tPolicy: checkpoint expects {len(self.video_keys)} views "
+                f"{self.video_keys}, but image_keys has {len(self.image_keys)} entries"
+            )
         if action_key is not None and action_key not in self.action_keys:
             raise ValueError(f"Gr00tPolicy: unknown action_key {action_key!r}; expected {self.action_keys}")
         self.selected_action_keys = [action_key] if action_key is not None else self.action_keys

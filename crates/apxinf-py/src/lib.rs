@@ -265,35 +265,6 @@ impl Gr00tModel {
         self.config.max_action_dim
     }
 
-    #[getter]
-    fn tuning_record_count(&self) -> PyResult<usize> {
-        self.runtime
-            .as_ref()
-            .map(Gr00tVlaRuntime::tuning_record_count)
-            .ok_or_else(|| PyRuntimeError::new_err("GR00T model is closed"))
-    }
-
-    /// Return tuning counters as (exact, bucket, miss, direct_exact_applied).
-    fn tuning_lookup_stats(&self) -> PyResult<(u64, u64, u64, u64)> {
-        let stats = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("GR00T model is closed"))?
-            .tuning_lookup_stats();
-        Ok((stats.exact, stats.bucket, stats.miss, stats.applied_exact))
-    }
-
-    /// Return retained GEMM plan counts as (exact, bucket, default).
-    fn gemm_plan_stats(&self) -> PyResult<(usize, usize, usize)> {
-        let stats = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("GR00T model is closed"))?
-            .gemm_plan_stats()
-            .map_err(runtime_err)?;
-        Ok((stats.exact, stats.bucket, stats.default))
-    }
-
     /// Release model weights, CUDA Graphs and device workspaces immediately.
     fn close(&mut self) {
         self.runtime.take();

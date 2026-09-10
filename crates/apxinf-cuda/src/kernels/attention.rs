@@ -4,8 +4,7 @@ use apxinf_core::{DType, Device, Error, KvCache, Result, Shape, Tensor};
 
 use super::contracts::{
     bf16_output, check_cuda, checked_bytes, f16_output, gpu_ptr, make_gpu_tensor, matrix_shape,
-    matrix_tensor, optional_ptr, require_address, require_buffers, require_finite,
-    unsupported_dtype,
+    optional_ptr, require_address, require_buffers, require_finite, unsupported_dtype,
 };
 use super::elementwise::{bias_f16, concat_rows_f16};
 use crate::buffer::{CudaBuffer, CudaDeviceAddress};

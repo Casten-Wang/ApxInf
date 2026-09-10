@@ -2,7 +2,7 @@
 """Dump a deterministic NVIDIA GR00T N1.7 BF16 inference reference.
 
 The synthetic fixture is intentionally defined at the already-preprocessed
-model boundary.  It is identical to ``gr00t_synthetic_smoke.rs``: two 2x2
+model boundary: two 2x2
 vision grids, two image tokens, zero state, and zero initial flow noise.  That
 keeps the comparison independent of image/tokenizer preprocessing while still
 executing the complete vision, language, VL-adapter, and action-head graph.

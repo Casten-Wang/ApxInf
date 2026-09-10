@@ -432,17 +432,6 @@ impl Gr00tVlaRuntime {
         self.tuning_records
     }
 
-    pub fn tuning_lookup_stats(&self) -> apxinf_cuda::tuning::TuningLookupStats {
-        self.backend.context().tuning().lookup_stats()
-    }
-
-    pub fn gemm_plan_stats(&self) -> Result<apxinf_cuda::kernels::gemm::GemmPlanStats> {
-        self.backend
-            .context()
-            .gemm_plan_stats()
-            .map_err(Error::Other)
-    }
-
     pub fn inference_spec(&self, observation: &Gr00tObservation) -> Result<Gr00tInferenceSpec> {
         observation.inference_spec(&self.config)
     }

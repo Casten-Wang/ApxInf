@@ -575,6 +575,20 @@ fn main() {
                             cmd.arg("-DAPXINF_FA2_SM80=1");
                         }
                         cmd.arg("-DAPXINF_FA2_SPLITKV=1");
+                        // Compile-time prune of never-used FA2 feature axes.
+                        // The runtime FA2 operator never enables dropout, ALiBi,
+                        // softcap, or local/window attention (see fa2_bf16_sm80.cu:
+                        // p_dropout=1.0, no alibi_slopes_ptr/softcap, window sizes
+                        // only encode causal). Disabling these collapses the
+                        // BOOL_SWITCH instantiation tree ~32x, taking hdim128 cicc
+                        // from >1h (OOM-bound on sm_87) to a few minutes.
+                        // Bit-identical for the kernels actually dispatched.
+                        cmd.args([
+                            "-DFLASHATTENTION_DISABLE_DROPOUT",
+                            "-DFLASHATTENTION_DISABLE_ALIBI",
+                            "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                            "-DFLASHATTENTION_DISABLE_LOCAL",
+                        ]);
                         for include in &fa2_includes {
                             cmd.arg(format!("-I{}", include.display()));
                         }
@@ -590,6 +604,15 @@ fn main() {
                             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                             "-DFLASH_NAMESPACE=apxinf_fa2_direct_e4m3",
                             "-DAPXINF_FA2_DIRECT_E4M3=1",
+                        ]);
+                        // Same never-used-axis prune as the sm80 FA2 path above;
+                        // the direct-E4M3 kernels dispatch under the identical
+                        // dropout/alibi/softcap/local configuration.
+                        cmd.args([
+                            "-DFLASHATTENTION_DISABLE_DROPOUT",
+                            "-DFLASHATTENTION_DISABLE_ALIBI",
+                            "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                            "-DFLASHATTENTION_DISABLE_LOCAL",
                         ]);
                         for include in &fa2_includes {
                             cmd.arg(format!("-I{}", include.display()));

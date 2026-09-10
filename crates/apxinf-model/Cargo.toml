@@ -40,9 +40,5 @@ name = "vision_check"
 required-features = ["cuda"]
 
 [[example]]
-name = "gr00t_synthetic_smoke"
-required-features = ["cuda"]
-
-[[example]]
 name = "gr00t_fixture_bench"
 required-features = ["cuda"]

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run GR00T N1.7 ApxInf inference in NVIDIA's LIBERO rollout harness.
+"""Run the shipped ``apxinf.Gr00tPolicy`` in NVIDIA's LIBERO harness.
 
-The NVIDIA checkpoint processor and action decoder are used unchanged. Only
-the model-core call is replaced by ``apxinf_py.Gr00tModel`` so the resulting
-success rate measures the deployed ApxInf policy rather than a reimplemented
-pre/post-processing approximation.
+The simulator adapter only translates NVIDIA's batched rollout dictionary to
+the public ApxInf observation/action contract. Preprocessing, native model
+execution, BF16-rounded numpy noise and action decoding all go through the
+same public policy users deploy.
 """
 
 from __future__ import annotations
@@ -16,21 +16,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import time
 
 import numpy as np
 import torch
-
-
-def _round_to_bf16(value: np.ndarray) -> np.ndarray:
-    """Round f32 to BF16 (round-to-nearest-even), matching Gr00tPolicy.
-
-    Mirrors ``apxinf.policies.impls.gr00t._round_to_bf16`` byte-for-byte so the
-    LIBERO rollout consumes the exact noise the deployed policy produces.
-    """
-    bits = np.ascontiguousarray(value, dtype=np.float32).view(np.uint32)
-    rounded = bits + np.uint32(0x7FFF) + ((bits >> 16) & np.uint32(1))
-    return (rounded & np.uint32(0xFFFF0000)).view(np.float32)
 
 
 def sha256(path: Path) -> str:
@@ -136,21 +124,8 @@ def main() -> None:
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["MUJOCO_GL"] = "egl"
     os.environ["PYOPENGL_PLATFORM"] = "egl"
-    if args.calibration is not None:
-        os.environ["APXINF_GR00T_FP8_CALIBRATION"] = str(args.calibration.resolve())
-    if args.tactics is not None:
-        document = json.loads(args.tactics.read_text())
-        records = document.get("records", [])
-        os.environ["APXINF_FP8_BF16_CUBLASLT_TACTICS"] = ";".join(
-            f"{record['key']['m']},{record['key']['n']},{record['key']['k']}="
-            f"{record['tactic']['id']}"
-            for record in records
-        )
-
     sys.path.insert(0, str(args.source_dir.resolve()))
     import gr00t.model  # noqa: F401
-    from gr00t.data.embodiment_tags import EmbodimentTag
-    from gr00t.data.types import MessageType, VLAStepData
     from gr00t.eval._horizon_contract import PolicyHorizonSpec
     from gr00t.eval.rollout_policy import (
         MultiStepConfig,
@@ -158,83 +133,46 @@ def main() -> None:
         WrapperConfigs,
         run_rollout_gymnasium_policy,
     )
-    from gr00t.policy.gr00t_policy import Gr00tPolicy, Gr00tSimPolicyWrapper
+    from gr00t.policy.gr00t_policy import (
+        Gr00tPolicy as NvidiaGr00tPolicy,
+        Gr00tSimPolicyWrapper,
+    )
     from gr00t.policy.policy import BasePolicy
-    from transformers import AutoProcessor
+    from apxinf import Gr00tPolicy as PublicGr00tPolicy
     import apxinf_py
 
     # Maturin editable installs expose a Python package that re-exports the
     # native submodule.  Hash the loaded shared object, not its tiny __init__.py.
     apxinf_extension = getattr(apxinf_py, "apxinf_py", apxinf_py)
 
-    class ApxInfGr00tPolicy(Gr00tPolicy):
+    class ApxInfGr00tPolicy(NvidiaGr00tPolicy):
+        """Thin simulator adapter around the shipped public ApxInf policy."""
+
         def __init__(self) -> None:
             BasePolicy.__init__(self, strict=True)
-            processor_dir = (
-                args.checkpoint / "processor"
-                if (args.checkpoint / "processor").is_dir()
-                and not (args.checkpoint / "processor_config.json").exists()
-                else args.checkpoint
+            image_keys = (
+                ("observation/image",)
+                if args.views == 1
+                else ("observation/image", "observation/wrist_image")
             )
-            self.processor = AutoProcessor.from_pretrained(
-                processor_dir,
-                model_name=str(args.backbone.resolve()),
-                local_files_only=True,
-                trust_remote_code=True,
-                transformers_loading_kwargs={
-                    "local_files_only": True,
-                    "trust_remote_code": True,
-                },
-            )
-            self.processor.eval()
-            self.embodiment_tag = EmbodimentTag.resolve("libero_sim")
-            all_configs = self.processor.get_modality_configs()
-            self.modality_configs = {
-                key: value
-                for key, value in all_configs[self.embodiment_tag.value].items()
-                if key != "rl_info"
-            }
-            video_config = self.modality_configs["video"]
-            available_video_keys = list(video_config.modality_keys)
-            if args.views > len(available_video_keys):
-                raise ValueError(
-                    f"requested {args.views} views, but checkpoint exposes only "
-                    f"{len(available_video_keys)}: {available_video_keys}"
-                )
-            required_video_keys = ["image"] if args.views == 1 else ["image", "wrist_image"]
-            missing_video_keys = [
-                key for key in required_video_keys if key not in available_video_keys
-            ]
-            if missing_video_keys:
-                raise ValueError(
-                    f"checkpoint is missing required LIBERO camera keys {missing_video_keys}; "
-                    f"available keys: {available_video_keys}"
-                )
-            video_config.modality_keys = required_video_keys
-            self.video_keys = list(video_config.modality_keys)
-            self.collate_fn = self.processor.collator
-            self.language_key = self.modality_configs["language"].modality_keys[0]
-            self.model = apxinf_py.Gr00tModel.load(
+            self.deployed_policy = PublicGr00tPolicy.from_pretrained(
                 args.checkpoint,
-                args.backbone,
-                "cuda:0",
-                args.precision,
-                args.calibration,
+                backbone=args.backbone,
+                precision=args.precision,
+                calibration=args.calibration,
+                tactics=args.tactics,
+                embodiment="libero_sim",
+                image_keys=image_keys,
+                seed=args.seed,
+                noise_mode=args.noise_mode,
             )
-            # Match the shipped Gr00tPolicy noise path exactly: numpy
-            # default_rng draws (not torch) rounded through BF16 with the same
-            # round-to-nearest-even helper, so this harness validates the noise
-            # sequence the deployed policy actually consumes.
-            self._rng = np.random.default_rng(args.seed)
-            self.fixed_noise = _round_to_bf16(
-                self._rng.standard_normal(
-                    (1, self.model.action_horizon, self.model.action_dim),
-                    dtype=np.float32,
-                )
-            )
-            # Keep stream mode's first draw identical to the historical seeded
-            # sequence; constructing the fixed tensor must not advance it.
-            self._rng = np.random.default_rng(args.seed)
+            adapter = self.deployed_policy.processor
+            self.processor = adapter.processor
+            self.embodiment_tag = adapter.embodiment_tag
+            self.modality_configs = adapter.modality_configs
+            self.video_keys = adapter.video_keys
+            self.language_key = self.modality_configs["language"].modality_keys[0]
+            self.model = self.deployed_policy.model
             self.inference_count = 0
             self.inference_seconds = 0.0
             self.first_normalized_action = None
@@ -245,69 +183,48 @@ def main() -> None:
             unbatched = self._unbatch_observation(observation)
             action_batches = {}
             for obs in unbatched:
-                step = VLAStepData(
-                    images=obs["video"],
-                    states=obs["state"],
-                    actions={},
-                    text=obs["language"][self.language_key][0],
-                    embodiment=self.embodiment_tag,
-                )
-                processed = self.processor(
-                    [{"type": MessageType.EPISODE_STEP.value, "content": step}]
-                )
-                inputs = self.collate_fn([processed])["inputs"]
-                noise = self.fixed_noise.copy()
-                if args.noise_mode == "stream":
-                    noise = _round_to_bf16(
-                        self._rng.standard_normal(
-                            (1, self.model.action_horizon, self.model.action_dim),
-                            dtype=np.float32,
-                        )
+                language = obs["language"][self.language_key]
+                prompt = language if isinstance(language, str) else language[0]
+                request = {
+                    user_key: obs["video"][model_key]
+                    for user_key, model_key in zip(
+                        self.deployed_policy.image_keys, self.video_keys
                     )
-                pixel_values = inputs["pixel_values"].float().cpu().numpy()
-                image_grid_thw = inputs["image_grid_thw"].to(torch.uint32).cpu().numpy()
-                token_ids = inputs["input_ids"].to(torch.uint32).cpu().numpy().reshape(-1)
-                attention_mask = (
-                    inputs["attention_mask"].to(torch.uint8).cpu().numpy().reshape(-1)
+                }
+                request["observation/state"] = obs["state"]
+                request["prompt"] = prompt
+                result = self.deployed_policy.infer(
+                    request, include_model_inputs=True
                 )
-                normalized_state = inputs["state"].float().cpu().numpy()
-                embodiment_id = int(inputs["embodiment_id"].reshape(-1)[0])
-                if self.first_model_input_signatures is None:
-                    self.first_model_input_signatures = {
-                        "pixel_values": array_signature(pixel_values),
-                        "image_grid_thw": array_signature(image_grid_thw),
-                        "token_ids": array_signature(token_ids),
-                        "attention_mask": array_signature(attention_mask),
-                        "state": array_signature(normalized_state),
-                        "noise": array_signature(noise),
-                        "embodiment_id": embodiment_id,
-                    }
-                started = time.perf_counter()
-                normalized = np.asarray(
-                    self.model.infer(
-                        pixel_values,
-                        image_grid_thw,
-                        token_ids,
-                        attention_mask,
-                        normalized_state,
-                        embodiment_id,
-                        noise,
-                    ),
-                    dtype=np.float32,
-                )[None]
+                normalized = result["normalized_actions"][None]
                 if self.first_normalized_action is None:
                     self.first_normalized_action = normalized.copy()
-                self.inference_seconds += time.perf_counter() - started
+                if self.first_model_input_signatures is None:
+                    inputs = result["model_inputs"]
+                    self.first_model_input_signatures = {
+                        key: array_signature(inputs[key])
+                        for key in (
+                            "pixel_values",
+                            "image_grid_thw",
+                            "token_ids",
+                            "attention_mask",
+                            "state",
+                        )
+                    }
+                    self.first_model_input_signatures["noise"] = array_signature(
+                        result["noise"]
+                    )
+                    self.first_model_input_signatures["embodiment_id"] = int(
+                        inputs["embodiment_id"]
+                    )
+                self.inference_seconds += result["timing"]["model_ms"] / 1000.0
                 self.inference_count += 1
-                batched_states = {
-                    key: np.expand_dims(step.states[key], axis=0)
-                    for key in self.modality_configs["state"].modality_keys
-                }
-                actions = self.processor.decode_action(
-                    normalized, self.embodiment_tag, batched_states
-                )
-                for key, value in actions.items():
-                    action_batches.setdefault(key, []).append(value.astype(np.float32))
+                offset = 0
+                for key in self.deployed_policy.processor.selected_action_keys:
+                    width = self.deployed_policy.processor.action_dims[key]
+                    value = result["actions"][:, offset : offset + width][None]
+                    action_batches.setdefault(key, []).append(value)
+                    offset += width
             return {
                 key: np.concatenate(values, axis=0)
                 for key, values in action_batches.items()
@@ -346,6 +263,8 @@ def main() -> None:
         key: value[: args.episodes] if isinstance(value, list) else value
         for key, value in info.items()
     }
+    tuning_lookups = policy.policy.model.tuning_lookup_stats()
+    gemm_plans = policy.policy.model.gemm_plan_stats()
     result = {
         "schema": "apxinf.gr00t-n1.7.libero-rollout.v1",
         "env_name": env_name,
@@ -360,6 +279,20 @@ def main() -> None:
         "episode_info": info,
         "model_calls": policy.policy.inference_count,
         "model_seconds": policy.policy.inference_seconds,
+        "tuning": {
+            "runtime_records": int(policy.policy.model.tuning_record_count),
+            "lookups": {
+                "exact": int(tuning_lookups[0]),
+                "bucket": int(tuning_lookups[1]),
+                "miss": int(tuning_lookups[2]),
+                "direct_exact_applied": int(tuning_lookups[3]),
+            },
+            "prepared_plans": {
+                "exact": int(gemm_plans[0]),
+                "bucket": int(gemm_plans[1]),
+                "default": int(gemm_plans[2]),
+            },
+        },
         "runtime_contract": {
             "action_horizon": int(policy.policy.model.action_horizon),
             "action_dim": int(policy.policy.model.action_dim),
@@ -405,6 +338,7 @@ def main() -> None:
     temporary.write_text(encoded)
     temporary.replace(args.output)
     print(json.dumps(result, indent=2, sort_keys=True))
+    policy.policy.deployed_policy.close()
 
 
 if __name__ == "__main__":

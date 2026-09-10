@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use crate::cublas::CublasHandle;
 use crate::device_caps::CudaDeviceCaps;
 use crate::ffi;
-use crate::kernels::gemm::{GemmPlanCache, GemmPlanStats};
+use crate::kernels::gemm::GemmPlanCache;
 use crate::stream::CudaStream;
 use crate::tuning::{TacticStore, TuningSession};
 
@@ -101,10 +101,6 @@ impl CudaContext {
 
     pub(crate) fn gemm_plans(&self) -> &GemmPlanCache {
         &self.gemm_plans
-    }
-
-    pub fn gemm_plan_stats(&self) -> Result<GemmPlanStats, String> {
-        self.gemm_plans.stats().map_err(|error| error.to_string())
     }
 
     pub fn synchronize(&self) -> Result<(), String> {
