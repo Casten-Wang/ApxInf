@@ -154,6 +154,8 @@ python scripts/eval_libero.py \
   --precision bf16 \
   --suite libero_10 \
   --trials-per-task 10 \
+  --max-steps 720 \
+  --replan-steps 8 \
   --results-jsonl devlocal/gr00t-n1d7/results/libero-bf16.jsonl \
   --summary-json devlocal/gr00t-n1d7/results/libero-bf16-summary.json
 ```
@@ -177,5 +179,8 @@ Development two-view rollouts use at most 10 episodes per LIBERO task. Before
 the final GR00T task campaign, PI0.5 performance, numerical accuracy, and task
 accuracy regression must all pass. Only then is the two-view GR00T release
 candidate evaluated with 50 episodes for each of the 10 LIBERO-10 tasks and
-each supported platform/precision pair. WallOSS smoke/regression is run when
-the device schedule permits.
+each supported platform/precision pair. GR00T LIBERO rollouts explicitly use
+the NVIDIA N1.7 evaluation protocol of 720 maximum simulator steps and 8
+executed actions per predicted chunk; the evaluator's 520/5 defaults remain
+unchanged for existing PI0.5 and WallOSS callers. WallOSS smoke/regression is
+run when the device schedule permits.

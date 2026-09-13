@@ -144,7 +144,13 @@ def _add_apxinf_to_path() -> None:
 # --- LIBERO harness (inlined; was scripts/libero_harness.py) ------------------
 
 
-def completed_runs(path: pathlib.Path, precision: str) -> dict[LedgerKey, dict]:
+def completed_runs(
+    path: pathlib.Path,
+    precision: str,
+    *,
+    max_steps: Optional[int] = None,
+    replan_steps: Optional[int] = None,
+) -> dict[LedgerKey, dict]:
     """Load the ``status == "completed"`` rows from a resumable ledger.
 
     Keyed by ``(suite, task_id, trial_id)`` so one ledger can hold several suites
@@ -165,6 +171,16 @@ def completed_runs(path: pathlib.Path, precision: str) -> dict[LedgerKey, dict]:
                 f"at line {line_number}"
             )
         if item.get("status") == "completed":
+            if max_steps is not None and item.get("max_steps") != max_steps:
+                raise ValueError(
+                    f"ledger max_steps is {item.get('max_steps')!r}, requested "
+                    f"{max_steps!r} at line {line_number}"
+                )
+            if replan_steps is not None and item.get("replan_steps") != replan_steps:
+                raise ValueError(
+                    f"ledger replan_steps is {item.get('replan_steps')!r}, requested "
+                    f"{replan_steps!r} at line {line_number}"
+                )
             key: LedgerKey = (
                 str(item["suite"]),
                 int(item["task_id"]),
@@ -190,6 +206,9 @@ def write_summary(
     expected_keys: set[LedgerKey],
     precision: str,
     transport: str,
+    *,
+    max_steps: int = MAX_STEPS,
+    replan_steps: int = REPLAN_STEPS,
 ) -> None:
     """Write the aggregate summary, grouped per-suite then per-task."""
     per_suite: dict[str, dict] = {}
@@ -223,6 +242,11 @@ def write_summary(
         "suites": sorted({key[0] for key in expected_keys}),
         "transport": transport,
         "precision": precision,
+        "rollout_protocol": {
+            "max_steps": max_steps,
+            "replan_steps": replan_steps,
+            "wait_steps": WAIT_STEPS,
+        },
         "expected_runs": len(expected_keys),
         "completed_runs": len(rows),
         "missing_runs": [
@@ -521,6 +545,7 @@ def run_episode(
     warm_start_alpha: float,
     replan_steps: int = REPLAN_STEPS,
     settle_gripper: float = -1.0,
+    max_steps: int = MAX_STEPS,
 ) -> dict:
     episode_started = time.perf_counter()
     env.reset()
@@ -552,7 +577,7 @@ def run_episode(
     warm_noise_checksum = None
     rng = np.random.default_rng(seed + 1_000_003 * task_id + 10_007 * trial_id)
 
-    while action_steps < MAX_STEPS:
+    while action_steps < max_steps:
         if not action_plan:
             preprocess_started = time.perf_counter()
             images = libero_images(
@@ -655,6 +680,8 @@ def run_episode(
         "transport": transport,
         "image_input": "openpi_uint8_hwc",
         "seed": seed,
+        "max_steps": max_steps,
+        "replan_steps": replan_steps,
     }
 
 
@@ -679,6 +706,12 @@ def parse_args() -> argparse.Namespace:
         "--model-seed",
         type=int,
         help="in-process model sampling seed (default: reuse --seed)",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=MAX_STEPS,
+        help=f"maximum simulator action steps per episode (default: {MAX_STEPS})",
     )
     parser.add_argument(
         "--replan-steps",
@@ -830,6 +863,8 @@ def parse_args() -> argparse.Namespace:
             )
     if args.replan_steps <= 0:
         parser.error("--replan-steps must be positive")
+    if args.max_steps <= 0:
+        parser.error("--max-steps must be positive")
     if args.trials_per_task <= 0 or args.trials_per_task > 50:
         parser.error("--trials-per-task must be in 1..=50")
     return args
@@ -879,13 +914,26 @@ def main() -> None:
         for task_id in task_ids
         for trial_id in range(args.trials_per_task)
     }
-    ledger = completed_runs(args.results_jsonl, args.precision)
+    ledger = completed_runs(
+        args.results_jsonl,
+        args.precision,
+        max_steps=args.max_steps,
+        replan_steps=args.replan_steps,
+    )
     unexpected = set(ledger) - expected_keys
     if unexpected:
         raise ValueError(
             f"ledger contains runs outside requested scope: {sorted(unexpected)}"
         )
-    write_summary(args.summary_json, ledger, expected_keys, args.precision, transport)
+    write_summary(
+        args.summary_json,
+        ledger,
+        expected_keys,
+        args.precision,
+        transport,
+        max_steps=args.max_steps,
+        replan_steps=args.replan_steps,
+    )
 
     backend = build_backend(args)
     print(f"backend={args.backend} metadata={backend.metadata}", flush=True)
@@ -921,8 +969,9 @@ def main() -> None:
                                     args.seed,
                                     args.warm_start,
                                     args.warm_start_alpha,
-                                    args.replan_steps,
-                                    args.settle_gripper,
+                                    replan_steps=args.replan_steps,
+                                    settle_gripper=args.settle_gripper,
+                                    max_steps=args.max_steps,
                                 )
                                 record["attempt"] = attempt
                                 record["precision"] = args.precision
@@ -931,6 +980,8 @@ def main() -> None:
                                 write_summary(
                                     args.summary_json, ledger, expected_keys,
                                     args.precision, transport,
+                                    max_steps=args.max_steps,
+                                    replan_steps=args.replan_steps,
                                 )
                                 print(
                                     f"{name} task={task_id} trial={trial_id} "
@@ -967,7 +1018,15 @@ def main() -> None:
     finally:
         backend.close()
 
-    write_summary(args.summary_json, ledger, expected_keys, args.precision, transport)
+    write_summary(
+        args.summary_json,
+        ledger,
+        expected_keys,
+        args.precision,
+        transport,
+        max_steps=args.max_steps,
+        replan_steps=args.replan_steps,
+    )
     missing = expected_keys - set(ledger)
     if missing:
         raise RuntimeError(f"evaluation incomplete; missing {sorted(missing)}")

@@ -116,3 +116,125 @@ def test_missing_norm_stats_is_rejected_before_rollout(monkeypatch, tmp_path, ca
         parse(monkeypatch, tmp_path, "--norm-stats", str(tmp_path / "missing.json"))
     assert exc.value.code == 2
     assert "--norm-stats must name an existing file" in capsys.readouterr().err
+
+
+def test_rollout_protocol_defaults_remain_openpi_compatible(monkeypatch, tmp_path):
+    args = parse(monkeypatch, tmp_path)
+
+    assert args.max_steps == 520
+    assert args.replan_steps == 5
+
+
+def test_rollout_protocol_can_select_official_gr00t_values(monkeypatch, tmp_path):
+    args = parse(
+        monkeypatch,
+        tmp_path,
+        "--max-steps",
+        "720",
+        "--replan-steps",
+        "8",
+    )
+
+    assert args.max_steps == 720
+    assert args.replan_steps == 8
+
+
+def test_completed_runs_rejects_mixed_rollout_protocol(tmp_path):
+    ledger = tmp_path / "results.jsonl"
+    ledger.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "precision": "bf16",
+                "suite": "libero_10",
+                "task_id": 0,
+                "trial_id": 0,
+                "max_steps": 520,
+                "replan_steps": 5,
+            }
+        )
+        + "\n"
+    )
+
+    with pytest.raises(ValueError, match="ledger max_steps is 520, requested 720"):
+        eval_libero.completed_runs(
+            ledger,
+            "bf16",
+            max_steps=720,
+            replan_steps=8,
+        )
+
+
+def test_summary_records_rollout_protocol(tmp_path):
+    summary = tmp_path / "summary.json"
+    expected = {("libero_10", 0, 0)}
+
+    eval_libero.write_summary(
+        summary,
+        {},
+        expected,
+        "bf16",
+        "in_process_api",
+        max_steps=720,
+        replan_steps=8,
+    )
+
+    assert json.loads(summary.read_text())["rollout_protocol"] == {
+        "max_steps": 720,
+        "replan_steps": 8,
+        "wait_steps": 10,
+    }
+
+
+def test_run_episode_obeys_explicit_max_steps(monkeypatch):
+    observation = {
+        "agentview_image": np.zeros((2, 2, 3), dtype=np.uint8),
+        "robot0_eye_in_hand_image": np.zeros((2, 2, 3), dtype=np.uint8),
+    }
+
+    class FakeEnv:
+        def reset(self):
+            return None
+
+        def set_init_state(self, initial_state):
+            return observation
+
+        def step(self, action):
+            return observation, 0.0, False, {}
+
+    class FakeBackend:
+        def state_from_observation(self, value):
+            return np.zeros(8, dtype=np.float32)
+
+        def infer(self, base, wrist, state, prompt, noise=None):
+            return (
+                np.zeros((8, 7), dtype=np.float32),
+                np.zeros((8, 7), dtype=np.float32),
+                {},
+            )
+
+    monkeypatch.setattr(
+        eval_libero,
+        "libero_images",
+        lambda base, wrist: (base, wrist),
+    )
+    record = eval_libero.run_episode(
+        FakeEnv(),
+        np.zeros(1),
+        "libero_10",
+        0,
+        0,
+        "task",
+        FakeBackend(),
+        "in_process_api",
+        7,
+        False,
+        0.5,
+        replan_steps=8,
+        max_steps=3,
+    )
+
+    assert record["action_steps"] == 3
+    assert record["replans"] == 1
+    assert record["max_steps"] == 3
+    assert record["replan_steps"] == 8
