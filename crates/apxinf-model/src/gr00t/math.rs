@@ -1,4 +1,4 @@
-use std::f64::consts::LN_10;
+use std::f32::consts::LN_10;
 
 use apxinf_core::{Error, Result};
 
@@ -82,12 +82,17 @@ fn sinusoidal_embedding(
 
     let mut sin = Vec::with_capacity(half);
     let mut cos = Vec::with_capacity(half);
-    let log_max_period = 4.0 * LN_10;
+    // NVIDIA constructs both embeddings with FP32 torch operations on the
+    // model device before casting them to the model dtype.  Computing the
+    // transcendental inputs in f64 changes a handful of values after the BF16
+    // cast (most visibly at timestep 750), and those differences are amplified
+    // by the four denoising steps.  Keep the complete construction in f32.
+    let log_max_period = 4.0f32 * LN_10;
     for index in 0..half {
-        let frequency = (-(index as f64) * log_max_period / denominator as f64).exp();
-        let phase = timestep as f64 * frequency;
-        sin.push(phase.sin() as f32);
-        cos.push(phase.cos() as f32);
+        let frequency = (-(index as f32) * log_max_period / denominator as f32).exp();
+        let phase = timestep as f32 * frequency;
+        sin.push(phase.sin());
+        cos.push(phase.cos());
     }
     if flip_sin_to_cos {
         cos.extend(sin);
@@ -159,6 +164,17 @@ mod tests {
         let projection = dit_timestep_projection(0, 8).unwrap();
         assert_eq!(&projection[..4], &[1.0; 4]);
         assert_eq!(&projection[4..], &[0.0; 4]);
+    }
+
+    #[test]
+    fn timestep_embeddings_round_like_torch_fp32_before_bf16() {
+        let action = action_timestep_embedding(750, 1024).unwrap();
+        assert_eq!(half::bf16::from_f32(action[533]).to_bits(), 0x3ec3);
+        assert_eq!(half::bf16::from_f32(action[612]).to_bits(), 0x3c96);
+
+        let dit = dit_timestep_projection(750, 256).unwrap();
+        assert_eq!(half::bf16::from_f32(dit[2]).to_bits(), 0x3a97);
+        assert_eq!(half::bf16::from_f32(dit[141]).to_bits(), 0x3c60);
     }
 
     #[test]

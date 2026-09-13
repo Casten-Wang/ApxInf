@@ -871,10 +871,34 @@ fn validate_grid_layout(
     Ok(segments)
 }
 
+#[inline]
+fn round_bf16(value: f32) -> f32 {
+    half::bf16::from_f32(value).to_f32()
+}
+
+#[inline]
+fn interpolate_position_bf16(values: [f32; 4], weights: [f32; 4]) -> f32 {
+    // HF materializes the interpolation weights in the BF16 dtype of
+    // `pos_embed.weight`, multiplies into a BF16 tensor, and evaluates the
+    // left-associated four-tensor sum as three separate BF16 additions.
+    // Preserve those rounding points instead of contracting the expression in
+    // f32 and rounding only once at the end.
+    let weighted = [
+        round_bf16(values[0] * round_bf16(weights[0])),
+        round_bf16(values[1] * round_bf16(weights[1])),
+        round_bf16(values[2] * round_bf16(weights[2])),
+        round_bf16(values[3] * round_bf16(weights[3])),
+    ];
+    let first = round_bf16(weighted[0] + weighted[1]);
+    let second = round_bf16(first + weighted[2]);
+    round_bf16(second + weighted[3])
+}
+
 /// Compute the bilinear-interpolated, permuted positional embeddings.
 /// HF's `fast_pos_embed_interpolate`: take the 48×48 learned pos_embed
-/// table, bilinearly interpolate to (H, W), then permute to the
-/// spatial-merge layout where 2×2 patches are consecutive.
+/// table, bilinearly interpolate to (H, W) with BF16 materialization at the
+/// same operation boundaries, then permute to the spatial-merge layout where
+/// 2×2 patches are consecutive.
 fn compute_pos_embeds(
     cfg: &Qwen3VLConfig,
     b: &dyn Backend,
@@ -917,10 +941,15 @@ fn compute_pos_embeds(
                     let v01 = table[(h0 * grid_side + w1) * hidden + c];
                     let v10 = table[(h1 * grid_side + w0) * hidden + c];
                     let v11 = table[(h1 * grid_side + w1) * hidden + c];
-                    interp[dst + c] = (1.0 - dh) * (1.0 - dw) * v00
-                        + (1.0 - dh) * dw * v01
-                        + dh * (1.0 - dw) * v10
-                        + dh * dw * v11;
+                    interp[dst + c] = interpolate_position_bf16(
+                        [v00, v01, v10, v11],
+                        [
+                            (1.0f32 - dh) * (1.0f32 - dw),
+                            (1.0f32 - dh) * dw,
+                            dh * (1.0f32 - dw),
+                            dh * dw,
+                        ],
+                    );
                 }
             }
         }
@@ -1016,5 +1045,19 @@ mod tests {
         assert_eq!(output.shape().dims(), &[2, 12]);
         assert_eq!(output.as_f32().unwrap(), values.as_slice());
         assert!(reshape_merge(&input, 7, 3, 2).is_err());
+    }
+
+    #[test]
+    fn position_interpolation_preserves_hf_bf16_rounding_points() {
+        // A real interpolation point from the N1.7 Qwen3-VL position table.
+        // HF rounds the weights and products to BF16 before each addition;
+        // evaluating the same expression entirely in f32 would round to
+        // 0.7734375 instead of the reference 0.77734375.
+        let value = interpolate_position_bf16(
+            [0.77734375, 0.75390625, 0.58203125, 0.5625],
+            [0.8671875, 0.1337890625, 0.0, 0.0],
+        );
+        assert_eq!(half::bf16::from_f32(value).to_bits(), 0x3f47);
+        assert_eq!(value, 0.77734375);
     }
 }
