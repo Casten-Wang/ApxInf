@@ -21,9 +21,9 @@ resize remains inside the selected policy.
 key is ``(suite, task_id, trial_id)`` so multiple suites share one resumable
 account without ``task_id=0`` colliding across suites.
 
-Adding a new model needs no change here: register a policy in ``apxinf.policies``
-(``@register_policy("<name>")``) and run ``--backend in-process --model-type
-<name> --model-dir <ckpt>`` (or serve it and use ``--backend websocket``).
+Model loading remains registry-driven. Dataset/model-specific state or action
+conventions are explicit adapters in ``scripts/libero_observation.py`` rather
+than being hidden in the shared rollout loop.
 
 This script exists so a kernel change, an FP8 recalibration or a tactic bump can
 be regressed end-to-end against ApxInf's own published LIBERO numbers. The
@@ -34,8 +34,9 @@ observation conversion it uses is mirrored elsewhere; see
     python scripts/eval_libero.py --backend websocket --precision bf16 \
         --suite libero_10 --results-jsonl r.jsonl --summary-json s.json
 
-    # in-process (no server)
+    # in-process GR00T (no server)
     python scripts/eval_libero.py --backend in-process --model-dir /path/ckpt \
+        --backbone /path/to/Cosmos-Reason2-2B \
         --precision bf16 --action-dim 7 --suite libero_10 \
         --results-jsonl r.jsonl --summary-json s.json
 """
@@ -50,14 +51,28 @@ import pathlib
 import sys
 import time
 import traceback
-from typing import NamedTuple, Optional, Protocol, Tuple
+from typing import Any, NamedTuple, Optional, Protocol, Tuple
 
 import numpy as np
 
 if __package__:
-    from .libero_observation import libero_images, libero_state, make_env
+    from .libero_observation import (
+        libero_gr00t_action,
+        libero_gr00t_state,
+        libero_images,
+        libero_state,
+        load_libero_init_states,
+        make_env,
+    )
 else:
-    from libero_observation import libero_images, libero_state, make_env
+    from libero_observation import (
+        libero_gr00t_action,
+        libero_gr00t_state,
+        libero_images,
+        libero_state,
+        load_libero_init_states,
+        make_env,
+    )
 
 # --- rollout protocol constants (OpenPI's public PI0.5 LIBERO configuration) ---
 LIBERO_ACTION_DIM = 7
@@ -284,11 +299,15 @@ class Backend(Protocol):
     #: Static description sent by / read from the underlying policy.
     metadata: dict
 
+    def state_from_observation(self, observation) -> Any:
+        """Return the state representation expected by the selected policy."""
+        ...
+
     def infer(
         self,
         base: np.ndarray,
         wrist: np.ndarray,
-        state: np.ndarray,
+        state: Any,
         prompt: str,
         noise: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, Optional[np.ndarray], dict]:
@@ -299,7 +318,7 @@ class Backend(Protocol):
         ...
 
 
-def _observation(base, wrist, state, prompt, keys: WireKeys) -> dict:
+def _observation(base, wrist, state: Any, prompt, keys: WireKeys) -> dict:
     """The OpenPI LIBERO observation both backends consume, identical on the wire
     and in-process. The keys are resolved once per run, so what the evaluator
     sends and what the policy is built to read cannot drift apart mid-rollout."""
@@ -389,6 +408,11 @@ class WebsocketBackend:
             "server_processor_seconds": max(0.0, server_compute_ms - model_ms) / 1000.0,
         }
 
+    def state_from_observation(self, observation) -> np.ndarray:
+        # Preserve the established OpenPI wire contract. A GR00T websocket
+        # server can expose its own adapter without changing this evaluator.
+        return libero_state(observation)
+
     def close(self) -> None:
         connection = getattr(self._client, "_ws", None)
         if connection is not None:
@@ -411,6 +435,7 @@ class InProcessBackend:
 
         self._keys = keys
         options = {
+            "backbone": args.backbone,
             "checkpoint": args.checkpoint,
             "calibration": args.calibration,
             "tactics": args.tactics,
@@ -441,6 +466,12 @@ class InProcessBackend:
             **{name: value for name, value in options.items() if value is not None},
         )
         self.metadata = dict(getattr(self._policy, "metadata", {}))
+        self._is_gr00t = self.metadata.get("model_type") == "gr00t"
+
+    def state_from_observation(self, observation):
+        if self._is_gr00t:
+            return libero_gr00t_state(observation)
+        return libero_state(observation)
 
     def infer(
         self, base, wrist, state, prompt, noise=None
@@ -449,6 +480,8 @@ class InProcessBackend:
             _observation(base, wrist, state, prompt, self._keys), noise=noise
         )
         actions = np.asarray(result["actions"], dtype=np.float32)
+        if self._is_gr00t:
+            actions = libero_gr00t_action(actions)
         normalized = np.asarray(result["normalized_actions"], dtype=np.float32)
         timing = result.get("timing", {}) or {}
         model_ms = float(timing.get("model_ms", 0.0))
@@ -526,7 +559,7 @@ def run_episode(
                 observation["agentview_image"],
                 observation["robot0_eye_in_hand_image"],
             )
-            state = libero_state(observation)
+            state = backend.state_from_observation(observation)
             preprocess_seconds += time.perf_counter() - preprocess_started
 
             noise = None
@@ -685,6 +718,11 @@ def parse_args() -> argparse.Namespace:
     in_process = parser.add_argument_group("in-process backend")
     in_process.add_argument("--model-dir", type=pathlib.Path)
     in_process.add_argument("--model-type", default=None, help="override config.json model type")
+    in_process.add_argument(
+        "--backbone",
+        type=pathlib.Path,
+        help="named backbone asset required by models such as GR00T N1.7",
+    )
     in_process.add_argument("--checkpoint", type=pathlib.Path)
     in_process.add_argument("--device", default="cuda:0")
     in_process.add_argument("--calibration", type=pathlib.Path)
@@ -865,7 +903,7 @@ def main() -> None:
                     print(f"{name} task {task_id}: already complete", flush=True)
                     continue
                 print(f"{name} task {task_id}: pending trials {pending}", flush=True)
-                initial_states = suite.get_task_init_states(task_id)
+                initial_states = load_libero_init_states(suite, task_id)
                 env = make_env(task, args.seed)
                 try:
                     for trial_id in pending:

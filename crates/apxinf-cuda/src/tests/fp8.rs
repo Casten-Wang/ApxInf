@@ -1517,6 +1517,62 @@ fn fused_fp8_bias_autotune_publishes_one_exact_key() {
 }
 
 #[test]
+fn fp8_bf16_autotune_publishes_and_reuses_one_exact_key() {
+    const M: usize = 7;
+    const N: usize = 64;
+    const K: usize = 64;
+    let backend = CudaBackend::new(0).unwrap();
+    if backend.context().caps().arch_family != CudaArchFamily::Sm100 {
+        return;
+    }
+    crate::kernels::gemm::configure_tuning(
+        backend.context(),
+        crate::tuning::TuningMode::AutoTune,
+        &[],
+        None,
+    )
+    .unwrap();
+    let activation = backend
+        .to_device(&Tensor::from_f8_e4m3(vec![M, K], &vec![0x38; M * K]).unwrap())
+        .unwrap();
+    let weight = backend
+        .to_device(&Tensor::from_f8_e4m3(vec![K, N], &vec![0x30; K * N]).unwrap())
+        .unwrap();
+    let weight = crate::kernels::gemm::Fp8WeightView {
+        values_e4m3: &weight,
+        scale: 1.0,
+        dual_geglu_interleaved: false,
+        dual_geglu_auto_interleaved: None,
+    };
+
+    let first =
+        crate::kernels::gemm::fp8_bf16(backend.context(), &activation, 1.0, weight).unwrap();
+    assert_eq!(first.shape().dims(), [M, N]);
+    let key = crate::tuning::GemmTuningKey {
+        op: crate::tuning::GemmOp::Fp8Bf16,
+        device: crate::tuning::DeviceFingerprint::from(backend.context().caps()),
+        m: M,
+        n: N,
+        k: K,
+        activation_dtype: crate::tuning::TuningDType::F8E4M3,
+        weight_dtype: crate::tuning::TuningDType::F8E4M3,
+        output_dtype: crate::tuning::TuningDType::Bf16,
+        layout: crate::tuning::GemmLayout::RowMajor,
+        scale_mode: crate::tuning::ScaleMode::PerTensor,
+        epilogue: crate::tuning::Epilogue::None,
+        workspace_limit: usize::MAX,
+    };
+    let first_generation = backend.context().tuning().generation();
+    assert_eq!(first_generation, 1);
+    assert!(backend.context().tuning().lookup_gemm_exact(&key).is_some());
+
+    let second =
+        crate::kernels::gemm::fp8_bf16(backend.context(), &activation, 1.0, weight).unwrap();
+    assert_eq!(second.shape().dims(), [M, N]);
+    assert_eq!(backend.context().tuning().generation(), first_generation);
+}
+
+#[test]
 fn fused_vision_fc1_gelu_matches_decomposed_path() {
     const M: usize = 512;
     const N: usize = 4304;

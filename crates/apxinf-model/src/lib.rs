@@ -4,6 +4,7 @@ mod accelerator;
 pub mod builtin;
 pub mod debug;
 mod generation_config;
+pub mod gr00t;
 pub mod llama;
 pub mod llm_trait;
 pub mod registry;
@@ -29,7 +30,7 @@ pub use pi05::{Pi05Config, Pi05PerformanceProfile};
 pub use qwen3vl::{GeneralQwen3VL, Qwen3VLConfig, Qwen3VLTextWeights};
 pub use vla::{
     Action, ImageLayout, InferenceSpec, InitialLatent, Observation,
-    PreparedInference, VisionObservation, VlaContract, VlaRequest, VlaRuntime,
+    PreparedInference, VisionObservation, VlaContract, VlaMetadata, VlaRequest, VlaRuntime,
 };
 #[cfg(feature = "cuda")]
 pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};

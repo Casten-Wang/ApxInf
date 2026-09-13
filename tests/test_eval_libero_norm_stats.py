@@ -4,6 +4,7 @@ import json
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from apxinf import AutoPolicy
@@ -52,6 +53,53 @@ def test_omitted_norm_stats_preserves_checkpoint_defaults(monkeypatch, tmp_path)
     args = parse(monkeypatch, tmp_path)
     eval_libero.InProcessBackend(args, eval_libero.resolve_wire_keys(args))
     assert "norm_stats" not in options
+
+
+def test_gr00t_backbone_and_two_joint_state_reach_policy(monkeypatch, tmp_path):
+    options = {}
+
+    def load(model_dir, **kwargs):
+        options.update(kwargs)
+        return SimpleNamespace(metadata={"model_type": "gr00t"})
+
+    monkeypatch.setattr(AutoPolicy, "from_pretrained", load)
+    backbone = tmp_path / "backbone"
+    args = parse(monkeypatch, tmp_path, "--model-type", "gr00t", "--backbone", str(backbone))
+    backend = eval_libero.InProcessBackend(args, eval_libero.resolve_wire_keys(args))
+    state = backend.state_from_observation(
+        {
+            "robot0_eef_pos": np.array([0.1, 0.2, 0.3]),
+            "robot0_eef_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+            "robot0_gripper_qpos": np.array([0.04, -0.04]),
+        }
+    )
+
+    assert options["backbone"] == backbone
+    np.testing.assert_array_equal(
+        state["gripper"], np.array([0.04, -0.04], dtype=np.float32)
+    )
+
+
+def test_gr00t_decoded_gripper_is_adapted_before_libero_step(monkeypatch, tmp_path):
+    class FakePolicy:
+        metadata = {"model_type": "gr00t"}
+
+        def infer(self, observation, *, noise=None):
+            actions = np.zeros((2, 7), dtype=np.float32)
+            actions[:, -1] = [0.0, 1.0]
+            return {
+                "actions": actions,
+                "normalized_actions": np.zeros((2, 132), dtype=np.float32),
+                "timing": {},
+            }
+
+    monkeypatch.setattr(AutoPolicy, "from_pretrained", lambda *args, **kwargs: FakePolicy())
+    args = parse(monkeypatch, tmp_path, "--model-type", "gr00t")
+    backend = eval_libero.InProcessBackend(args, eval_libero.resolve_wire_keys(args))
+
+    actions, _, _ = backend.infer(None, None, None, "prompt")
+
+    np.testing.assert_array_equal(actions[:, -1], np.array([1.0, -1.0], dtype=np.float32))
 
 
 def test_websocket_norm_stats_is_rejected(monkeypatch, tmp_path, capsys):
