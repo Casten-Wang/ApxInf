@@ -41,6 +41,9 @@ class _ProcessorAdapter(Protocol):
     """Small injectable seam around NVIDIA's processor, also used by tests."""
 
     image_keys: tuple[str, ...]
+    state_key: str
+    prompt_key: str
+    state_dim: int
     action_horizon: int
     action_dim: int
 
@@ -71,6 +74,8 @@ class Gr00tPolicy:
         self.model = model
         self.processor = processor
         self.image_keys = tuple(processor.image_keys)
+        self.state_key = processor.state_key
+        self.prompt_key = processor.prompt_key
         self.noise_mode = noise_mode
         self.action_horizon_out = (
             int(action_horizon) if action_horizon is not None else int(model.action_horizon)
@@ -87,7 +92,11 @@ class Gr00tPolicy:
             "model_action_horizon": int(model.action_horizon),
             "model_action_dim": int(model.action_dim),
             "action_dim": self.action_dim_out,
+            "num_views": len(self.image_keys),
             "image_keys": list(self.image_keys),
+            "state_key": self.state_key,
+            "prompt_key": self.prompt_key,
+            "state_dim": int(processor.state_dim),
             "noise_mode": noise_mode,
             "seed": int(seed),
             **(dict(metadata) if metadata else {}),
@@ -375,6 +384,7 @@ class _NvidiaProcessorAdapter:
             key: _statistics_dim(statistics["state"][key])
             for key in self.state_keys
         }
+        self.state_dim = sum(self.state_dims.values())
         self.action_dims = {
             key: _statistics_dim(statistics["action"][key])
             for key in self.action_keys

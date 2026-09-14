@@ -33,6 +33,9 @@ class _FakeModel:
 
 class _FakeProcessor:
     image_keys = ("observation/image", "observation/wrist_image")
+    state_key = "observation/state"
+    prompt_key = "prompt"
+    state_dim = 6
     action_horizon = 4
     action_dim = 3
 
@@ -76,8 +79,32 @@ def test_policy_contract_and_raw_observation_call():
     assert result["noise"].shape == (1, 4, 6)
     assert result["actions"].dtype == np.float32
     assert result["metadata"]["model_type"] == "gr00t"
+    assert result["metadata"]["num_views"] == 2
+    assert result["metadata"]["image_keys"] == [
+        "observation/image",
+        "observation/wrist_image",
+    ]
+    assert result["metadata"]["state_key"] == "observation/state"
+    assert result["metadata"]["prompt_key"] == "prompt"
+    assert result["metadata"]["state_dim"] == 6
     assert policy.action_horizon == 4
     assert result["metadata"]["model_action_horizon"] == 4
+
+
+def test_policy_metadata_tracks_custom_processor_input_contract():
+    processor = _FakeProcessor()
+    processor.image_keys = ("front", "wrist")
+    processor.state_key = "robot/state"
+    processor.prompt_key = "instruction"
+    processor.state_dim = 8
+
+    policy = Gr00tPolicy(_FakeModel(), processor=processor, action_dim=3)
+
+    assert policy.metadata["num_views"] == 2
+    assert policy.metadata["image_keys"] == ["front", "wrist"]
+    assert policy.metadata["state_key"] == "robot/state"
+    assert policy.metadata["prompt_key"] == "instruction"
+    assert policy.metadata["state_dim"] == 8
 
 
 def test_fixed_noise_repeats_and_stream_noise_advances():
