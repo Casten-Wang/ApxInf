@@ -591,9 +591,7 @@ pub fn replace_rows_bf16(
 ) -> Result<Tensor> {
     let (rows, cols) = matrix_shape(base, "row replacement")?;
     let (_, replacement_cols) = matrix_shape(replacement, "row replacement")?;
-    if base.dtype() != DType::BF16
-        || replacement.dtype() != DType::BF16
-        || cols != replacement_cols
+    if base.dtype() != DType::BF16 || replacement.dtype() != DType::BF16 || cols != replacement_cols
     {
         return Err(Error::Other(
             "static inference BF16 row replacement has incompatible shape".into(),

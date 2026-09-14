@@ -88,7 +88,9 @@ pub fn install_bf16_observer(
     BF16_OBSERVER.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {
-            return Err(Error::Other("a BF16 activation observer is already installed".into()));
+            return Err(Error::Other(
+                "a BF16 activation observer is already installed".into(),
+            ));
         }
         *slot = Some(observer);
         Ok(Bf16ObserverGuard)

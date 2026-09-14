@@ -41,9 +41,9 @@ uses W8A8 only for the validated FFN and eligible fused self-QKV matrices.
 ## Loading
 
 ```python
-from apxinf import Gr00tPolicy
+from apxinf import AutoPolicy
 
-policy = Gr00tPolicy.from_pretrained(
+policy = AutoPolicy.from_pretrained(
     "/models/GR00T-N1.7-LIBERO/libero_10",
     backbone="/models/nvidia/Cosmos-Reason2-2B",
     precision="bf16",
@@ -82,7 +82,8 @@ unchanged.
 
 Importing `apxinf` does not import Torch, Transformers, Isaac-GR00T, or the CUDA
 binding. Those optional dependencies are loaded lazily by
-`Gr00tPolicy.from_pretrained`.
+`AutoPolicy.from_pretrained` when it dispatches to GR00T, or by the equivalent
+model-specific `Gr00tPolicy.from_pretrained` entry point.
 
 ## FP8 calibration
 
@@ -95,7 +96,7 @@ before collecting BF16 activation maxima. A calibration job therefore follows
 the same model-neutral workflow as a new VLA:
 
 ```python
-from apxinf import CalibrationRunner
+from apxinf import CalibrationRunner, Gr00tPolicy
 
 plan = policy.calibration_plan()
 profile = CalibrationRunner(
@@ -174,13 +175,14 @@ Minimum release gates are:
 - Every output must be finite and have the exact expected shape.
 
 One-view fixtures are used only for fixed-input numerical accuracy and
-performance; they are never used for LIBERO closed-loop task evaluation.
-Development two-view rollouts use at most 10 episodes per LIBERO task. Before
-the final GR00T task campaign, PI0.5 performance, numerical accuracy, and task
-accuracy regression must all pass. Only then is the two-view GR00T release
-candidate evaluated with 50 episodes for each of the 10 LIBERO-10 tasks and
-each supported platform/precision pair. GR00T LIBERO rollouts explicitly use
-the NVIDIA N1.7 evaluation protocol of 720 maximum simulator steps and 8
+performance; they are never used for LIBERO closed-loop task evaluation. The
+two-view release campaign uses 10 episodes for each of the 10 LIBERO-10 tasks
+and each supported platform/precision pair. GR00T LIBERO rollouts explicitly
+use the NVIDIA N1.7 evaluation protocol of 720 maximum simulator steps and 8
 executed actions per predicted chunk; the evaluator's 520/5 defaults remain
-unchanged for existing PI0.5 and WallOSS callers. WallOSS smoke/regression is
-run when the device schedule permits.
+unchanged for existing PI0.5 and WallOSS callers.
+
+PI0.5 regression acceptance uses a same-host upstream-versus-candidate A/B
+with the same checkpoint, evaluator, trials, frozen noise, and calibration.
+Unmatched historical aggregate success rates are useful context, but are not
+used to attribute a regression to this change.

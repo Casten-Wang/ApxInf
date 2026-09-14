@@ -109,19 +109,13 @@ fn fused_gqa_qkv_mrope_cache_matches_composed_kernels() {
             .map(|index| {
                 let token = index / width;
                 let col = index % width + offset;
-                bf16::from_f32(
-                    values[token * WIDTH + col].to_f32() + bias_values[col].to_f32(),
-                )
+                bf16::from_f32(values[token * WIDTH + col].to_f32() + bias_values[col].to_f32())
             })
             .collect::<Vec<_>>()
     };
     let q = backend
         .to_device(
-            &Tensor::from_bf16(
-                vec![TOKENS, Q_HEADS, HEAD_DIM],
-                &split_values(0, q_width),
-            )
-            .unwrap(),
+            &Tensor::from_bf16(vec![TOKENS, Q_HEADS, HEAD_DIM], &split_values(0, q_width)).unwrap(),
         )
         .unwrap();
     let k = backend

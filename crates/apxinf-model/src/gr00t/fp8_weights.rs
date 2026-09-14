@@ -169,16 +169,12 @@ impl Gr00tFp8Calibration {
                 "GR00T FP8 calibration manifest is incomplete".into(),
             ));
         }
-        match (
-            document.calibration_data.kind.as_str(),
-            document.calibration_data.production,
-        ) {
-            ("representative", true) | ("synthetic-zero-fixture", false) => {}
-            _ => {
-                return Err(Error::Other(
-                    "GR00T FP8 calibration data kind/production label is ambiguous".into(),
-                ));
-            }
+        if document.calibration_data.kind != "representative"
+            || !document.calibration_data.production
+        {
+            return Err(Error::Other(
+                "GR00T FP8 calibration requires representative production data".into(),
+            ));
         }
         let _ = document.seed_policy.base_seed;
 
@@ -851,5 +847,23 @@ mod tests {
             &["action_head.test".into()],
         )
         .is_err());
+    }
+
+    #[test]
+    fn calibration_rejects_non_production_synthetic_data() {
+        let mut synthetic: serde_json::Value =
+            serde_json::from_str(&document(112.0, 0.25)).unwrap();
+        synthetic["calibration_data"]["kind"] = "synthetic-zero-fixture".into();
+        synthetic["calibration_data"]["production"] = false.into();
+
+        let error = Gr00tFp8Calibration::from_json_str(
+            &synthetic.to_string(),
+            "sha256:test",
+            &["action_head.test".into()],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires representative production data"));
     }
 }
