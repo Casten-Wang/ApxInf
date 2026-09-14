@@ -171,14 +171,20 @@ def completed_runs(
                 f"at line {line_number}"
             )
         if item.get("status") == "completed":
-            if max_steps is not None and item.get("max_steps") != max_steps:
+            # Rows written before rollout-protocol fields were added used the
+            # evaluator's historical OpenPI defaults (520/5). Preserve their
+            # resumability while still rejecting an attempt to reuse them for
+            # an explicitly different protocol such as GR00T's 720/8.
+            item_max_steps = item.get("max_steps", MAX_STEPS)
+            item_replan_steps = item.get("replan_steps", REPLAN_STEPS)
+            if max_steps is not None and item_max_steps != max_steps:
                 raise ValueError(
-                    f"ledger max_steps is {item.get('max_steps')!r}, requested "
+                    f"ledger max_steps is {item_max_steps!r}, requested "
                     f"{max_steps!r} at line {line_number}"
                 )
-            if replan_steps is not None and item.get("replan_steps") != replan_steps:
+            if replan_steps is not None and item_replan_steps != replan_steps:
                 raise ValueError(
-                    f"ledger replan_steps is {item.get('replan_steps')!r}, requested "
+                    f"ledger replan_steps is {item_replan_steps!r}, requested "
                     f"{replan_steps!r} at line {line_number}"
                 )
             key: LedgerKey = (
