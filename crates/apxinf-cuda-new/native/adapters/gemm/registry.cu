@@ -57,6 +57,17 @@ AlignmentRequirements cutlass_geglu_alignment(const Spec& spec) {
 }
 #endif
 
+#ifdef APXINF_GEMM_CUTLASS_SM80_W8A8
+AlignmentRequirements cutlass_w8a8_alignment(const Spec&) {
+  AlignmentRequirements requirements{};
+  requirements.a = 16;
+  requirements.a_scales = alignof(float);
+  requirements.b_scales = alignof(float);
+  requirements.output = 16;
+  return requirements;
+}
+#endif
+
 void one_configuration(const Spec&, std::vector<int>& configs) {
   configs.push_back(0);
 }
@@ -118,6 +129,19 @@ void cutlass_configurations(const Spec&,
   for (int configuration = 0; configuration < 4; ++configuration) {
     configs.push_back(configuration);
   }
+}
+#endif
+
+#ifdef APXINF_GEMM_CUTLASS_SM80_W8A8
+bool supports_cutlass_w8a8(const Spec& spec) {
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
+         spec.a_dtype == APXINF_DTYPE_I8 &&
+         spec.b_dtype == APXINF_DTYPE_I8 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.accumulation_dtype == APXINF_DTYPE_I32 &&
+         spec.quantization == APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL &&
+         spec.k % 16 == 0 && spec.alpha_is_unit != 0 &&
+         spec.output_scale_is_unit != 0;
 }
 #endif
 
@@ -184,6 +208,13 @@ const std::vector<Implementation>& registry(uint32_t semantic) {
        supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
+#ifdef APXINF_GEMM_CUTLASS_SM80_W8A8
+      {kProviderCutlass, 5, 1, "cutlass-w8a8-sm80",
+       kDeviceFeatureCutlassSm80W8a8, true, true, supports_cutlass_w8a8,
+       cutlass_w8a8_alignment, cutlass_w8a8_resource_requirements,
+       one_configuration, prepare_cutlass_w8a8, launch_cutlass_w8a8,
+       destroy_cutlass_w8a8},
+#endif
       {kProviderCublasLt, 2, 1, "cublasLt-native-fp8+custom-epilogue",
        kDeviceFeatureNativeFp8, true, false, supports_native_fp8,
        cublaslt_alignment, cublaslt_native_fp8_resource_requirements,
