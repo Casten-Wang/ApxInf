@@ -18,6 +18,7 @@ import torch
 M, K, N = 8, 16, 16
 BF16_ALPHA, BF16_OUTPUT_SCALE = 0.75, 1.25
 FP8_UNIT_ALPHA, FP8_UNIT_OUTPUT_SCALE = 1.0, 1.0
+FP8_BF16_ALPHA = 0.03125
 FP8_SCALED_ALPHA, FP8_SCALED_OUTPUT_SCALE = 0.75, 1.25
 W8A8_ALPHA, W8A8_OUTPUT_SCALE = 0.5, 1.25
 
@@ -119,6 +120,9 @@ def main() -> None:
     arrays.append(rust_array("ROW_SCALES", "f32", f32_bits(row_scales), 4))
     arrays.append(rust_array("CHANNEL_SCALES", "f32", f32_bits(channel_scales), 4))
 
+    fp8_bf16 = (FP8_BF16_ALPHA * fp8_projection).to(torch.bfloat16)
+    arrays.append(rust_array("FP8_BF16_GEMM_BITS", "u16", words(fp8_bf16), N))
+
     for prefix, projection, bias, alpha, output_scale, semantics in [
         ("BF16", bf16_projection, bf16_bias.float(), BF16_ALPHA, BF16_OUTPUT_SCALE,
          ["gemm", "gemm_bias", "gemm_bias_gelu"]),
@@ -159,6 +163,7 @@ def main() -> None:
         f"pub(crate) const BF16_OUTPUT_SCALE: f32 = {BF16_OUTPUT_SCALE};\n"
         f"pub(crate) const FP8_UNIT_ALPHA: f32 = {FP8_UNIT_ALPHA};\n"
         f"pub(crate) const FP8_UNIT_OUTPUT_SCALE: f32 = {FP8_UNIT_OUTPUT_SCALE};\n"
+        f"pub(crate) const FP8_BF16_ALPHA: f32 = {FP8_BF16_ALPHA};\n"
         f"pub(crate) const FP8_SCALED_ALPHA: f32 = {FP8_SCALED_ALPHA};\n"
         f"pub(crate) const FP8_SCALED_OUTPUT_SCALE: f32 = {FP8_SCALED_OUTPUT_SCALE};\n\n"
         f"pub(crate) const W8A8_ALPHA: f32 = {W8A8_ALPHA};\n"

@@ -31,6 +31,12 @@ fn configure_torch_case(args: &mut GemmArgs<'_>, alpha: f32, output_scale: f32) 
     args.policy.graph_safe = true;
 }
 
+fn bf16_values(bits: &[u16]) -> Vec<f32> {
+    bits.iter()
+        .map(|value| f32::from_bits(u32::from(*value) << 16))
+        .collect()
+}
+
 #[test]
 fn torch_validation_requires_the_l3_output_shape() {
     let ctx = CudaContext::new(0).unwrap();
@@ -67,6 +73,24 @@ fn gemm_all_candidates_match_torch() {
         super::contracts::Semantic::Gemm,
         None,
         f::BF16_GEMM,
+    )
+    .unwrap();
+
+    // GR00T static-FP8 uses the product of its activation and weight scales as
+    // alpha and stores the projection directly as BF16.
+    let ctx = CudaContext::new(0).unwrap();
+    let a = bytes_tensor(0, vec![f::M, f::K], DType::F8E4M3, f::FP8_A);
+    let b = bytes_tensor(0, vec![f::K, f::N], DType::F8E4M3, f::FP8_B);
+    let mut out = zeros_tensor(0, vec![f::M, f::N], DType::BF16);
+    let mut args = GemmArgs::new(&a, &b, &mut out);
+    args.quantization = GemmQuantization::Fp8UnitScale;
+    configure_torch_case(&mut args, f::FP8_BF16_ALPHA, 1.0);
+    validate_all_candidates(
+        &ctx,
+        args,
+        super::contracts::Semantic::Gemm,
+        None,
+        &bf16_values(f::FP8_BF16_GEMM_BITS),
     )
     .unwrap();
 

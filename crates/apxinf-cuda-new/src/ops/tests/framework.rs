@@ -52,6 +52,26 @@ fn hardware_fingerprint(
         .to_owned()
 }
 
+fn device_sm(device: usize) -> i32 {
+    let mut major = 0;
+    let mut minor = 0;
+    unsafe {
+        crate::ffi::check_cuda(crate::ffi::cudaDeviceGetAttribute(
+            &mut major,
+            crate::ffi::CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR,
+            device as i32,
+        ))
+        .unwrap();
+        crate::ffi::check_cuda(crate::ffi::cudaDeviceGetAttribute(
+            &mut minor,
+            crate::ffi::CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR,
+            device as i32,
+        ))
+        .unwrap();
+    }
+    major * 10 + minor
+}
+
 #[test]
 fn uuid_does_not_partition_persistent_tuning_cache() {
     let first = [0x11; 16];
@@ -344,6 +364,7 @@ fn fp8_unit_scale_f32_output_does_not_round_through_f16() {
 #[test]
 fn fp8_unit_scale_bf16_output_does_not_round_through_f16() {
     let ctx = CudaContext::new(0).unwrap();
+    let sm = device_sm(ctx.device_id());
     let (m, k, n) = (1, 16, 16);
     // BF16 can represent this dot product exactly, while F16 overflows it.
     let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &vec![0x7e; m * k]);
@@ -360,6 +381,14 @@ fn fp8_unit_scale_bf16_output_does_not_round_through_f16() {
     assert_eq!(expected, 3_211_264.0);
     super::execution::validate_candidates(&ctx, &normalized, &vec![expected; m * n]).unwrap();
     let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    let summary = execution.summary().to_owned();
+    if matches!(sm, 100 | 101 | 110 | 120) {
+        assert!(
+            (0..4).any(|configuration| summary
+                .contains(&format!("cutlass-fp8-bf16#{configuration}=timed"))),
+            "the BF16 CUTLASS candidate was not exercised: {summary}"
+        );
+    }
 
     execution.enqueue().unwrap();
     ctx.synchronize().unwrap();

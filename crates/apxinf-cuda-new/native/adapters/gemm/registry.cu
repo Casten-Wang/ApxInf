@@ -79,6 +79,16 @@ bool supports_cutlass_fp8(const Spec& spec) {
          spec.k % 16 == 0 && spec.output_scale_is_unit != 0;
 }
 
+bool supports_cutlass_fp8_bf16(const Spec& spec) {
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
+         spec.a_dtype == APXINF_DTYPE_E4M3 &&
+         spec.b_dtype == APXINF_DTYPE_E4M3 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
+         spec.n % 16 == 0 && spec.k % 16 == 0 &&
+         spec.output_scale_is_unit != 0;
+}
+
 bool supports_cutlass_fp8_geglu(const Spec& spec) {
   const bool exact_shape = (spec.m == 522 || spec.m == 533) &&
                            spec.n == 32768 && spec.k == 2048;
@@ -184,6 +194,10 @@ const std::vector<Implementation>& registry(uint32_t semantic) {
        supports_cutlass_fp8, cutlass_fp8_alignment,
        cutlass_fp8_resource_requirements, cutlass_configurations,
        prepare_cutlass_fp8_gemm, launch_cutlass_fp8_gemm, destroy_cutlass},
+      {kProviderCutlass, 4, 1, "cutlass-fp8-bf16", kDeviceFeatureCutlassSm100,
+       true, true, supports_cutlass_fp8_bf16, cutlass_fp8_alignment,
+       cutlass_fp8_resource_requirements, cutlass_configurations,
+       prepare_cutlass_fp8_gemm, launch_cutlass_fp8_bf16_gemm, destroy_cutlass},
 #endif
   };
   static const std::vector<Implementation> gemm_geglu_entries = {

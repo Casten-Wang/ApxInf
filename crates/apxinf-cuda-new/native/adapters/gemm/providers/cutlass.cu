@@ -109,6 +109,23 @@ cudaError_t launch_cutlass_fp8_gemm(Execution& state) {
 #endif
 }
 
+cudaError_t launch_cutlass_fp8_bf16_gemm(Execution& state) {
+  const auto& bindings = state.bindings;
+#ifdef APXINF_GEMM_CUTLASS
+  const auto& spec = state.spec;
+  const auto stream = static_cast<cudaStream_t>(bindings.stream);
+  using namespace apxinf::cuda::cutlass_ops;
+  check_cutlass_status(fp8_gemm_bf16(
+      bindings.a, bindings.b, bindings.output, spec.m, spec.n, spec.k,
+      bindings.alpha, state.configuration, stream));
+  return cudaSuccess;
+#else
+  (void)state;
+  (void)bindings;
+  return cudaErrorNotSupported;
+#endif
+}
+
 cudaError_t launch_cutlass_fp8_geglu(Execution& state) {
   const auto& bindings = state.bindings;
 #ifdef APXINF_GEMM_CUTLASS
