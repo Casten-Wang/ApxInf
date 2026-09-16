@@ -40,12 +40,15 @@ struct CutlassGegluState {
 struct CutlassW8a8State {
   void* packed_weight = nullptr;
   size_t packed_weight_bytes = 0;
+  void* projection = nullptr;
+  size_t projection_bytes = 0;
   const void* packed_weight_source = nullptr;
   uint64_t packed_weight_version = 0;
   bool packed_weight_ready = false;
 
   ~CutlassW8a8State() {
     if (packed_weight != nullptr) cudaFree(packed_weight);
+    if (projection != nullptr) cudaFree(projection);
   }
 };
 
@@ -109,7 +112,11 @@ size_t cutlass_geglu_resource_requirements(const Spec& spec) {
 }
 
 size_t cutlass_w8a8_resource_requirements(const Spec& spec) {
-  return static_cast<size_t>(spec.k * spec.n) * dtype_bytes(spec.b_dtype);
+  size_t bytes = static_cast<size_t>(spec.k * spec.n) * dtype_bytes(spec.b_dtype);
+  if (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM) {
+    bytes += static_cast<size_t>(spec.m * spec.n) * dtype_bytes(APXINF_DTYPE_BF16);
+  }
+  return bytes;
 }
 
 void prepare_cutlass_fp8_gemm(Execution&) {}
@@ -144,7 +151,14 @@ void prepare_cutlass_w8a8(Execution& state) {
   resources->packed_weight_bytes = cutlass_w8a8_resource_requirements(state.spec);
   check_cuda(cudaMalloc(&resources->packed_weight,
                         resources->packed_weight_bytes));
-  state.resource_bytes = resources->packed_weight_bytes;
+  if (state.spec.semantic != APXINF_GEMM_SEMANTIC_GEMM) {
+    resources->projection_bytes =
+        static_cast<size_t>(state.spec.m * state.spec.n) *
+        dtype_bytes(APXINF_DTYPE_BF16);
+    check_cuda(cudaMalloc(&resources->projection, resources->projection_bytes));
+  }
+  state.resource_bytes =
+      resources->packed_weight_bytes + resources->projection_bytes;
   state.provider_state = resources.release();
   const auto& bindings = state.bindings;
   if (bindings.b_is_immutable == 0) return;
@@ -180,11 +194,24 @@ cudaError_t launch_cutlass_w8a8(Execution& state) {
     pack_w8a8_weight(state, bindings);
   }
   const auto& spec = state.spec;
-  return apxinf::cuda::cutlass_ops::w8a8_gemm_bf16(
+  void* projection = resources.projection != nullptr ? resources.projection
+                                                     : bindings.output;
+  const auto status = apxinf::cuda::cutlass_ops::w8a8_gemm_bf16(
       bindings.a, resources.packed_weight, bindings.a_scales,
-      bindings.b_scales, bindings.output, static_cast<int>(spec.m),
+      bindings.b_scales, projection, static_cast<int>(spec.m),
       static_cast<int>(spec.n), static_cast<int>(spec.k),
       static_cast<cudaStream_t>(bindings.stream));
+  if (status != cudaSuccess || resources.projection == nullptr) return status;
+  const int64_t output_width = is_gated_semantic(spec) ? spec.n / 2 : spec.n;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>((spec.m * output_width + 255) / 256, 4096));
+  apxinf::cuda::custom::finish<<<
+      blocks, 256, 0, static_cast<cudaStream_t>(bindings.stream)>>>(
+      projection, APXINF_DTYPE_BF16, bindings.output, spec.output_dtype,
+      bindings.bias, APXINF_DTYPE_BF16, bindings.residual, nullptr, nullptr,
+      spec.m, spec.n, static_cast<int>(spec.semantic), 0, bindings.alpha,
+      bindings.output_scale);
+  return cudaGetLastError();
 #else
   (void)state;
   return cudaErrorNotSupported;
@@ -285,6 +312,10 @@ cudaError_t launch_cutlass_bf16_geglu(Execution& state) {
 
 uint64_t cutlass_weight_prepack_count(const Execution& state) {
   if (state.provider_state == nullptr) return 0;
+  if (state.implementation != nullptr &&
+      std::strcmp(state.implementation->name, "cutlass-w8a8-sm80") == 0) {
+    return 0;
+  }
   return static_cast<const CutlassGegluState*>(state.provider_state)
       ->prepack_count;
 }

@@ -134,14 +134,17 @@ void cutlass_configurations(const Spec&,
 
 #ifdef APXINF_GEMM_CUTLASS_SM80_W8A8
 bool supports_cutlass_w8a8(const Spec& spec) {
-  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
-         spec.a_dtype == APXINF_DTYPE_I8 &&
+  const bool supported_semantic =
+      spec.semantic != APXINF_GEMM_SEMANTIC_GEMM_GEGLU;
+  const bool direct_output_scales_are_unit =
+      spec.semantic != APXINF_GEMM_SEMANTIC_GEMM ||
+      (spec.alpha_is_unit != 0 && spec.output_scale_is_unit != 0);
+  return supported_semantic && spec.a_dtype == APXINF_DTYPE_I8 &&
          spec.b_dtype == APXINF_DTYPE_I8 &&
          spec.output_dtype == APXINF_DTYPE_BF16 &&
          spec.accumulation_dtype == APXINF_DTYPE_I32 &&
          spec.quantization == APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL &&
-         spec.k % 16 == 0 && spec.alpha_is_unit != 0 &&
-         spec.output_scale_is_unit != 0;
+         spec.k % 16 == 0 && direct_output_scales_are_unit;
 }
 #endif
 
@@ -188,6 +191,13 @@ const std::vector<Implementation>& registry(uint32_t semantic) {
        supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
+#ifdef APXINF_GEMM_CUTLASS_SM80_W8A8
+      {kProviderCutlass, 5, 1, "cutlass-w8a8-sm80",
+       kDeviceFeatureCutlassSm80W8a8, true, true, supports_cutlass_w8a8,
+       cutlass_w8a8_alignment, cutlass_w8a8_resource_requirements,
+       one_configuration, prepare_cutlass_w8a8, launch_cutlass_w8a8,
+       destroy_cutlass_w8a8},
+#endif
   };
   // Keep GEMM+bias as a separate L3 tuning domain even though its current L1
   // candidates happen to be the same vendor implementations.
@@ -199,6 +209,13 @@ const std::vector<Implementation>& registry(uint32_t semantic) {
        supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
+#ifdef APXINF_GEMM_CUTLASS_SM80_W8A8
+      {kProviderCutlass, 5, 1, "cutlass-w8a8-sm80",
+       kDeviceFeatureCutlassSm80W8a8, true, true, supports_cutlass_w8a8,
+       cutlass_w8a8_alignment, cutlass_w8a8_resource_requirements,
+       one_configuration, prepare_cutlass_w8a8, launch_cutlass_w8a8,
+       destroy_cutlass_w8a8},
+#endif
   };
   static const std::vector<Implementation> gemm_entries = {
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true,
@@ -260,6 +277,11 @@ const std::vector<Implementation>& registry(uint32_t semantic) {
       return gemm_geglu_entries;
     case APXINF_GEMM_SEMANTIC_GEMM_BIAS:
       return gemm_bias_entries;
+    case APXINF_GEMM_SEMANTIC_GEMM_BIAS_RELU:
+    case APXINF_GEMM_SEMANTIC_GEMM_BIAS_SILU:
+    case APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL:
+    case APXINF_GEMM_SEMANTIC_GEMM_SWIGLU:
+      return vendor_entries;
   }
   throw Failure(APXINF_STATUS_INTERNAL_ERROR, "unknown GEMM semantic registry");
 }
