@@ -23,6 +23,7 @@ unsafe extern "C" {
         capacity: usize,
     ) -> usize;
     fn apxinf_gemm_test_resource_prefilter(device: c_int) -> c_int;
+    fn apxinf_gemm_test_w8a8_registry_is_plain_only() -> c_int;
 }
 
 fn hardware_fingerprint(
@@ -142,6 +143,11 @@ fn memory_clock_partitions_the_performance_fingerprint() {
 #[test]
 fn workspace_budget_rejects_before_provider_create() {
     assert_eq!(unsafe { apxinf_gemm_test_resource_prefilter(0) }, 1);
+}
+
+#[test]
+fn cutlass_w8a8_candidate_is_registered_for_plain_gemm_only() {
+    assert_eq!(unsafe { apxinf_gemm_test_w8a8_registry_is_plain_only() }, 1);
 }
 
 pub(super) fn tensor(device: usize, shape: Vec<usize>, values: &[f32]) -> Tensor {
