@@ -102,6 +102,14 @@ fn is_fa2_sm80_family(arch: &str) -> bool {
     matches!(arch, "sm_80" | "sm_86" | "sm_87" | "sm_89")
 }
 
+// Architectures that compile the vendored FlashAttention-2 BF16 forward
+// kernels. The sm80 family and Blackwell (sm_120/121, GB10/DGX Spark) all run
+// the same v2.7.4 instantiations; the -arch flag selects the real target.
+fn is_fa2_bf16_arch(arch: &str) -> bool {
+    is_fa2_sm80_family(arch)
+        || matches!(arch, "sm_120" | "sm_120a" | "sm_121" | "sm_121a")
+}
+
 fn is_cutlass_sm89_family(arch: &str) -> bool {
     matches!(arch, "sm_89")
 }
@@ -379,12 +387,14 @@ fn main() {
             }
 
             let fa2_root = cutlass_root.join("fa2");
+            let fa2_compat = cutlass_root.join("fa2_compat");
             let fa2_operator = cutlass_root.join("fa2_bf16_sm80.cu");
+            let fa2_hdim64_apx = cutlass_root.join("fa2_hdim64_bf16.cu");
             let fa2_wrapper = std::path::Path::new(&adapters_dir).join("fa2_adapter.cu");
             let mut fa2_sources = Vec::new();
             let mut fa2_direct_e4m3_sources = Vec::new();
             let mut fa2_includes = Vec::new();
-            let fa2_sm80 = nvcc_arch.as_deref().is_some_and(is_fa2_sm80_family);
+            let fa2_sm80 = nvcc_arch.as_deref().is_some_and(is_fa2_bf16_arch);
             let fa2_f16_sm100 = nvcc_arch.as_deref().is_some_and(is_cutlass_sm100_family);
             if fa2_sm80 || fa2_f16_sm100 {
                 let fa2_hdim96 = fa2_root.join("flash_attn/flash_fwd_hdim96_bf16_sm80.cu");
@@ -395,6 +405,7 @@ fn main() {
                 let fa2_cutlass = fa2_root.join("cutlass/include");
                 assert!(
                     fa2_operator.is_file()
+                        && fa2_hdim64_apx.is_file()
                         && fa2_wrapper.is_file()
                         && fa2_hdim96.is_file()
                         && fa2_hdim128.is_file()
@@ -407,6 +418,7 @@ fn main() {
                 );
                 fa2_sources.extend([
                     fa2_wrapper.clone(),
+                    fa2_hdim64_apx,
                     fa2_hdim96,
                     fa2_hdim128,
                     fa2_hdim256,
@@ -437,12 +449,13 @@ fn main() {
                     kernel_files.extend(fa2_direct_e4m3_sources.iter().cloned());
                     println!("cargo:rustc-cfg=apxinf_fa2_direct_e4m3_sm100");
                 }
-                fa2_includes.extend([fa2_root.clone(), fa2_cutlass]);
+                fa2_includes.extend([fa2_compat.clone(), fa2_root.clone(), fa2_cutlass]);
                 kernel_files.extend(fa2_sources.iter().cloned());
                 if fa2_sm80 {
                     println!("cargo:rustc-cfg=apxinf_fa2_sm80");
                 }
                 emit_rerun_if_changed_tree(&fa2_root);
+                emit_rerun_if_changed_tree(&fa2_compat);
             }
 
             if !kernel_files.is_empty() {

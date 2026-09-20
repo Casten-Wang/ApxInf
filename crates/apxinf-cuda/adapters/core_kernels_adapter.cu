@@ -492,12 +492,15 @@ extern "C" cudaError_t apxinf_layer_norm_bf16(
     const void* input, const void* weight, const void* bias, void* output,
     uint32_t cols, uint32_t rows, float eps, void* stream)
 {
-    dim3 grid((cols + BLOCK_SIZE - 1) / BLOCK_SIZE, rows, 1);
+    // One block per row: block-parallel reduction over cols, matching the
+    // rms_norm_bf16 launch policy. The previous per-thread serial reduction
+    // made this the single largest GPU kernel in the vision tower.
+    dim3 grid(rows, 1, 1);
     dim3 block(BLOCK_SIZE, 1, 1);
     layer_norm_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         (const __nv_bfloat16*)input, (const __nv_bfloat16*)weight,
         (const __nv_bfloat16*)bias, (__nv_bfloat16*)output,
-        cols, rows, eps);
+        rows, cols, eps);
     return cudaGetLastError();
 }
 
@@ -609,6 +612,44 @@ extern "C" cudaError_t apxinf_vision_sdpa_bf16(
     vision_sdpa_bf16_kernel<<<grid, block, smem, (cudaStream_t)stream>>>(
         (const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v,
         (__nv_bfloat16*)out, seq_len, n_heads, head_dim, scale);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_vision_sdpa_bf16_v3(
+    const void* q, const void* k, const void* v, void* out,
+    uint32_t seq_len, uint32_t n_heads, uint32_t head_dim, float scale, void* stream)
+{
+    dim3 grid(seq_len, n_heads, 1);
+    dim3 block(32 * APXINF_VISION_V3_WARPS, 1, 1);
+    vision_sdpa_bf16_v3_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v,
+        (__nv_bfloat16*)out, seq_len, n_heads, head_dim, scale);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_vision_sdpa_bf16_v3_hd72(
+    const void* q, const void* k, const void* v, void* out,
+    uint32_t seq_len, uint32_t n_heads, uint32_t head_dim, float scale, void* stream)
+{
+    dim3 grid(seq_len, n_heads, 1);
+    dim3 block(32 * APXINF_VISION_V3_WARPS, 1, 1);
+    vision_sdpa_bf16_v3_hd72_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v,
+        (__nv_bfloat16*)out, seq_len, n_heads, head_dim, scale);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_kv_cache_gather_bf16(
+    const void* src, void* dst,
+    uint32_t tokens, uint32_t n_kv_heads, uint32_t head_dim,
+    uint32_t max_seq_len, uint32_t kv_offset, void* stream)
+{
+    uint32_t total = tokens * n_kv_heads * head_dim;
+    uint32_t threads = 256;
+    uint32_t blocks = (total + threads - 1) / threads;
+    kv_cache_gather_bf16_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)src, (__nv_bfloat16*)dst,
+        tokens, n_kv_heads, head_dim, max_seq_len, kv_offset);
     return cudaGetLastError();
 }
 

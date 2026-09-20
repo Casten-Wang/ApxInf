@@ -11,7 +11,9 @@ use crate::buffer::{CudaBuffer, CudaDeviceAddress};
 use crate::context::CudaContext;
 use crate::cublas::CublasTranspose;
 use crate::ffi;
-use crate::workspace::{may_prepare_native_resources, output_buffer};
+#[cfg(all(apxinf_cutlass_fmha, not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))))]
+use crate::workspace::may_prepare_native_resources;
+use crate::workspace::output_buffer;
 use crate::CudaKVCache;
 
 pub struct QkvTensors {
@@ -189,6 +191,56 @@ pub fn sdpa(
     let gqa_ratio = n_heads / n_kv_heads;
     let dtype = query.dtype();
     let element_bytes = dtype.size_in_bytes();
+
+    // Fast path: vendor FlashAttention-2 causal prefill for the Qwen3-VL
+    // text tower (BF16, head_dim 128). The KV cache layout is
+    // [n_kv_heads, max_seq, head_dim]; FA2 wants [tokens, n_kv_heads, head_dim],
+    // so gather the valid prefix (two bf16 copy kernels) then call the dense
+    // causal GQA entry. This replaces the three-pass materialized path that
+    // allocated a seq*heads*kv_len score matrix and launched one cuBLAS GEMV
+    // per (head, query). Only the contiguous causal case (kv_offset == 0,
+    // i.e. a fresh prefill over the whole prompt) takes this path; chunked or
+    // continued prefill falls through to the legacy path. Set
+    // APXINF_PREFILL_SDPA_LEGACY=1 to force the legacy path for A/B checks.
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    if dtype == DType::BF16
+        && head_dim == 128
+        && kv_offset == 0
+        && kv_len == seq_len
+        && std::env::var_os("APXINF_PREFILL_SDPA_LEGACY").is_none()
+    {
+        let gather = |src: &CudaBuffer| -> Result<CudaBuffer> {
+            let dst = CudaBuffer::alloc_zeros(
+                seq_len * n_kv_heads * head_dim * element_bytes,
+                ctx.device_id(),
+            )
+            .map_err(Error::Cuda)?;
+            unsafe {
+                let res = ffi::apxinf_kv_cache_gather_bf16(
+                    src.ptr(),
+                    dst.ptr(),
+                    seq_len as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_seq_len as u32,
+                    kv_offset,
+                    ctx.stream().handle(),
+                );
+                ffi::check_cuda(res).map_err(Error::Cuda)?;
+            }
+            Ok(dst)
+        };
+        let k_buf = gather(cache.k_buffer(layer_idx))?;
+        let v_buf = gather(cache.v_buffer(layer_idx))?;
+        let kv_shape = Shape::new(vec![seq_len, n_kv_heads, head_dim]);
+        let k_t = make_gpu_tensor(kv_shape.clone(), DType::BF16, ctx.device_id(), k_buf);
+        let v_t = make_gpu_tensor(kv_shape, DType::BF16, ctx.device_id(), v_buf);
+        let out = causal_gqa_bf16(ctx, query, &k_t, &v_t, seq_len)?;
+        // Match the materialized path's output contract for callers that
+        // project the attention result directly (for example LlamaModel).
+        return out.reshape(vec![seq_len, n_heads * head_dim]);
+    }
+
     let scores = CudaBuffer::alloc(seq_len * n_heads * kv_len * element_bytes, ctx.device_id())
         .map_err(Error::Cuda)?;
     let key_cache = cache.k_buffer(layer_idx);
@@ -366,11 +418,12 @@ pub fn softmax(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     ))
 }
 
-/// Non-causal full attention for the vision tower. Q/K/V each
-/// `[seq, n_heads, head_dim]` bf16; returns `[seq, n_heads * head_dim]`.
-/// Non-causal full attention for the Qwen3-VL vision tower. Supports any
-/// head_dim (64 for Qwen3-VL-2B/4B, 72 for Qwen3-VL-8B); the CUDA kernel
-/// distributes head_dim columns cyclically across a 32-thread warp.
+/// Non-causal full attention for the Qwen3-VL vision tower. Q/K/V each
+/// `[seq, n_heads, head_dim]` BF16; returns `[seq, n_heads * head_dim]`.
+/// Supports head dimensions 1..=256, including 64 (2B/4B) and 72 (8B).
+/// Uses FA2 when compiled, otherwise specialized multi-warp kernels for
+/// dimensions 64/72 and the cyclic single-warp kernel for other dimensions.
+/// Set `APXINF_VISION_SDPA_LEGACY` to force the single-warp kernel.
 pub fn vision(
     ctx: &CudaContext,
     q: &Tensor,
@@ -386,22 +439,73 @@ pub fn vision(
     if head_dim == 0 || head_dim > 256 {
         return Err(Error::Other("vision_sdpa: head_dim out of range".into()));
     }
+    // Preferred path on Blackwell/sm80/sm100 where the vendored
+    // FlashAttention-2 BF16 forward is compiled: run the whole vision
+    // attention as one tensor-core FA2 kernel. FA2 handles head_dim 64 and
+    // 72 internally (96-tile with even-K masking), so Qwen3-VL 2B/4B (64) and
+    // 8B (72) both go through here. Non-causal, dense heads, contiguous
+    // [seq, n_heads, head_dim] Q/K/V, so no layout gather is needed.
+    // APXINF_VISION_SDPA_LEGACY=1 forces the in-tree multi-warp/scalar path.
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    if std::env::var_os("APXINF_VISION_SDPA_LEGACY").is_none() {
+        let out = fa2_attention(
+            ctx, q, k, v,
+            /*batches*/ 1,
+            /*query_tokens*/ seq_len,
+            /*key_tokens*/ seq_len,
+            /*query_heads*/ n_heads,
+            /*kv_heads*/ n_heads,
+            head_dim,
+        )?;
+        // fa2_attention keeps the 3-D [seq, n_heads, head_dim] shape; the
+        // vision block expects the flattened [seq, n_heads * head_dim].
+        return out.reshape(vec![seq_len, n_heads * head_dim]);
+    }
+
     let device_id = ctx.device_id();
     let out_bytes = seq_len * n_heads * head_dim * DType::BF16.size_in_bytes();
     let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
+    // 4-warp flash-decoding (register-resident online softmax, no per-query
+    // score buffer) covers head_dim 64 (Qwen3-VL-2B/4B ViT) and head_dim 72
+    // (Qwen3-VL-8B ViT), via two shape-specialized kernels. Other dimensions
+    // use the cyclic single-warp kernel. APXINF_VISION_SDPA_LEGACY=1 forces
+    // the three-pass kernel for numerical A/B comparison.
+    let v3_kind = if std::env::var_os("APXINF_VISION_SDPA_LEGACY").is_some() {
+        0
+    } else if head_dim == 64 {
+        1
+    } else if head_dim == 72 {
+        2
+    } else {
+        0
+    };
     unsafe {
-        let res = ffi::apxinf_vision_sdpa_bf16(
-            gpu_ptr(q)?,
-            gpu_ptr(k)?,
-            gpu_ptr(v)?,
-            out_buf.ptr(),
-            seq_len as u32,
-            n_heads as u32,
-            head_dim as u32,
-            scale,
-            ctx.stream().handle(),
-        );
+        let res = if v3_kind == 1 {
+            ffi::apxinf_vision_sdpa_bf16_v3(
+                gpu_ptr(q)?, gpu_ptr(k)?, gpu_ptr(v)?, out_buf.ptr(),
+                seq_len as u32, n_heads as u32, head_dim as u32, scale,
+                ctx.stream().handle(),
+            )
+        } else if v3_kind == 2 {
+            ffi::apxinf_vision_sdpa_bf16_v3_hd72(
+                gpu_ptr(q)?, gpu_ptr(k)?, gpu_ptr(v)?, out_buf.ptr(),
+                seq_len as u32, n_heads as u32, head_dim as u32, scale,
+                ctx.stream().handle(),
+            )
+        } else {
+            ffi::apxinf_vision_sdpa_bf16(
+                gpu_ptr(q)?,
+                gpu_ptr(k)?,
+                gpu_ptr(v)?,
+                out_buf.ptr(),
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                scale,
+                ctx.stream().handle(),
+            )
+        };
         ffi::check_cuda(res).map_err(Error::Cuda)?;
     }
     Ok(make_gpu_tensor(
@@ -1038,6 +1142,143 @@ fn fa2_splitkv_enabled(
         && matches!(head_dim, 128 | 256)
 }
 
+/// Choose split-KV parallelism from the logical work shape.
+///
+/// The occupancy policy follows the documented heuristic in official
+/// FlashAttention 2.7.4.post1 (BSD-3-Clause), expressed here independently in
+/// Rust so the raw-pointer CUDA wrapper only marshals an already-made choice.
+#[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+fn plan_fa2_split_count(
+    batches: usize,
+    query_tokens: usize,
+    key_tokens: usize,
+    query_heads: usize,
+    head_dim: usize,
+    multiprocessors: usize,
+) -> usize {
+    if batches == 0
+        || query_tokens == 0
+        || key_tokens == 0
+        || query_heads == 0
+        || head_dim == 0
+        || multiprocessors == 0
+    {
+        return 1;
+    }
+    let key_tile = if head_dim <= 64 {
+        256
+    } else if head_dim <= 128 {
+        128
+    } else {
+        64
+    };
+    let key_tiles = key_tokens.div_ceil(key_tile);
+    let row_tiles = query_tokens.div_ceil(64);
+    let base_jobs = batches
+        .saturating_mul(query_heads)
+        .saturating_mul(row_tiles);
+    let execution_slots = multiprocessors.saturating_mul(2);
+    if execution_slots == 0
+        || key_tiles == 0
+        || base_jobs.saturating_mul(5) >= execution_slots.saturating_mul(4)
+    {
+        return 1;
+    }
+
+    let limit = 128.min(execution_slots).min(key_tiles);
+    let eligible =
+        |splits: usize| splits == 1 || key_tiles.div_ceil(splits) != key_tiles.div_ceil(splits - 1);
+    let utilization = |splits: usize| {
+        let jobs = base_jobs.saturating_mul(splits);
+        let waves = jobs as f32 / execution_slots as f32;
+        waves / waves.ceil()
+    };
+    let peak = (1..=limit)
+        .filter(|&splits| eligible(splits))
+        .map(utilization)
+        .fold(0.0f32, f32::max);
+    (1..=limit)
+        .find(|&splits| eligible(splits) && utilization(splits) >= 0.85 * peak)
+        .unwrap_or(1)
+}
+
+#[cfg(all(test, any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+mod splitkv_planner_tests {
+    use super::plan_fa2_split_count;
+
+    fn official_fa2_choice(base_jobs: usize, execution_slots: usize, key_tiles: usize) -> usize {
+        if base_jobs as f32 >= 0.8 * execution_slots as f32 {
+            return 1;
+        }
+        let limit = 128.min(execution_slots).min(key_tiles);
+        let eligible = |splits: usize| {
+            splits == 1 || key_tiles.div_ceil(splits) != key_tiles.div_ceil(splits - 1)
+        };
+        let scores = (1..=limit)
+            .map(|splits| {
+                if !eligible(splits) {
+                    return 0.0;
+                }
+                let waves = (base_jobs * splits) as f32 / execution_slots as f32;
+                waves / waves.ceil()
+            })
+            .collect::<Vec<_>>();
+        let peak = scores.iter().copied().fold(0.0f32, f32::max);
+        (1..=limit)
+            .find(|&splits| eligible(splits) && scores[splits - 1] >= 0.85 * peak)
+            .unwrap_or(1)
+    }
+
+    #[test]
+    fn pi05_orin_shape_uses_three_splits() {
+        assert_eq!(plan_fa2_split_count(1, 10, 532, 8, 256, 16), 3);
+    }
+
+    #[test]
+    fn saturated_or_single_tile_work_stays_unsplit() {
+        assert_eq!(plan_fa2_split_count(1, 64, 512, 32, 256, 16), 1);
+        assert_eq!(plan_fa2_split_count(1, 10, 32, 8, 256, 16), 1);
+    }
+
+    #[test]
+    fn invalid_or_overflowing_work_stays_unsplit() {
+        assert_eq!(plan_fa2_split_count(0, 1, 64, 1, 256, 16), 1);
+        assert_eq!(plan_fa2_split_count(1, 0, 64, 1, 256, 16), 1);
+        assert_eq!(plan_fa2_split_count(1, 1, 0, 1, 256, 16), 1);
+        assert_eq!(plan_fa2_split_count(1, 1, 64, 0, 256, 16), 1);
+        assert_eq!(plan_fa2_split_count(1, 1, 64, 1, 0, 16), 1);
+        assert_eq!(plan_fa2_split_count(1, 1, 64, 1, 256, 0), 1);
+        assert_eq!(
+            plan_fa2_split_count(usize::MAX, 64, usize::MAX, usize::MAX, 256, usize::MAX),
+            1
+        );
+    }
+
+    #[test]
+    fn agrees_with_official_fa2_policy_over_supported_domain() {
+        for multiprocessors in 1..=128 {
+            let execution_slots = multiprocessors * 2;
+            for query_heads in 1..=256 {
+                for key_tiles in 1..=128 {
+                    let expected = official_fa2_choice(query_heads, execution_slots, key_tiles);
+                    let actual = plan_fa2_split_count(
+                        1,
+                        1,
+                        key_tiles * 64,
+                        query_heads,
+                        256,
+                        multiprocessors,
+                    );
+                    assert_eq!(
+                        actual, expected,
+                        "SMs={multiprocessors}, heads={query_heads}, key_tiles={key_tiles}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fa2_attention_splitkv(
@@ -1053,6 +1294,14 @@ pub(crate) fn fa2_attention_splitkv(
     head_dim: usize,
     causal: bool,
 ) -> Result<Tensor> {
+    let num_splits = plan_fa2_split_count(
+        batches,
+        query_tokens,
+        key_tokens,
+        query_heads,
+        head_dim,
+        ctx.caps().multiprocessor_count as usize,
+    );
     let output = output_buffer(ctx, q.size_in_bytes())?;
     let lse_elements = batches
         .checked_mul(query_heads)
@@ -1112,7 +1361,7 @@ pub(crate) fn fa2_attention_splitkv(
                 kv_heads as i32,
                 head_dim as i32,
                 (head_dim as f32).sqrt().recip(),
-                ctx.caps().multiprocessor_count as i32,
+                num_splits as i32,
                 ctx.stream().handle(),
             )
         } else {
@@ -1131,7 +1380,7 @@ pub(crate) fn fa2_attention_splitkv(
                 kv_heads as i32,
                 head_dim as i32,
                 (head_dim as f32).sqrt().recip(),
-                ctx.caps().multiprocessor_count as i32,
+                num_splits as i32,
                 ctx.stream().handle(),
             )
         };
@@ -1627,17 +1876,23 @@ pub(crate) fn cublas_mqa_f16(
 }
 
 #[cfg(apxinf_fa2_f16_sm100)]
-pub(crate) fn fa2_mqa_f16(
+#[allow(clippy::too_many_arguments)]
+fn fa2_attention_f16(
     ctx: &CudaContext,
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
+    batches: usize,
+    query_tokens: usize,
     key_tokens: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
 ) -> Result<Tensor> {
-    let q_shape = q.shape().dims();
     let output = output_buffer(ctx, q.size_in_bytes())?;
-    let lse_elements = q_shape[0]
-        .checked_mul(q_shape[1])
+    let lse_elements = batches
+        .checked_mul(query_heads)
+        .and_then(|value| value.checked_mul(query_tokens))
         .ok_or_else(|| Error::Other("FA2 FP16 LSE size overflow".into()))?;
     let softmax_lse = output_buffer(
         ctx,
@@ -1652,13 +1907,13 @@ pub(crate) fn fa2_mqa_f16(
             gpu_ptr(v)?,
             output.ptr(),
             softmax_lse.ptr(),
-            1,
-            q_shape[0] as i32,
+            batches as i32,
+            query_tokens as i32,
             key_tokens as i32,
-            q_shape[1] as i32,
-            1,
-            q_shape[2] as i32,
-            (q_shape[2] as f32).sqrt().recip(),
+            query_heads as i32,
+            kv_heads as i32,
+            head_dim as i32,
+            (head_dim as f32).sqrt().recip(),
             ctx.stream().handle(),
         ))
         .map_err(Error::Cuda)?;
@@ -1669,6 +1924,20 @@ pub(crate) fn fa2_mqa_f16(
         ctx.device_id(),
         output,
     ))
+}
+
+#[cfg(apxinf_fa2_f16_sm100)]
+pub(crate) fn fa2_mqa_f16(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    key_tokens: usize,
+) -> Result<Tensor> {
+    let q_shape = q.shape().dims();
+    fa2_attention_f16(
+        ctx, q, k, v, 1, q_shape[0], key_tokens, q_shape[1], 1, q_shape[2],
+    )
 }
 
 /// Exact MQA for the static inference action expert. Prefix and suffix
@@ -1796,9 +2065,9 @@ pub fn split_qkv_bias_f16(
     })
 }
 
-/// Apply QKV bias without splitting the projection, then let SM100-family
-/// FMHA consume Q/K/V through row-strided views of `[tokens, 3 * heads * dim]`.
-/// This avoids materializing three layout copies for SigLIP attention.
+/// Apply QKV bias without splitting the projection, then let FA2 consume Q/K/V
+/// through row-strided views of `[tokens, 3 * heads * dim]`. This avoids
+/// materializing three layout copies for SigLIP attention.
 pub fn mha_packed_qkv_bias_f16(
     ctx: &CudaContext,
     qkv: &Tensor,
@@ -1827,49 +2096,42 @@ pub fn mha_packed_qkv_bias_f16(
         )));
     }
 
-    #[cfg(apxinf_cutlass_fmha)]
+    #[cfg(apxinf_fa2_f16_sm100)]
     if tokens_per_batch == 256 && heads == 16 && head_dim == 72 {
         let biased = bias
             .map(|value| bias_f16(ctx, qkv, Some(value)))
             .transpose()?;
         let packed = biased.as_ref().unwrap_or(qkv);
         let output = f16_output(ctx, tokens, projection_width)?;
+        let lse_elements = tokens
+            .checked_mul(heads)
+            .ok_or_else(|| Error::Other("packed FA2 FP16 LSE size overflow".into()))?;
+        let softmax_lse = output_buffer(
+            ctx,
+            lse_elements
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| Error::Other("packed FA2 FP16 LSE byte size overflow".into()))?,
+        )?;
         unsafe {
-            let batches = tokens / tokens_per_batch;
-            if may_prepare_native_resources() {
-                let status = ffi::apxinf_static_prepare_cutlass_mha_packed_qkv_f16(
-                    gpu_ptr(packed)?,
-                    output.ptr(),
-                    batches as i32,
-                    tokens_per_batch as i32,
-                    heads as i32,
-                    head_dim as i32,
-                    ctx.stream().handle(),
-                );
-                if status != 0 {
-                    return Err(Error::Cuda(format!(
-                        "packed CUTLASS FMHA resource preparation failed with status {status}"
-                    )));
-                }
-            }
-            let status = ffi::apxinf_static_cutlass_mha_packed_qkv_f16(
+            ffi::check_cuda(ffi::apxinf_static_fa2_f16_strided_qkv(
                 gpu_ptr(packed)?,
                 output.ptr(),
-                batches as i32,
+                softmax_lse.ptr(),
+                (tokens / tokens_per_batch) as i32,
                 tokens_per_batch as i32,
                 heads as i32,
                 head_dim as i32,
+                (head_dim as f32).sqrt().recip(),
                 ctx.stream().handle(),
-            );
-            if status == 0 {
-                return Ok(make_gpu_tensor(
-                    Shape::new(vec![tokens, heads, head_dim]),
-                    DType::F16,
-                    ctx.device_id(),
-                    output,
-                ));
-            }
+            ))
+            .map_err(Error::Cuda)?;
         }
+        return Ok(make_gpu_tensor(
+            Shape::new(vec![tokens, heads, head_dim]),
+            DType::F16,
+            ctx.device_id(),
+            output,
+        ));
     }
 
     let split = split_qkv_bias_f16(ctx, qkv, bias, heads, head_dim)?;
@@ -1898,54 +2160,22 @@ pub fn mha_f16(
             "static inference MHA expects matching FP16 [tokens,heads,head_dim] tensors".into(),
         ));
     }
-    let output = output_buffer(ctx, q.size_in_bytes())?;
-    #[cfg(apxinf_cutlass_fmha)]
+    #[cfg(apxinf_fa2_f16_sm100)]
     if tokens_per_batch == 256 && shape[1] == 16 && shape[2] == 72 {
-        unsafe {
-            let batches = shape[0] / tokens_per_batch;
-            if may_prepare_native_resources() {
-                let status = ffi::apxinf_static_prepare_cutlass_mha_f16(
-                    gpu_ptr(q)?,
-                    gpu_ptr(k)?,
-                    gpu_ptr(v)?,
-                    output.ptr(),
-                    batches as i32,
-                    tokens_per_batch as i32,
-                    tokens_per_batch as i32,
-                    shape[1] as i32,
-                    shape[1] as i32,
-                    shape[2] as i32,
-                    ctx.stream().handle(),
-                );
-                if status != 0 {
-                    return Err(Error::Cuda(format!(
-                        "CUTLASS FMHA resource preparation failed with status {status}"
-                    )));
-                }
-            }
-            let status = ffi::apxinf_static_cutlass_mha_f16(
-                gpu_ptr(q)?,
-                gpu_ptr(k)?,
-                gpu_ptr(v)?,
-                output.ptr(),
-                batches as i32,
-                tokens_per_batch as i32,
-                tokens_per_batch as i32,
-                shape[1] as i32,
-                shape[1] as i32,
-                shape[2] as i32,
-                ctx.stream().handle(),
-            );
-            if status == 0 {
-                return Ok(make_gpu_tensor(
-                    q.shape().clone(),
-                    DType::F16,
-                    ctx.device_id(),
-                    output,
-                ));
-            }
-        }
+        return fa2_attention_f16(
+            ctx,
+            q,
+            k,
+            v,
+            shape[0] / tokens_per_batch,
+            tokens_per_batch,
+            tokens_per_batch,
+            shape[1],
+            shape[1],
+            shape[2],
+        );
     }
+    let output = output_buffer(ctx, q.size_in_bytes())?;
     unsafe {
         ffi::check_cuda(ffi::apxinf_static_mha_flash_f16(
             gpu_ptr(q)?,
