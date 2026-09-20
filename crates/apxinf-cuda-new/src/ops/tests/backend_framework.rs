@@ -1,4 +1,4 @@
-//! Shared operator-framework regression tests.
+//! Shared backend-framework contract, integration, and regression tests.
 //!
 //! Adding an L3 operator normally does not require editing this file. Extend it
 //! only when the operator introduces or changes shared behavior such as keys,
@@ -7,9 +7,11 @@
 use super::*;
 use crate::{CudaBuffer, CudaContext};
 use apxinf_core::{DType, Shape, Tensor};
-use half::bf16;
-use std::ffi::CStr;
+use half::{bf16, f16};
+use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 unsafe extern "C" {
     fn apxinf_gemm_test_hardware_fingerprint(
@@ -23,6 +25,78 @@ unsafe extern "C" {
         capacity: usize,
     ) -> usize;
     fn apxinf_gemm_test_resource_prefilter(device: c_int) -> c_int;
+    fn apxinf_framework_test_registry_contract(error: *mut c_char, capacity: usize) -> c_int;
+    fn apxinf_framework_test_recipe_db_contract(
+        directory: *const c_char,
+        error: *mut c_char,
+        capacity: usize,
+    ) -> c_int;
+    fn apxinf_framework_test_autotune_contract(
+        graph_safe: c_int,
+        error: *mut c_char,
+        capacity: usize,
+    ) -> c_int;
+}
+
+fn run_framework_contract(name: &str, invoke: impl FnOnce(*mut c_char, usize) -> c_int) {
+    let mut error = vec![0 as c_char; 4096];
+    let passed = invoke(error.as_mut_ptr(), error.len());
+    let detail = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
+    assert_eq!(passed, 1, "{name} failed: {detail}");
+}
+
+struct FrameworkTestDirectory(PathBuf);
+
+impl FrameworkTestDirectory {
+    fn new() -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock predates UNIX epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "apxinf-framework-recipe-contract-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path)
+            .unwrap_or_else(|error| panic!("create {}: {error}", path.display()));
+        Self(path)
+    }
+}
+
+impl Drop for FrameworkTestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn registry_requires_the_exact_identity_triple() {
+    run_framework_contract("registry exact identity", |error, capacity| unsafe {
+        apxinf_framework_test_registry_contract(error, capacity)
+    });
+}
+
+#[test]
+fn recipe_db_round_trips_updates_and_rejects_invalid_reads() {
+    let directory = FrameworkTestDirectory::new();
+    let path = CString::new(directory.0.to_string_lossy().as_bytes()).unwrap();
+    run_framework_contract("recipe DB persistence", |error, capacity| unsafe {
+        apxinf_framework_test_recipe_db_contract(path.as_ptr(), error, capacity)
+    });
+}
+
+#[test]
+fn autotune_filters_failures_and_times_every_valid_configuration() {
+    run_framework_contract("CUDA autotune selection", |error, capacity| unsafe {
+        apxinf_framework_test_autotune_contract(0, error, capacity)
+    });
+}
+
+#[test]
+fn graph_safe_autotune_captures_the_winner() {
+    run_framework_contract("CUDA Graph-safe autotune", |error, capacity| unsafe {
+        apxinf_framework_test_autotune_contract(1, error, capacity)
+    });
 }
 
 fn hardware_fingerprint(
@@ -68,47 +142,6 @@ fn uuid_does_not_partition_persistent_tuning_cache() {
 }
 
 #[test]
-fn performance_mismatch_is_compatible_but_not_fully_tuned() {
-    let uuid = [0x42; 16];
-    let full = hardware_fingerprint(uuid, 14, 32 << 30, 1_500_000, true);
-    let reduced = hardware_fingerprint(uuid, 7, 16 << 30, 1_500_000, true);
-    assert_ne!(
-        full, reduced,
-        "different performance profiles need retuning"
-    );
-    assert_eq!(
-        hardware_fingerprint(uuid, 14, 32 << 30, 1_500_000, false),
-        hardware_fingerprint(uuid, 7, 16 << 30, 1_500_000, false),
-        "the previous winner remains an execution-compatible tuning hint"
-    );
-}
-
-#[test]
-fn total_memory_does_not_partition_the_performance_fingerprint() {
-    let uuid = [0x42; 16];
-    assert_eq!(
-        hardware_fingerprint(uuid, 14, 32 << 30, 1_500_000, true),
-        hardware_fingerprint(uuid, 14, 80 << 30, 1_500_000, true),
-        "different capacity SKUs with the same performance profile share recipes"
-    );
-}
-
-#[test]
-fn memory_clock_partitions_the_performance_fingerprint() {
-    let uuid = [0x42; 16];
-    assert_ne!(
-        hardware_fingerprint(uuid, 14, 32 << 30, 1_500_000, true),
-        hardware_fingerprint(uuid, 14, 32 << 30, 2_000_000, true),
-        "different memory clocks require performance retuning"
-    );
-    assert_eq!(
-        hardware_fingerprint(uuid, 14, 32 << 30, 1_500_000, false),
-        hardware_fingerprint(uuid, 14, 32 << 30, 2_000_000, false),
-        "memory clock does not affect execution compatibility"
-    );
-}
-
-#[test]
 fn workspace_budget_rejects_before_provider_create() {
     assert_eq!(unsafe { apxinf_gemm_test_resource_prefilter(0) }, 1);
 }
@@ -124,6 +157,19 @@ pub(super) fn tensor(device: usize, shape: Vec<usize>, values: &[f32]) -> Tensor
     let buffer = CudaBuffer::alloc(bytes.len(), device).unwrap();
     buffer.copy_from_host(bytes).unwrap();
     buffer.as_tensor(Shape::new(shape), DType::BF16).unwrap()
+}
+
+pub(super) fn f16_tensor(device: usize, shape: Vec<usize>, values: &[f32]) -> Tensor {
+    let host: Vec<_> = values.iter().map(|value| f16::from_f32(*value)).collect();
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            host.as_ptr().cast::<u8>(),
+            host.len() * std::mem::size_of::<f16>(),
+        )
+    };
+    let buffer = CudaBuffer::alloc(bytes.len(), device).unwrap();
+    buffer.copy_from_host(bytes).unwrap();
+    buffer.as_tensor(Shape::new(shape), DType::F16).unwrap()
 }
 
 pub(super) fn bf16_bits_tensor(device: usize, shape: Vec<usize>, values: &[u16]) -> Tensor {
@@ -483,86 +529,6 @@ fn bf16_gemm_numeric_recipe_and_graph() {
     assert_eq!(values(&out), actual);
 }
 
-#[test]
-fn compatible_recipe_is_only_a_retuning_hint() {
-    let cache_dir = std::env::temp_dir().join(format!(
-        "apxinf-compatible-recipe-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&cache_dir).unwrap();
-    let cache = cache_dir.to_string_lossy().into_owned();
-
-    let run = |ctx: &CudaContext, online_tune: bool| {
-        let a = tensor(0, vec![2, 3], &[1.0; 6]);
-        let b = tensor(0, vec![3, 4], &[1.0; 12]);
-        let mut out = tensor(0, vec![2, 4], &[0.0; 8]);
-        let mut args = GemmArgs::new(&a, &b, &mut out);
-        args.policy.cache_dir = Some(cache.clone());
-        args.policy.online_tune = online_tune;
-        args.policy.allow_fallback = false;
-        super::execution::prepare(
-            ctx,
-            super::contracts::normalize(ctx, args, super::contracts::Semantic::Gemm, None)?,
-        )
-    };
-    let remove_performance_recipe = || {
-        for entry in std::fs::read_dir(&cache_dir).unwrap() {
-            let path = entry.unwrap().path();
-            let contents = std::fs::read_to_string(&path).unwrap();
-            if contents
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .contains("|performance|")
-            {
-                std::fs::remove_file(path).unwrap();
-            }
-        }
-    };
-
-    let first = run(&CudaContext::new(0).unwrap(), true).unwrap();
-    assert!(first.summary().contains("tuned preferred=0"));
-    drop(first);
-    remove_performance_recipe();
-
-    let retuned = run(&CudaContext::new(0).unwrap(), true).unwrap();
-    assert!(
-        retuned.summary().contains("tuned preferred=1"),
-        "compatible winner must be tried first but still fully tuned: {}",
-        retuned.summary()
-    );
-    drop(retuned);
-    remove_performance_recipe();
-
-    for entry in std::fs::read_dir(&cache_dir).unwrap() {
-        let path = entry.unwrap().path();
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let key = contents.lines().next().unwrap_or_default();
-        if key.contains("|compatible-hint") {
-            std::fs::write(path, format!("{key}\n999 999 999 999\n")).unwrap();
-        }
-    }
-    let invalid_hint = run(&CudaContext::new(0).unwrap(), true).unwrap();
-    assert!(
-        invalid_hint.summary().contains("tuned preferred=0"),
-        "missing or version-incompatible candidates must be filtered: {}",
-        invalid_hint.summary()
-    );
-    drop(invalid_hint);
-    remove_performance_recipe();
-
-    let miss = match run(&CudaContext::new(0).unwrap(), false) {
-        Ok(_) => panic!("compatible hint was incorrectly accepted as fully tuned"),
-        Err(error) => error,
-    };
-    assert!(miss.to_string().contains("recipe miss"));
-    std::fs::remove_dir_all(cache_dir).unwrap();
-}
-
 fn scratch_cache_dir(label: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "apxinf-{}-{}-{}",
@@ -877,6 +843,42 @@ fn scaled_fp8_and_w8a8_use_the_canonical_kn_weight_contract() {
     let int8_values = values(&int8_out);
     assert!(int8_values[..n].iter().all(|&value| value == 16.0));
     assert!(int8_values[n..].iter().all(|&value| value == 8.0));
+}
+
+#[test]
+fn w8a8_orin_shape_uses_cublas_dequantization_fallback() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n) = (41, 1536, 6144);
+    let a = bytes_tensor(0, vec![m, k], DType::I8, &vec![1; m * k]);
+    let b = bytes_tensor(0, vec![k, n], DType::I8, &vec![1; k * n]);
+    let row_scales = scales(0, &vec![0.5; m]);
+    let channel_scales = scales(0, &vec![2.0; n]);
+    let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+    let mut args = GemmArgs::w8a8(
+        &a,
+        &row_scales,
+        &b,
+        &channel_scales,
+        &mut out,
+    );
+    args.policy.online_tune = false;
+    args.policy.allow_fallback = true;
+
+    let normalized =
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
+    let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    assert!(
+        execution
+            .summary()
+            .starts_with("cublas+custom-epilogue config=0 "),
+        "unexpected W8A8 fallback: {}",
+        execution.summary()
+    );
+    assert!(execution.summary().contains("source=fallback"));
+
+    execution.enqueue().unwrap();
+    ctx.synchronize().unwrap();
+    assert!(values(&out).iter().all(|&value| value == k as f32));
 }
 
 #[test]
