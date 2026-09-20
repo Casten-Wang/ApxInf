@@ -762,7 +762,14 @@ fn gr00t_swiglu_candidates_match_torch() {
         f::BF16_GEMM_SWIGLU,
     )
     .unwrap();
+}
 
+#[test]
+fn gr00t_w8a8_swiglu_candidates_match_torch() {
+    use torch_fixture as f;
+
+    // Nonuniform gate/up channel scales expose premature BF16 rounding in
+    // vendor fallbacks. Validate the final output in eager and graph modes.
     let ctx = CudaContext::new(0).unwrap();
     let a = bytes_tensor(0, vec![f::M, f::K], DType::I8, f::W8A8_A);
     let b = bytes_tensor(0, vec![f::K, 2 * f::N], DType::I8, f::W8A8_SWIGLU_B);

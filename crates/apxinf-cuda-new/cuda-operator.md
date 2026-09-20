@@ -105,7 +105,14 @@ Computes `Y = SiLU(alpha * (A @ B_gate)) * (alpha * (A @ B_up)) / output_scale`.
 Public weight is `[K,2N]`, with gate columns first and up columns second;
 output is `[M,N]`. Supports all shared GEMM quantization modes; channel scales
 have length `2N`, covering both gate and up columns, and W8A8 output is BF16. Reference:
-`gr00t_swiglu_candidates_match_torch`.
+`gr00t_swiglu_candidates_match_torch` and
+`gr00t_w8a8_swiglu_candidates_match_torch`.
+
+The cuBLAS W8A8 fallback converts unscaled INT8 operands exactly to BF16,
+accumulates and stores the projection in FP32, then applies row/channel
+scales and the fused epilogue before the final BF16 output conversion.
+This avoids rounding scaled operands or gate/up projections to BF16 before
+SwiGLU.
 
 ## Operator families not yet exposed by `cuda-new`
 
