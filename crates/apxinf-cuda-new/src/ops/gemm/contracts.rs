@@ -189,6 +189,10 @@ impl Semantic {
         Self::GemmBias,
         Self::GemmBiasGelu,
         Self::GemmGeglu,
+        Self::GemmBiasRelu,
+        Self::GemmBiasSilu,
+        Self::GemmBiasResidual,
+        Self::GemmSwiglu,
     ];
 
     /// Stable identifier used by the operator catalog's machine-readable
@@ -200,6 +204,10 @@ impl Semantic {
             Self::GemmBias => "gemm_bias",
             Self::GemmBiasGelu => "gemm_bias_gelu",
             Self::GemmGeglu => "gemm_geglu",
+            Self::GemmBiasRelu => "gemm_bias_relu",
+            Self::GemmBiasSilu => "gemm_bias_silu",
+            Self::GemmBiasResidual => "gemm_bias_residual",
+            Self::GemmSwiglu => "gemm_swiglu",
         }
     }
 }
