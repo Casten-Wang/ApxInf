@@ -128,6 +128,22 @@ Two views, 224x224 NHWC `uint8`, batch 1.
 | Jetson AGX Orin | BF16 | 117.3 ms | 25.34 ms |
 | RTX 4090 | BF16 | 20.9 ms | 5.24 ms |
 
+### Qwen3.8-27B-NVFP4
+
+Text LLM, 48 Gated DeltaNet + 16 full-attention layers, mixed NVFP4/FP8.
+2048-token prompt, 128 greedy tokens, batch 1, BF16 KV cache; steady state
+after one warm-up generation. See [doc/qwen38-nvfp4.md](doc/qwen38-nvfp4.md)
+for CLI inference.
+
+| Hardware | Precision | TTFT (2048) | Decode | Throughput |
+|---|---|---:|---:|---:|
+| Jetson AGX Thor | NVFP4/FP8 | 534 ms | 78.1 ms/token | 12.8 tok/s |
+
+```bash
+cargo run -p apxinf-model --features cuda --release --example qwen38_bench -- \
+    <path-to-Qwen3.8-27B-NVFP4> --prompt-len 2048 --max-new 128 --repeats 3
+```
+
 
 ## Port a new model with an agent
 
