@@ -815,6 +815,103 @@ __global__ void bias_residual_layer_norm_quant_bf16_e4m3_kernel(
   }
 }
 
+// Exact-width companion for GR00T's DiT FFN-output boundary. The projection
+// bias and residual remain separately rounded to BF16 before applying the
+// following block's adaptive LayerNorm. The 256-thread ownership and
+// accumulation order match adaptive_layer_norm_bf16_kernel at width 1536.
+__global__ void
+bias_then_residual_adaptive_layer_norm_bf16_cached_1536_kernel(
+    const __nv_bfloat16* projection, const __nv_bfloat16* projection_bias,
+    const __nv_bfloat16* residual, const __nv_bfloat16* modulation,
+    __nv_bfloat16* hidden, __nv_bfloat16* normalized, int rows, float eps) {
+  __shared__ float scratch[16];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int64_t base = static_cast<int64_t>(row) * 1536;
+  float cache[6];
+#pragma unroll
+  for (int i = 0; i < 6; ++i) {
+    const int col = threadIdx.x + i * static_cast<int>(blockDim.x);
+    const __nv_bfloat16 biased = __float2bfloat16(
+        __bfloat162float(projection[base + col]) +
+        __bfloat162float(projection_bias[col]));
+    const __nv_bfloat16 rounded = __float2bfloat16(
+        __bfloat162float(biased) + __bfloat162float(residual[base + col]));
+    hidden[base + col] = rounded;
+    cache[i] = __bfloat162float(rounded);
+  }
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 6; ++i) sum += cache[i];
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / 1536.0f;
+  float variance_sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 6; ++i) {
+    const float centered = cache[i] - mean;
+    variance_sum += centered * centered;
+  }
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / 1536.0f + eps);
+#pragma unroll
+  for (int i = 0; i < 6; ++i) {
+    const int col = threadIdx.x + i * static_cast<int>(blockDim.x);
+    const float value = (cache[i] - mean) * inverse_std;
+    const float scale = __bfloat162float(modulation[col]);
+    const float shift = __bfloat162float(modulation[1536 + col]);
+    normalized[base + col] =
+        __float2bfloat16(value * (1.0f + scale) + shift);
+  }
+}
+
+// Exact-shape opt-in for the GR00T DiT attention-output boundary. Unlike the
+// generic fused residual path, this retains the legacy bias kernel's BF16
+// boundary before the residual add. Each of the 256 threads owns the same six
+// columns, in the same order, as layer_norm_bf16_kernel at width 1536.
+__global__ void bias_then_residual_layer_norm_bf16_cached_1536_kernel(
+    const __nv_bfloat16* projection, const __nv_bfloat16* projection_bias,
+    const __nv_bfloat16* residual, const __nv_bfloat16* norm_weight,
+    const __nv_bfloat16* norm_bias, __nv_bfloat16* hidden,
+    __nv_bfloat16* normalized, int rows, float eps) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int64_t base = static_cast<int64_t>(row) * 1536;
+  float cache[6];
+#pragma unroll
+  for (int i = 0; i < 6; ++i) {
+    const int col = threadIdx.x + i * static_cast<int>(blockDim.x);
+    const __nv_bfloat16 biased = __float2bfloat16(
+        __bfloat162float(projection[base + col]) +
+        __bfloat162float(projection_bias[col]));
+    const __nv_bfloat16 rounded = __float2bfloat16(
+        __bfloat162float(biased) + __bfloat162float(residual[base + col]));
+    hidden[base + col] = rounded;
+    cache[i] = __bfloat162float(rounded);
+  }
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 6; ++i) sum += cache[i];
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / 1536.0f;
+  float variance_sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 6; ++i) {
+    const float centered = cache[i] - mean;
+    variance_sum += centered * centered;
+  }
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / 1536.0f + eps);
+#pragma unroll
+  for (int i = 0; i < 6; ++i) {
+    const int col = threadIdx.x + i * static_cast<int>(blockDim.x);
+    normalized[base + col] = __float2bfloat16(
+        (cache[i] - mean) * inverse_std *
+            __bfloat162float(norm_weight[col]) +
+        __bfloat162float(norm_bias[col]));
+  }
+}
+
 __global__ void ada_gate_residual_bf16_kernel(
     const __nv_bfloat16* projection, const __nv_bfloat16* residual,
     const __nv_bfloat16* style, __nv_bfloat16* output,

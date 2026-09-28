@@ -942,12 +942,20 @@ fn fp8_identity_gemm_runs_on_device() {
         );
         if crate::kernels::gemm::native_fp8_supported(backend.context()).unwrap() {
             let output = backend
-                .to_cpu(&bf16_output.unwrap()).unwrap().to_f32_vec().unwrap();
+                .to_cpu(&bf16_output.unwrap())
+                .unwrap()
+                .to_f32_vec()
+                .unwrap();
             for (actual, expected) in output.iter().zip(&activation) {
-                assert!((actual - expected).abs() < 0.04, "BF16 {actual} != {expected}");
+                assert!(
+                    (actual - expected).abs() < 0.04,
+                    "BF16 {actual} != {expected}"
+                );
             }
         } else {
-            assert!(bf16_output.unwrap_err().to_string()
+            assert!(bf16_output
+                .unwrap_err()
+                .to_string()
                 .contains("requires native E4M3 Tensor Core support"));
         }
     }
@@ -1019,7 +1027,8 @@ fn dynamic_fp8_row_channel_scales_match_bf16_reference() {
         let error = output_result.unwrap_err().to_string();
         assert!(
             error.contains("dynamic rowwise FP8 GEMM requires native FP8 Tensor Cores")
-                || error.contains("dynamic rowwise FP8 GEMM requires an SM100-family native backend"),
+                || error
+                    .contains("dynamic rowwise FP8 GEMM requires an SM100-family native backend"),
             "unsupported architecture must fail explicitly, got: {error}"
         );
         return;
@@ -2559,33 +2568,21 @@ fn concat_rows_quantize_bf16_e4m3_matches_composed_production_shape() {
             .collect::<Vec<_>>()
     };
     let first = backend
-        .to_device(&Tensor::from_bf16(
-            vec![ROWS, COLS],
-            &values(17, 101, 50.0, 7.0),
-        )
-        .unwrap())
+        .to_device(&Tensor::from_bf16(vec![ROWS, COLS], &values(17, 101, 50.0, 7.0)).unwrap())
         .unwrap();
     let second = backend
-        .to_device(&Tensor::from_bf16(
-            vec![ROWS, COLS],
-            &values(29, 113, 56.0, 9.0),
-        )
-        .unwrap())
+        .to_device(&Tensor::from_bf16(vec![ROWS, COLS], &values(29, 113, 56.0, 9.0)).unwrap())
         .unwrap();
 
     let joined = concat_rows_bf16(backend.context(), &first, &second).unwrap();
     let reference = quantize_bf16_e4m3(backend.context(), &joined, SCALE).unwrap();
-    let fused =
-        concat_rows_quantize_bf16_e4m3(backend.context(), &first, &second, SCALE).unwrap();
+    let fused = concat_rows_quantize_bf16_e4m3(backend.context(), &first, &second, SCALE).unwrap();
     backend.synchronize().unwrap();
 
     let reference = backend.to_cpu(&reference).unwrap();
     let fused = backend.to_cpu(&fused).unwrap();
     assert_eq!(fused.shape(), reference.shape());
-    assert_eq!(
-        fused.as_f8_e4m3().unwrap(),
-        reference.as_f8_e4m3().unwrap()
-    );
+    assert_eq!(fused.as_f8_e4m3().unwrap(), reference.as_f8_e4m3().unwrap());
 }
 
 #[test]

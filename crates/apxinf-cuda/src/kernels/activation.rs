@@ -253,6 +253,44 @@ pub(super) fn bias_activation(
     Ok(matrix_tensor(ctx, rows, cols, output))
 }
 
+/// GR00T-private SM110 packed8 route for the exact BF16 bias/activation
+/// shapes established by the model profile. Unsupported devices and shapes
+/// return `None`, leaving the model to use the ordinary public operator.
+pub fn gr00t_bias_activation_bf16_packed8(
+    ctx: &CudaContext,
+    input: &Tensor,
+    bias: &Tensor,
+    activation: i32,
+) -> Result<Option<Tensor>> {
+    let (rows, cols) = matrix_shape(input, "GR00T packed8 bias activation")?;
+    if input.dtype() != DType::BF16 || bias.dtype() != DType::BF16 || bias.shape().dims() != [cols]
+    {
+        return Err(Error::Other(
+            "GR00T packed8 bias activation has incompatible dtype or shape".into(),
+        ));
+    }
+    let supported_shape = matches!(
+        (rows, cols, activation),
+        (41, 1536, 0) | (41, 4608, 0) | (41, 6144, 1) | (256, 4096, 1) | (512, 4096, 1)
+    );
+    if ctx.caps().sm != 110 || !supported_shape {
+        return Ok(None);
+    }
+    let output = bf16_output(ctx, rows, cols)?;
+    unsafe {
+        check_cuda(ffi::apxinf_gr00t_bias_activation_bf16_packed8(
+            gpu_ptr(input)?,
+            gpu_ptr(bias)?,
+            output.ptr(),
+            rows as i32,
+            cols as i32,
+            activation,
+            ctx.stream().handle(),
+        ))?;
+    }
+    Ok(Some(matrix_tensor(ctx, rows, cols, output)))
+}
+
 pub fn bias_gelu_bf16(ctx: &CudaContext, input: &Tensor, value: Option<&Tensor>) -> Result<Tensor> {
     bias_activation(ctx, input, value, 1)
 }

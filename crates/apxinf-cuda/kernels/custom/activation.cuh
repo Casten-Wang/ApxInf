@@ -12,6 +12,10 @@ struct alignas(8) Bf16x4 {
   __nv_bfloat162 high;
 };
 
+struct alignas(16) Bf16x8 {
+  __nv_bfloat16 values[8];
+};
+
 // Copyright 2026 apxinf contributors.
 // Pure CUDA operators grouped by physical operation; launch policy lives under adapters/.
 
@@ -592,6 +596,34 @@ __global__ void bias_activation_bf16_packed4_kernel(
         __floats2bfloat162_rn(values[0], values[1]),
         __floats2bfloat162_rn(values[2], values[3]),
     };
+  }
+}
+
+__global__ void bias_activation_bf16_packed8_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* bias,
+    __nv_bfloat16* output, int64_t oct_count, int cols, int activation) {
+  int64_t oct_index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  const int octs_per_row = cols / 8;
+  const Bf16x8* input8 = reinterpret_cast<const Bf16x8*>(input);
+  const Bf16x8* bias8 = reinterpret_cast<const Bf16x8*>(bias);
+  Bf16x8* output8 = reinterpret_cast<Bf16x8*>(output);
+  for (; oct_index < oct_count; oct_index += stride) {
+    const Bf16x8 packed_input = input8[oct_index];
+    Bf16x8 packed_output;
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+      float value = __bfloat162float(packed_input.values[item]);
+      if (bias != nullptr) {
+        value += __bfloat162float(
+            bias8[oct_index % octs_per_row].values[item]);
+      }
+      if (activation == 1) value = gelu_tanh(value);
+      if (activation == 2) value = value / (1.0f + expf(-value));
+      packed_output.values[item] = __float2bfloat16_rn(value);
+    }
+    output8[oct_index] = packed_output;
   }
 }
 

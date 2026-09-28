@@ -298,7 +298,9 @@ fn forward_impl(
         // fuse this single-use LayerNorm directly into their activation type.
         let qkv = if let Some(normed) = prepared_norm1.take() {
             vision_matmul(matmul, b, &qkv_name, &normed, &blk.qkv_w).map_err(|error| {
-                Error::Other(format!("vision block {i} prepared norm/QKV failed: {error}"))
+                Error::Other(format!(
+                    "vision block {i} prepared norm/QKV failed: {error}"
+                ))
             })?
         } else if let Some(norm_matmul) = norm_matmul {
             norm_matmul(&qkv_name, &x, &blk.norm1_w, &blk.norm1_b, eps, &blk.qkv_w).map_err(
@@ -405,18 +407,12 @@ fn forward_impl(
         )
         .map_err(|error| Error::Other(format!("vision block {i} attention failed: {error}")))?;
         // Output projection + residual + pre-MLP LayerNorm
-        let attn_out = vision_matmul(
-            matmul,
-            b,
-            &output_name,
-            &attn_out,
-            &blk.proj_w,
-        )
-        .map_err(|error| {
-            Error::Other(format!(
-                "vision block {i} output projection failed: {error}"
-            ))
-        })?;
+        let attn_out =
+            vision_matmul(matmul, b, &output_name, &attn_out, &blk.proj_w).map_err(|error| {
+                Error::Other(format!(
+                    "vision block {i} output projection failed: {error}"
+                ))
+            })?;
         let fc1_name = format!("backbone.vision.blocks.{i}.fc1");
         // Output residual + pre-MLP LayerNorm + FC1. Quantized GR00T may
         // explicitly replace the normalized BF16 intermediate with an FP8
@@ -469,12 +465,7 @@ fn forward_impl(
         )
         .map_err(|error| Error::Other(format!("vision block {i} FC2 failed: {error}")))?;
         if allow_gr00t_fused_mlp_residual_norm
-            && fused_vision_mlp_residual_norm_shape_supported(
-                n_patches,
-                hidden,
-                i,
-                w.blocks.len(),
-            )
+            && fused_vision_mlp_residual_norm_shape_supported(n_patches, hidden, i, w.blocks.len())
         {
             // Block 23 intentionally retains the legacy residual path. Its
             // consumer is the primary merger, not another vision block.

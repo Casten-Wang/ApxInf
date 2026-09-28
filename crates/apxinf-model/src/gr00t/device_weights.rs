@@ -18,6 +18,22 @@ pub(super) trait DeviceLinearWeights: Debug {
 
     fn bias(&self) -> Option<&Tensor>;
 
+    /// Optional GR00T-private BF16 packed8 bias path. Implementations return
+    /// `None` when the precision, device, or exact profiled shape is not
+    /// eligible, preserving the ordinary public operator as the fallback.
+    fn packed8_bias(&self, _input: &Tensor, _backend: &RuntimeBackend) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
+    /// Optional GR00T-private BF16 packed8 Bias+GELU path.
+    fn packed8_bias_gelu(
+        &self,
+        _input: &Tensor,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
     fn activation_scale(&self) -> Option<f32> {
         None
     }
@@ -131,6 +147,34 @@ pub(super) trait DeviceLinearWeights: Debug {
         _eps: f32,
         _backend: &RuntimeBackend,
     ) -> Result<Option<(Tensor, Self::ReusableInput)>> {
+        Ok(None)
+    }
+
+    /// Exact opt-in composition for a projection bias, residual add, and the
+    /// following adaptive LayerNorm. Implementors return `None` unless their
+    /// storage and kernel contract preserve the legacy BF16 boundaries.
+    fn bias_residual_adaptive_layer_norm(
+        &self,
+        _projection: &Tensor,
+        _residual: &Tensor,
+        _modulation: &Tensor,
+        _eps: f32,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        Ok(None)
+    }
+
+    /// Exact opt-in composition for a projection whose bias must be rounded
+    /// to BF16 before the residual add and following fixed LayerNorm.
+    fn bias_residual_layer_norm(
+        &self,
+        _projection: &Tensor,
+        _residual: &Tensor,
+        _norm_weight: &Tensor,
+        _norm_bias: &Tensor,
+        _eps: f32,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<(Tensor, Tensor)>> {
         Ok(None)
     }
 

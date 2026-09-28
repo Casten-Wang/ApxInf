@@ -21,6 +21,8 @@ impl Gr00tPrecisionExecution for Gr00tBf16Execution {
     type FusedQkv = Gr00tBf16LinearWeights;
     type Backbone = Gr00tBf16LinearWeights;
 
+    const USE_BIAS_RESIDUAL_ADAPTIVE_LAYER_NORM: bool = true;
+    const USE_BIAS_RESIDUAL_LAYER_NORM: bool = true;
     const NAME: &'static str = "bf16";
     const SUPPORTS_CALIBRATION: bool = true;
     const USE_HDIM96_BM64_ATTENTION: bool = true;
@@ -30,6 +32,7 @@ impl Gr00tPrecisionExecution for Gr00tBf16Execution {
     const USE_DIRECT_BF16_VISION_SEGMENT_OUTPUT: bool = true;
     const USE_PRECOMPUTED_BF16_VISION_ROPE: bool = true;
     const USE_FUSED_BF16_VISION_MLP_RESIDUAL_NORM: bool = true;
+    const USE_PACKED8_BF16_BIAS_ACTIVATION: bool = true;
 
     fn transfer_dense(
         &self,
@@ -108,5 +111,20 @@ mod tests {
     #[test]
     fn bf16_explicitly_opts_into_vision_mlp_residual_norm_fusion() {
         assert!(Gr00tBf16Execution::USE_FUSED_BF16_VISION_MLP_RESIDUAL_NORM);
+    }
+
+    #[test]
+    fn bf16_explicitly_opts_into_packed8_bias_activation() {
+        assert!(Gr00tBf16Execution::USE_PACKED8_BF16_BIAS_ACTIVATION);
+    }
+
+    #[test]
+    fn bf16_explicitly_opts_into_bias_residual_adaptive_layer_norm() {
+        assert!(Gr00tBf16Execution::USE_BIAS_RESIDUAL_ADAPTIVE_LAYER_NORM);
+    }
+
+    #[test]
+    fn bf16_explicitly_opts_into_bias_residual_layer_norm() {
+        assert!(Gr00tBf16Execution::USE_BIAS_RESIDUAL_LAYER_NORM);
     }
 }

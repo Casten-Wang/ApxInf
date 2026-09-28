@@ -519,12 +519,7 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
                 },
             )
         } else {
-            kernels::gemm::fp8_bf16(
-                backend.context(),
-                input,
-                self.activation_scale,
-                weight,
-            )
+            kernels::gemm::fp8_bf16(backend.context(), input, self.activation_scale, weight)
         }
     }
 

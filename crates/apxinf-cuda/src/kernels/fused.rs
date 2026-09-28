@@ -600,6 +600,116 @@ pub fn bias_residual_layer_quant_bf16_e4m3(
     })
 }
 
+/// GR00T-only exact-width composition for an FFN projection followed by the
+/// next DiT block's adaptive LayerNorm. Public/default normalization dispatch
+/// does not select this helper.
+pub fn bias_then_residual_adaptive_layer_bf16_cached_1536(
+    ctx: &CudaContext,
+    projection: &Tensor,
+    projection_bias: &Tensor,
+    residual: &Tensor,
+    modulation: &Tensor,
+    eps: f32,
+) -> Result<ResidualNormTensors> {
+    let (rows, cols) = matrix_shape(projection, "cached bias residual adaptive LayerNorm")?;
+    if rows != 41
+        || cols != 1536
+        || [projection, projection_bias, residual, modulation]
+            .into_iter()
+            .any(|tensor| tensor.dtype() != DType::BF16)
+        || residual.shape() != projection.shape()
+        || projection_bias.shape().dims() != [cols]
+        || modulation.shape().dims() != [2 * cols]
+    {
+        return Err(Error::Other(
+            "cached BF16 bias residual adaptive LayerNorm requires shape [41, 1536] and matching inputs"
+                .into(),
+        ));
+    }
+    let hidden = bf16_output(ctx, rows, cols)?;
+    let normalized = bf16_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(
+            ffi::apxinf_static_bias_then_residual_adaptive_layer_norm_bf16_cached_1536(
+                gpu_ptr(projection)?,
+                gpu_ptr(projection_bias)?,
+                gpu_ptr(residual)?,
+                gpu_ptr(modulation)?,
+                hidden.ptr(),
+                normalized.ptr(),
+                rows as i32,
+                cols as i32,
+                eps,
+                ctx.stream().handle(),
+            ),
+        )
+        .map_err(Error::Cuda)?;
+    }
+    Ok(ResidualNormTensors {
+        hidden: matrix_tensor(ctx, rows, cols, hidden),
+        normalized: matrix_tensor(ctx, rows, cols, normalized),
+    })
+}
+
+/// GR00T may opt into this exact-width composition when the caller needs the
+/// legacy bias-rounding boundary before adding the residual. Public residual
+/// and LayerNorm helpers do not dispatch here automatically.
+#[allow(clippy::too_many_arguments)]
+pub fn bias_then_residual_layer_bf16_cached_1536(
+    ctx: &CudaContext,
+    projection: &Tensor,
+    projection_bias: &Tensor,
+    residual: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: &Tensor,
+    eps: f32,
+) -> Result<ResidualNormTensors> {
+    let (rows, cols) = matrix_shape(projection, "cached bias residual LayerNorm")?;
+    if cols != 1536
+        || [
+            projection,
+            projection_bias,
+            residual,
+            norm_weight,
+            norm_bias,
+        ]
+        .into_iter()
+        .any(|tensor| tensor.dtype() != DType::BF16)
+        || residual.shape() != projection.shape()
+        || projection_bias.shape().dims() != [cols]
+        || norm_weight.shape().dims() != [cols]
+        || norm_bias.shape().dims() != [cols]
+    {
+        return Err(Error::Other(
+            "cached BF16 bias residual LayerNorm requires width 1536 and matching shapes".into(),
+        ));
+    }
+    let hidden = bf16_output(ctx, rows, cols)?;
+    let normalized = bf16_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(
+            ffi::apxinf_static_bias_then_residual_layer_norm_bf16_cached_1536(
+                gpu_ptr(projection)?,
+                gpu_ptr(projection_bias)?,
+                gpu_ptr(residual)?,
+                gpu_ptr(norm_weight)?,
+                gpu_ptr(norm_bias)?,
+                hidden.ptr(),
+                normalized.ptr(),
+                rows as i32,
+                cols as i32,
+                eps,
+                ctx.stream().handle(),
+            ),
+        )
+        .map_err(Error::Cuda)?;
+    }
+    Ok(ResidualNormTensors {
+        hidden: matrix_tensor(ctx, rows, cols, hidden),
+        normalized: matrix_tensor(ctx, rows, cols, normalized),
+    })
+}
+
 pub fn adaptive_gate_residual_bf16(
     ctx: &CudaContext,
     projection: &Tensor,

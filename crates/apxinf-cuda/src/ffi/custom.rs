@@ -529,6 +529,16 @@ extern "C" {
         activation: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    /// GR00T-only SM110 exact-shape packed8 BF16 bias/activation path.
+    pub fn apxinf_gr00t_bias_activation_bf16_packed8(
+        input: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        activation: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 
     pub fn apxinf_static_bias_relu_bf16(
         input: *const c_void,
@@ -767,6 +777,31 @@ extern "C" {
         cols: i32,
         eps: f32,
         scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_bias_then_residual_adaptive_layer_norm_bf16_cached_1536(
+        projection: *const c_void,
+        projection_bias: *const c_void,
+        residual: *const c_void,
+        modulation: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_bias_then_residual_layer_norm_bf16_cached_1536(
+        projection: *const c_void,
+        projection_bias: *const c_void,
+        residual: *const c_void,
+        norm_weight: *const c_void,
+        norm_bias: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub fn apxinf_static_ada_rms_norm_bf16(

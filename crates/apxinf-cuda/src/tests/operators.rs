@@ -124,7 +124,11 @@ fn gr00t_hdim96_bm64_matches_default_fa2_bitwise() {
             crate::kernels::attention::noncausal_hdim96_bm64(&ctx, &q, &k, &v, HEADS, DIM)
                 .unwrap()
                 .expect("measured GR00T production shape must select BM64");
-        assert_eq!(candidate.shape(), reference.shape(), "key_tokens={key_tokens}");
+        assert_eq!(
+            candidate.shape(),
+            reference.shape(),
+            "key_tokens={key_tokens}"
+        );
         assert_eq!(
             download_bf16_as_fp32(&reference).unwrap(),
             download_bf16_as_fp32(&candidate).unwrap(),
@@ -1811,6 +1815,90 @@ fn layer_norm_bf16_matches_fp32_reference() {
     let t_b = upload_fp32_as_bf16(&ctx, &bias, vec![cols]).unwrap();
     let out = layer(&ctx, &t_in, &t_w, &t_b, eps).unwrap();
     assert_bf16_close_reduction(&download_bf16_as_fp32(&out).unwrap(), &expected);
+}
+
+#[test]
+fn cached_bias_then_residual_adaptive_layer_norm_1536_is_bitwise_exact() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (rows, cols) = (41usize, 1536usize);
+    let projection: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.017).sin())
+        .collect();
+    let residual: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.013).cos())
+        .collect();
+    let projection_bias: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.0001 - 0.05).collect();
+    let modulation: Vec<f32> = (0..2 * cols)
+        .map(|i| ((i as f32) * 0.0003).sin() * 0.25)
+        .collect();
+    let projection = upload_fp32_as_bf16(&ctx, &projection, vec![rows, cols]).unwrap();
+    let residual = upload_fp32_as_bf16(&ctx, &residual, vec![rows, cols]).unwrap();
+    let projection_bias = upload_fp32_as_bf16(&ctx, &projection_bias, vec![cols]).unwrap();
+    let modulation = upload_fp32_as_bf16(&ctx, &modulation, vec![2 * cols]).unwrap();
+    let biased =
+        crate::kernels::elementwise::bias_bf16(&ctx, &projection, Some(&projection_bias)).unwrap();
+    let legacy_hidden = add(&ctx, &biased, &residual).unwrap();
+    let legacy_normalized =
+        crate::kernels::norm::adaptive_layer(&ctx, &legacy_hidden, &modulation, 1.0e-6).unwrap();
+    let cached = crate::kernels::fused::bias_then_residual_adaptive_layer_bf16_cached_1536(
+        &ctx,
+        &projection,
+        &projection_bias,
+        &residual,
+        &modulation,
+        1.0e-6,
+    )
+    .unwrap();
+    assert_eq!(
+        download_bf16_as_fp32(&legacy_hidden).unwrap(),
+        download_bf16_as_fp32(&cached.hidden).unwrap()
+    );
+    assert_eq!(
+        download_bf16_as_fp32(&legacy_normalized).unwrap(),
+        download_bf16_as_fp32(&cached.normalized).unwrap()
+    );
+}
+
+#[test]
+fn cached_bias_then_residual_layer_norm_1536_is_bitwise_exact() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (rows, cols) = (3usize, 1536usize);
+    let projection: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.017).sin())
+        .collect();
+    let residual: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.013).cos())
+        .collect();
+    let projection_bias: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.0001 - 0.05).collect();
+    let norm_weight: Vec<f32> = (0..cols).map(|i| 0.9 + (i as f32) * 0.0001).collect();
+    let norm_bias: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.00002).collect();
+    let projection = upload_fp32_as_bf16(&ctx, &projection, vec![rows, cols]).unwrap();
+    let residual = upload_fp32_as_bf16(&ctx, &residual, vec![rows, cols]).unwrap();
+    let projection_bias = upload_fp32_as_bf16(&ctx, &projection_bias, vec![cols]).unwrap();
+    let norm_weight = upload_fp32_as_bf16(&ctx, &norm_weight, vec![cols]).unwrap();
+    let norm_bias = upload_fp32_as_bf16(&ctx, &norm_bias, vec![cols]).unwrap();
+    let biased =
+        crate::kernels::elementwise::bias_bf16(&ctx, &projection, Some(&projection_bias)).unwrap();
+    let legacy_hidden = add(&ctx, &biased, &residual).unwrap();
+    let legacy_normalized = layer(&ctx, &legacy_hidden, &norm_weight, &norm_bias, 1.0e-6).unwrap();
+    let cached = crate::kernels::fused::bias_then_residual_layer_bf16_cached_1536(
+        &ctx,
+        &projection,
+        &projection_bias,
+        &residual,
+        &norm_weight,
+        &norm_bias,
+        1.0e-6,
+    )
+    .unwrap();
+    assert_eq!(
+        download_bf16_as_fp32(&legacy_hidden).unwrap(),
+        download_bf16_as_fp32(&cached.hidden).unwrap()
+    );
+    assert_eq!(
+        download_bf16_as_fp32(&legacy_normalized).unwrap(),
+        download_bf16_as_fp32(&cached.normalized).unwrap()
+    );
 }
 
 #[test]

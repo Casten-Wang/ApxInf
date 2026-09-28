@@ -40,6 +40,91 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
         Some(&self.weights.bias)
     }
 
+    fn packed8_bias(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Option<Tensor>> {
+        if std::env::var_os("APXINF_GR00T_BF16_LEGACY_PACKED8_BIAS_ACTIVATION").is_some() {
+            return Ok(None);
+        }
+        kernels::activation::gr00t_bias_activation_bf16_packed8(
+            backend.context(),
+            input,
+            &self.weights.bias,
+            0,
+        )
+    }
+
+    fn packed8_bias_gelu(
+        &self,
+        input: &Tensor,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        if std::env::var_os("APXINF_GR00T_BF16_LEGACY_PACKED8_BIAS_ACTIVATION").is_some() {
+            return Ok(None);
+        }
+        kernels::activation::gr00t_bias_activation_bf16_packed8(
+            backend.context(),
+            input,
+            &self.weights.bias,
+            1,
+        )
+    }
+
+    fn bias_residual_adaptive_layer_norm(
+        &self,
+        projection: &Tensor,
+        residual: &Tensor,
+        modulation: &Tensor,
+        eps: f32,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        if backend.context().caps().sm != 110
+            || projection.shape().dims() != [41, 1536]
+            || residual.shape() != projection.shape()
+            || self.weights.bias.shape().dims() != [1536]
+            || modulation.shape().dims() != [3072]
+        {
+            return Ok(None);
+        }
+        let fused = kernels::fused::bias_then_residual_adaptive_layer_bf16_cached_1536(
+            backend.context(),
+            projection,
+            &self.weights.bias,
+            residual,
+            modulation,
+            eps,
+        )?;
+        Ok(Some((fused.hidden, fused.normalized)))
+    }
+
+    fn bias_residual_layer_norm(
+        &self,
+        projection: &Tensor,
+        residual: &Tensor,
+        norm_weight: &Tensor,
+        norm_bias: &Tensor,
+        eps: f32,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        if backend.context().caps().sm != 110
+            || projection.shape().dims() != [41, 1536]
+            || residual.shape() != projection.shape()
+            || self.weights.bias.shape().dims() != [1536]
+            || norm_weight.shape().dims() != [1536]
+            || norm_bias.shape().dims() != [1536]
+        {
+            return Ok(None);
+        }
+        let fused = kernels::fused::bias_then_residual_layer_bf16_cached_1536(
+            backend.context(),
+            projection,
+            &self.weights.bias,
+            residual,
+            norm_weight,
+            norm_bias,
+            eps,
+        )?;
+        Ok(Some((fused.hidden, fused.normalized)))
+    }
+
     fn supports_fused_self_qkv(&self) -> bool {
         true
     }

@@ -1801,7 +1801,9 @@ fn launch_tactic_fp8_bf16(
             key.n as i32,
             key.k as i32,
             alpha,
-            scratch.as_ref().map_or(std::ptr::null_mut(), CudaBuffer::ptr),
+            scratch
+                .as_ref()
+                .map_or(std::ptr::null_mut(), CudaBuffer::ptr),
             ctx.stream().handle(),
         ))
         .map_err(Error::Cuda)
@@ -2196,7 +2198,8 @@ fn fp8_weight_scratch(ctx: &CudaContext, n: usize, k: usize) -> Result<Option<Cu
     if ctx.caps().arch_family == crate::CudaArchFamily::Sm100 {
         return Ok(None);
     }
-    let bytes = n.checked_mul(k)
+    let bytes = n
+        .checked_mul(k)
         .ok_or_else(|| Error::Other("FP8 weight staging size overflow".into()))?;
     crate::workspace::output_buffer(ctx, bytes).map(Some)
 }
@@ -2222,7 +2225,9 @@ pub fn cublaslt_fp8_gemm_f16(
             n as i32,
             k as i32,
             alpha,
-            scratch.as_ref().map_or(std::ptr::null_mut(), CudaBuffer::ptr),
+            scratch
+                .as_ref()
+                .map_or(std::ptr::null_mut(), CudaBuffer::ptr),
             ctx.stream().handle(),
         )
     };

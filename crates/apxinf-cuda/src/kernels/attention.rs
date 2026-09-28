@@ -1331,8 +1331,7 @@ pub(crate) const fn gr00t_hdim96_bm64_shape_supported(
     heads: usize,
     head_dim: usize,
 ) -> bool {
-    ((compute_major == 8 && compute_minor == 7)
-        || (compute_major == 11 && compute_minor == 0))
+    ((compute_major == 8 && compute_minor == 7) || (compute_major == 11 && compute_minor == 0))
         && query_tokens == 41
         && matches!(key_tokens, 28 | 41 | 128)
         && heads == 32
