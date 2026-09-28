@@ -507,6 +507,7 @@ fn noise_fixture(
 }
 
 fn latency_json(mut milliseconds: Vec<f64>) -> serde_json::Value {
+    let samples_in_order_ms = milliseconds.clone();
     milliseconds.sort_by(f64::total_cmp);
     let sample_count = milliseconds.len() as f64;
     let mean = milliseconds.iter().sum::<f64>() / sample_count;
@@ -528,7 +529,8 @@ fn latency_json(mut milliseconds: Vec<f64>) -> serde_json::Value {
         "p95": percentile(0.95),
         "max": milliseconds[milliseconds.len() - 1],
         "mean": mean,
-        "standard_deviation": variance.sqrt()
+        "standard_deviation": variance.sqrt(),
+        "samples_in_order_ms": samples_in_order_ms
     })
 }
 
@@ -1162,6 +1164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "used_bytes": graph.workspace_used_bytes()
             },
             "output_abs_checksum": checksum,
+            "raw_actions": output,
             "integrity": {
                 "passed": eager_graph_passed && reference_passed,
                 "eager_vs_graph": eager_graph.as_json(),
