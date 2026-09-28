@@ -144,9 +144,8 @@ P50/P95 and the complete normalized model-core output. Generated fixtures,
 reference dumps, logs, tactic databases, and result JSON belong under
 `devlocal/gr00t-n1d7/` and are not committed.
 
-See [optimization and local tuning](gr00t-performance-tactics.md) for the Thor
-and Orin optimization scope, fresh-database commands, and the distinction
-between operator tuning and full-model acceptance.
+See [performance and tuning](gr00t-performance-tactics.md) for optimization
+results and device-local tuning commands.
 
 The repository's shared LIBERO evaluator selects the GR00T state adapter while
 leaving the existing OpenPI state wire format unchanged for other policies:
@@ -170,8 +169,7 @@ python scripts/eval_libero.py \
 Correctness comparison uses the same official processor output, embodiment ID,
 and initial noise on both implementations. The native model-core output is
 `[40, 132]`; the processor decodes and trims the LIBERO action to `[16, 7]`.
-The closed-loop evaluation executes the first eight actions of that decoded
-chunk before replanning; eight executed actions is not the native horizon.
+The closed-loop evaluator executes eight actions before replanning.
 
 Minimum release gates are:
 
@@ -192,13 +190,3 @@ PI0.5 regression acceptance uses a same-host upstream-versus-candidate A/B
 with the same checkpoint, evaluator, trials, frozen noise, and calibration.
 Unmatched historical aggregate success rates are useful context, but are not
 used to attribute a regression to this change.
-
-Keep three kinds of evidence separate: independently tuned end-to-end results,
-fixed-tactic numerical comparisons, and closed-loop task success. If independent
-tuning produces different actions, replay saved complete native inputs with
-the same original, compatible tactic database on both revisions. Record its
-hash and prohibit retuning during replay. Bitwise-equal complete outputs rule
-out a numerical difference for those tested inputs and tactics; they do not
-prove equality for all inputs or explain a historical score obtained under a
-different evaluator. See the [Pi0.5 regression protocol](pi05-cuda-regression.md)
-for the paired 10-task-by-10-trial campaign and performance timing boundaries.

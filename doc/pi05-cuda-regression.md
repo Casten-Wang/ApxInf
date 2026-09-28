@@ -3,69 +3,6 @@
 > Status: This document defines the canonical benchmark workload, tuning rules, accuracy protocol, and result format.
 > As part of the manual CI/CD process, rerun the applicable tests after every code change and attach the results to the pull request.
 
-## Paired regression for the GR00T optimization PR
-
-This campaign compares upstream `9bbf948209b16e6344c2556d84cc42f7ba82df92`
-with compute revision `2b90781f7d8252628835069c63660d9183047df9` on the same
-device. Both benchmark binaries include the same reporting-only change for
-complete action outputs and ordered latency samples. Historical best timings
-below are context, not a substitute for this contemporaneous baseline.
-
-The performance scope is **eight cells**: four device/precision paths, two
-real cameras, and T=10/T=21. Each cell uses H=10 and three interleaved A/B rounds
-of 10 warmups and 30 measured samples per arm. Pool 90 samples per arm and
-report both timing boundaries, P50/P95, complete outputs, tactic identities
-and the observed power/clock/thermal conditions. Each arm tunes a fresh local
-database; no shared tactic file is changed. Three-view tests are optional
-deployment-shape extensions and are outside this campaign.
-
-The requested closed-loop validation first runs the PR candidate for **100
-episodes on each of the four paths: all ten LIBERO-10 tasks, ten fixed trials
-each**. Run additional upstream accuracy comparisons when a suspected
-regression needs attribution; a second complete 100-episode arm is not an
-unconditional requirement. Its checkpoint and tokenizer hashes
-are pinned in section 3.1. Use the original checkpoint's OpenPI LIBERO
-deployment configuration: H=10, ten flow steps starting at 1.0, no warm-start,
-no discrete state tokens, two real cameras, replan every five actions and at
-most 520 action steps. The original OpenPI configuration at
-`175f89c31d1b2631a8ff3b678768f17489c5ead4` explicitly sets
-`action_horizon=10, discrete_state_input=False` for `pi05_libero`.
-
-Use each task's complete language instruction; the ten actual token lengths
-are `14,14,14,16,21,16,20,15,10,14`. A T=10 performance fixture does not stand in
-for all task prompts. Pin the original `norm_stats.json`, select the `actions`
-statistics and quantile normalization with float32 arithmetic and epsilon
-`1e-6`. Rotate both simulator images by 180 degrees and apply the same
-PIL/BILINEAR 224-pixel letterbox preprocessing in both arms.
-
-For every episode, seed the environment with 7, select its bundled initial
-state by trial index, and take ten settling steps with gripper action -1.
-Generate float32 `[10,32]` noise from an episode-local NumPy PCG64 stream seeded
-with `SeedSequence([7, task_id, trial_id])`. Keep failures and allow only one
-scored attempt per case. This noise schedule is a paired code-regression
-protocol, not a reconstruction of historical Torch noise streams.
-
-Prepare the candidate database using all ten real prompts and freeze its
-original bytes before scoring. If results need attribution, start with saved
-input/output comparisons. Use that unchanged database on the upstream
-revision after verifying provider, tactic, SM and library compatibility, and
-record any missing-key fallback. Do not rewrite database headers or enable
-tuning during scored runs. Record database hashes before and after each run
-and use the same calibration for paired FP8 comparisons. This diagnostic
-holds available tactics fixed; the performance experiment retains independent
-tuning. Escalate to full trajectory replay or a complete upstream 100-episode
-arm only when the remaining uncertainty requires it.
-Save every native input, complete `[10,32]` output and decoded action, including
-failed episodes. Equal complete outputs establish numerical equality on the
-tested inputs and tactics; they do not alone prove equal task success or
-equivalence on untested inputs.
-
-Report all four candidate accuracy results and all eight performance cells
-explicitly, along with any additional upstream comparison actually performed.
-In-progress runs and preparation calls are not completed accuracy results.
-This 100-episode campaign must not be reported as the historical 500-episode
-standard described below.
-
 ## 1. Goals
 
 This benchmark answers two questions:
@@ -82,7 +19,7 @@ The primary result uses an official LIBERO instruction with 10 tokens. The exten
 | Batch size | 1 |
 | Camera views | 2 / 3 views |
 | Images | 224 x 224 RGB, NHWC `uint8` |
-| Action horizon `H` | 10 for the pinned OpenPI LIBERO deployment |
+| Action horizon `H` | 10 for performance; 50 for accuracy |
 | Action dimension | 32 |
 | Flow-matching steps | 10 |
 | Token execution mode | Exact length; do not pad to 200 |
@@ -92,9 +29,7 @@ The primary result uses an official LIBERO instruction with 10 tokens. The exten
 | Measured samples | 30 iterations |
 | Timing statistics | P50 / P95 / min / max / mean / standard deviation |
 
-`H` denotes the action horizon and `T` the language token count. The paired
-campaign above uses H=10 for both performance and accuracy. Historical H=50
-runs are a different workload and must retain that label.
+`H` denotes the action horizon. Use `H=10` for performance tests and `H=50` for accuracy tests. `T` denotes the language token count.
 
 ## 3. Token dataset
 
@@ -155,7 +90,7 @@ Run three-view performance tests only. Do not use three views for LIBERO task-su
 | Orin SM87 | BF16 | Orin high-precision baseline |
 | Orin SM87 | INT8 (W8A8) | Orin native INT8 quantized path |
 
-The full matrix including optional three-view deployment shapes contains:
+The real benchmark matrix contains:
 
 ```text
 4 device/precision paths x 2 view counts x 2 real token lengths = 16 cells
@@ -163,17 +98,11 @@ The full matrix including optional three-view deployment shapes contains:
 
 There are also 16 T=50/200 view/device/precision autotune-only profiles. They do not count as end-to-end benchmark results.
 
-The current GR00T PR regression uses only the eight two-real-view cells, as
-specified above; it does not require the optional third-view or T=50/200 cases.
-
 NVFP4 is outside the scope of the current ApxInf benchmark. ApxInf currently has no PI0.5 NVFP4 executor, calibration, tactic, or validated result.
 
-## 6. Historical performance reference results
+## 6. Current best performance results
 
-These recorded results are useful reference points. For a code-regression
-claim, run the declared upstream baseline and candidate under the same
-current conditions; do not compare a new candidate only against an older
-best run. Investigate and report observed regressions before acceptance.
+Use the current best results as the performance baseline. A faster validated result is a candidate for an explicit baseline update. Any result that does not meet the current matching baseline requires human review.
 
 All baseline cells below used 10 warm-up iterations and 30 measured samples. Each latency cell is **P50 / P95** in milliseconds.
 
@@ -209,9 +138,9 @@ Orin uses the same fixed LIBERO fixtures, token IDs, NHWC `uint8` images, and BF
 
 The Orin INT8 CUDA Graph and eager outputs match element by element. Replacing the SM87 CUTLASS W8A8 GEMM with cuBLAS also produces elementwise-identical final outputs across all eight mixed-precision combinations (`max_abs=0`). The accuracy issue comes from the current naive PTQ W8A8 quantization algorithm: weights use per-output-channel absmax scales, activations use dynamic per-token-row absmax scales, and the algorithm has no calibration, SmoothQuant, outlier handling, or QAT. Improving the quantization algorithm remains a TODO.
 
-## 7. Historical accuracy standard and reference results
+## 7. Accuracy standard and current reference results
 
-The previously documented broader accuracy standard was:
+The formal pull-request accuracy standard is:
 
 | Parameter | Required value |
 |---|---:|
@@ -221,10 +150,7 @@ The previously documented broader accuracy standard was:
 | Views | 2 |
 | Token length | T=10 |
 
-A material task-success-rate regression requires investigation and review.
-A run using this 500-episode protocol must report its completed count out of
-500 and the corresponding percentage. The current paired campaign uses the
-explicit H=10, complete-prompt, 10-task-by-10-trial protocol above instead.
+A material task-success-rate regression requires human review. New formal results must report the completed count out of 500 and the corresponding percentage.
 
 The tables below are historical 100-episode reference runs. They are useful comparison points, but they do **not** satisfy the current 500-episode pull-request accuracy standard and must not be reported as new formal PR accuracy results.
 
