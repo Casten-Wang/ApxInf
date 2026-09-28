@@ -235,7 +235,7 @@ __global__ void rope_mrope_bf16_kernel(
     float x0 = __bfloat162float(input[idx0]);
     float x1 = __bfloat162float(input[idx1]);
     output[idx0] = __float2bfloat16(x0 * cos_val - x1 * sin_val);
-  output[idx1] = __float2bfloat16(x0 * sin_val + x1 * cos_val);
+    output[idx1] = __float2bfloat16(x0 * sin_val + x1 * cos_val);
 }
 
 // Fuse the per-head RMSNorm of Q and K with multimodal RoPE while preserving
@@ -312,8 +312,6 @@ __global__ void qk_rms_norm_mrope_bf16_kernel(
   output[base + head_dim / 2 + pair] =
       __float2bfloat16(first * sin_value + second * cos_value);
 }
-
-
 
 // Decode-position variant: seq_len is always 1, pos_ids is a [3] u32 buffer
 // read from device memory (so the captured graph is static across replay).
@@ -525,4 +523,67 @@ __global__ void qkv_split_bias_vision_rope_bf16_kernel(
     v_out[out_base + second] = __float2bfloat16(
         __bfloat162float(qkv[qkv_row + 2 * width + head_col + second]) +
         __bfloat162float(bias[2 * width + head_col + second]));
+}
+
+// Two adjacent RoPE pairs per thread. This preserves scalar arithmetic and
+// the legacy BF16 boundary while reducing exact-shape address work.
+__global__ void qkv_split_bias_vision_rope_precomputed_bf16_vec2_kernel(
+    const __nv_bfloat16* qkv, const __nv_bfloat16* bias,
+    __nv_bfloat16* q_out, __nv_bfloat16* k_out, __nv_bfloat16* v_out,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    const float2* rotation_table) {
+  const uint64_t group =
+      static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const uint32_t half = head_dim / 2;
+  const uint32_t groups_per_head = half / 2;
+  const uint64_t total =
+      static_cast<uint64_t>(seq_len) * n_heads * groups_per_head;
+  if (group >= total) return;
+
+  const uint32_t group_in_head = static_cast<uint32_t>(group % groups_per_head);
+  const uint64_t token_head = group / groups_per_head;
+  const uint32_t head = static_cast<uint32_t>(token_head % n_heads);
+  const uint32_t row = static_cast<uint32_t>(token_head / n_heads);
+  const uint32_t width = n_heads * head_dim;
+  const uint64_t qkv_row = static_cast<uint64_t>(row) * 3 * width;
+  const uint32_t head_col = head * head_dim;
+  const uint64_t out_base = token_head * head_dim;
+
+#pragma unroll
+  for (uint32_t lane = 0; lane < 2; ++lane) {
+    const uint32_t pair = group_in_head * 2 + lane;
+    const uint32_t second = pair + half;
+    const __nv_bfloat16 q0_bf16 = __float2bfloat16(
+        __bfloat162float(qkv[qkv_row + head_col + pair]) +
+        __bfloat162float(bias[head_col + pair]));
+    const __nv_bfloat16 q1_bf16 = __float2bfloat16(
+        __bfloat162float(qkv[qkv_row + head_col + second]) +
+        __bfloat162float(bias[head_col + second]));
+    const __nv_bfloat16 k0_bf16 = __float2bfloat16(
+        __bfloat162float(qkv[qkv_row + width + head_col + pair]) +
+        __bfloat162float(bias[width + head_col + pair]));
+    const __nv_bfloat16 k1_bf16 = __float2bfloat16(
+        __bfloat162float(qkv[qkv_row + width + head_col + second]) +
+        __bfloat162float(bias[width + head_col + second]));
+    const float2 rotation =
+        rotation_table[static_cast<size_t>(row) * half + pair];
+    const float q0 = __bfloat162float(q0_bf16);
+    const float q1 = __bfloat162float(q1_bf16);
+    const float k0 = __bfloat162float(k0_bf16);
+    const float k1 = __bfloat162float(k1_bf16);
+    q_out[out_base + pair] =
+        __float2bfloat16(q0 * rotation.x - q1 * rotation.y);
+    q_out[out_base + second] =
+        __float2bfloat16(q0 * rotation.y + q1 * rotation.x);
+    k_out[out_base + pair] =
+        __float2bfloat16(k0 * rotation.x - k1 * rotation.y);
+    k_out[out_base + second] =
+        __float2bfloat16(k0 * rotation.y + k1 * rotation.x);
+    v_out[out_base + pair] = __float2bfloat16(
+        __bfloat162float(qkv[qkv_row + 2 * width + head_col + pair]) +
+        __bfloat162float(bias[2 * width + head_col + pair]));
+    v_out[out_base + second] = __float2bfloat16(
+        __bfloat162float(qkv[qkv_row + 2 * width + head_col + second]) +
+        __bfloat162float(bias[2 * width + head_col + second]));
+  }
 }

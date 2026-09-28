@@ -105,6 +105,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "apxinf-cuda-new"
+version = "0.1.0"
+dependencies = [
+ "apxinf-core",
+ "half",
+]
+
+[[package]]
 name = "apxinf-loader"
 version = "0.1.0"
 dependencies = [
@@ -125,6 +133,7 @@ version = "0.1.0"
 dependencies = [
  "apxinf-core",
  "apxinf-cuda",
+ "apxinf-cuda-new",
  "apxinf-loader",
  "half",
  "once_cell",

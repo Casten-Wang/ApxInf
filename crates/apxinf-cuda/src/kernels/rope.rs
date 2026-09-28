@@ -257,9 +257,32 @@ pub fn apply_mrope(
     ))
 }
 
+pub(crate) const fn qk_rms_mrope_block_threads(
+    sm: u32,
+    seq_len: usize,
+    head_dim: usize,
+    query_heads: usize,
+    key_heads: usize,
+    legacy_threads: bool,
+) -> u32 {
+    let measured_arch_shape =
+        (sm == 110 && (seq_len == 90 || seq_len == 156)) || (sm == 87 && seq_len == 156);
+    if !legacy_threads
+        && measured_arch_shape
+        && head_dim == 128
+        && query_heads == 16
+        && key_heads == 8
+    {
+        128
+    } else {
+        256
+    }
+}
+
 /// Apply per-head RMSNorm and multimodal RoPE to Q and K in one launch.
 /// The normalized values are rounded to BF16 before rotation, matching the
 /// decomposed RMSNorm-then-RoPE contract.
+/// Head dimensions above 512 require the decomposed path.
 #[allow(clippy::too_many_arguments)]
 pub fn rms_norm_apply_mrope_qk(
     ctx: &CudaContext,
@@ -289,6 +312,7 @@ pub fn rms_norm_apply_mrope_qk(
         || query_heads == 0
         || key_heads == 0
         || head_dim == 0
+        || head_dim > 512
         || head_dim % 2 != 0
         || eps <= 0.0
         || theta <= 0.0
@@ -335,8 +359,21 @@ pub fn rms_norm_apply_mrope_qk(
     )?;
     let query_output = output_buffer(ctx, query_bytes)?;
     let key_output = output_buffer(ctx, key_bytes)?;
+    let legacy_threads = match ctx.caps().sm {
+        110 => std::env::var_os("APXINF_GR00T_LEGACY_QK_MROPE_THREADS").is_some(),
+        87 => std::env::var_os("APXINF_GR00T_BF16_LEGACY_QK_MROPE_THREADS").is_some(),
+        _ => false,
+    };
+    let block_threads = qk_rms_mrope_block_threads(
+        ctx.caps().sm,
+        seq_len,
+        head_dim,
+        query_heads,
+        key_heads,
+        legacy_threads,
+    );
     check_cuda(unsafe {
-        ffi::apxinf_qk_rms_norm_mrope_bf16(
+        ffi::apxinf_qk_rms_norm_mrope_bf16_with_threads(
             query_buffer.ptr(),
             query_weight_buffer.ptr(),
             query_output.ptr(),
@@ -358,6 +395,7 @@ pub fn rms_norm_apply_mrope_qk(
                 .map_err(|_| Error::Other("Q/K mRoPE H section exceeds u32".into()))?,
             u32::try_from(sections[2])
                 .map_err(|_| Error::Other("Q/K mRoPE W section exceeds u32".into()))?,
+            block_threads,
             ctx.stream().handle(),
         )
     })?;
@@ -590,6 +628,29 @@ pub fn split_qkv_bias_apply_vision_2d_precomputed(
         n_heads,
         head_dim,
         rotation_table,
+        false,
+    )
+}
+
+/// GR00T exact-shape opt-in using two RoPE pairs per thread. The public
+/// prepared-position entry above retains its existing launch geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn split_qkv_bias_apply_vision_2d_precomputed_vec2(
+    ctx: &CudaContext,
+    qkv: &Tensor,
+    bias: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    rotation_table: &CudaBuffer,
+) -> Result<QkvTensors> {
+    split_qkv_bias_apply_vision_2d_precomputed_impl(
+        ctx,
+        qkv,
+        bias,
+        n_heads,
+        head_dim,
+        rotation_table,
+        true,
     )
 }
 
@@ -686,6 +747,7 @@ fn split_qkv_bias_apply_vision_2d_precomputed_impl(
     n_heads: usize,
     head_dim: usize,
     rotation_table: &CudaBuffer,
+    vec2: bool,
 ) -> Result<QkvTensors> {
     let (seq_len, width) = matrix_shape(qkv, "precomputed vision fused QKV 2D-RoPE")?;
     let projection_width = n_heads
@@ -733,7 +795,12 @@ fn split_qkv_bias_apply_vision_2d_precomputed_impl(
     let k = output_buffer(ctx, output_bytes)?;
     let v = output_buffer(ctx, output_bytes)?;
     check_cuda(unsafe {
-        ffi::apxinf_qkv_split_bias_vision_rope_precomputed_bf16(
+        let launch = if vec2 {
+            ffi::apxinf_qkv_split_bias_vision_rope_precomputed_vec2_bf16
+        } else {
+            ffi::apxinf_qkv_split_bias_vision_rope_precomputed_bf16
+        };
+        launch(
             qkv_buffer.ptr(),
             bias_buffer.ptr(),
             q.ptr(),

@@ -138,6 +138,18 @@ pub(super) trait DeviceLinearWeights: Debug {
         Ok(None)
     }
 
+    /// Return a precision-specific, bit-compatible packed bias-then-residual
+    /// result when the output width satisfies that implementation's contract.
+    fn packed_bias_then_residual(
+        &self,
+        _projection: &Tensor,
+        _bias: Option<&Tensor>,
+        _residual: &Tensor,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
     /// Return a fused adaptive-normalization plus reusable quantization when
     /// this precision has an exact model-neutral kernel for that composition.
     fn adaptive_layer_norm_quantized(
@@ -194,5 +206,37 @@ pub(super) trait DeviceLinearWeights: Debug {
 
     fn uses_quantized_output(&self) -> bool {
         false
+    }
+
+    fn supports_fused_bias_gelu_quantization(&self) -> bool {
+        false
+    }
+
+    fn forward_reusable_quantized_bias_gelu_quantized(
+        &self,
+        _input: &Self::ReusableInput,
+        _bias: &Tensor,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<(Tensor, Self::ReusableInput)>> {
+        Ok(None)
+    }
+
+    fn forward_reusable_quantized_with_bias(
+        &self,
+        _input: &Self::ReusableInput,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
+    fn layer_norm_quantized(
+        &self,
+        _input: &Tensor,
+        _weight: &Tensor,
+        _bias: &Tensor,
+        _eps: f32,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<(Tensor, Self::ReusableInput)>> {
+        Ok(None)
     }
 }

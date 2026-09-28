@@ -1818,6 +1818,54 @@ fn layer_norm_bf16_matches_fp32_reference() {
 }
 
 #[test]
+fn cached_residual_layer_norm_1024_is_bitwise_exact() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (rows, cols) = (3usize, 1024usize);
+    let projection: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.017).sin())
+        .collect();
+    let residual: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.013).cos())
+        .collect();
+    let projection_bias: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.0001 - 0.05).collect();
+    let norm_weight: Vec<f32> = (0..cols).map(|i| 0.9 + (i as f32) * 0.0001).collect();
+    let norm_bias: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.00002).collect();
+    let projection = upload_fp32_as_bf16(&ctx, &projection, vec![rows, cols]).unwrap();
+    let residual = upload_fp32_as_bf16(&ctx, &residual, vec![rows, cols]).unwrap();
+    let projection_bias = upload_fp32_as_bf16(&ctx, &projection_bias, vec![cols]).unwrap();
+    let norm_weight = upload_fp32_as_bf16(&ctx, &norm_weight, vec![cols]).unwrap();
+    let norm_bias = upload_fp32_as_bf16(&ctx, &norm_bias, vec![cols]).unwrap();
+    let legacy = crate::kernels::fused::bias_residual_layer_bf16(
+        &ctx,
+        &projection,
+        Some(&projection_bias),
+        &residual,
+        &norm_weight,
+        &norm_bias,
+        1.0e-6,
+    )
+    .unwrap();
+    let cached = crate::kernels::fused::bias_residual_layer_bf16_cached_1024(
+        &ctx,
+        &projection,
+        Some(&projection_bias),
+        &residual,
+        &norm_weight,
+        &norm_bias,
+        1.0e-6,
+    )
+    .unwrap();
+    assert_eq!(
+        download_bf16_as_fp32(&legacy.hidden).unwrap(),
+        download_bf16_as_fp32(&cached.hidden).unwrap()
+    );
+    assert_eq!(
+        download_bf16_as_fp32(&legacy.normalized).unwrap(),
+        download_bf16_as_fp32(&cached.normalized).unwrap()
+    );
+}
+
+#[test]
 fn cached_bias_then_residual_adaptive_layer_norm_1536_is_bitwise_exact() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
     let (rows, cols) = (41usize, 1536usize);
@@ -1935,6 +1983,73 @@ fn add_bias_bf16_matches_fp32_reference() {
     let t_b = upload_fp32_as_bf16(&ctx, &bias, vec![cols]).unwrap();
     let out = add_bias(&ctx, &t_in, &t_b).unwrap();
     assert_bf16_close_elementwise(&download_bf16_as_fp32(&out).unwrap(), &expected);
+}
+
+#[test]
+fn packed_bias_then_residual_bf16_matches_common_path_bitwise() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    for (rows, cols) in [(41, 1536), (156, 2048), (512, 1024)] {
+        let projection = (0..rows * cols)
+            .map(|index| ((index * 17 % 257) as f32 - 128.0) / 64.0)
+            .collect::<Vec<_>>();
+        let residual = (0..rows * cols)
+            .map(|index| ((index * 29 % 263) as f32 - 131.0) / 128.0)
+            .collect::<Vec<_>>();
+        let bias = (0..cols)
+            .map(|index| ((index * 13 % 251) as f32 - 125.0) / 256.0)
+            .collect::<Vec<_>>();
+        let projection = upload_fp32_as_bf16(&ctx, &projection, vec![rows, cols]).unwrap();
+        let residual = upload_fp32_as_bf16(&ctx, &residual, vec![rows, cols]).unwrap();
+        let bias = upload_fp32_as_bf16(&ctx, &bias, vec![cols]).unwrap();
+        let common = crate::kernels::fused::bias_then_residual_bf16(
+            &ctx,
+            &projection,
+            Some(&bias),
+            &residual,
+        )
+        .unwrap();
+        let packed = crate::kernels::fused::bias_then_residual_bf16_packed4(
+            &ctx,
+            &projection,
+            Some(&bias),
+            &residual,
+        )
+        .unwrap();
+        assert_eq!(
+            download_bf16_as_fp32(&packed).unwrap(),
+            download_bf16_as_fp32(&common).unwrap(),
+            "packed4 mismatch for {rows}x{cols}"
+        );
+    }
+}
+
+#[test]
+fn packed_bias_residual_bf16_matches_common_path_bitwise() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (rows, cols) = (512usize, 1024usize);
+    let projection = (0..rows * cols)
+        .map(|index| ((index * 17 % 257) as f32 - 128.0) / 64.0)
+        .collect::<Vec<_>>();
+    let residual = (0..rows * cols)
+        .map(|index| ((index * 29 % 263) as f32 - 131.0) / 128.0)
+        .collect::<Vec<_>>();
+    let bias = (0..cols)
+        .map(|index| ((index * 13 % 251) as f32 - 125.0) / 256.0)
+        .collect::<Vec<_>>();
+    let projection = upload_fp32_as_bf16(&ctx, &projection, vec![rows, cols]).unwrap();
+    let residual = upload_fp32_as_bf16(&ctx, &residual, vec![rows, cols]).unwrap();
+    let bias = upload_fp32_as_bf16(&ctx, &bias, vec![cols]).unwrap();
+    let common =
+        crate::kernels::fused::bias_residual_bf16(&ctx, &projection, Some(&bias), &residual)
+            .unwrap();
+    let packed =
+        crate::kernels::fused::bias_residual_bf16_packed4(&ctx, &projection, &bias, &residual)
+            .unwrap();
+    assert_eq!(
+        download_bf16_as_fp32(&packed).unwrap(),
+        download_bf16_as_fp32(&common).unwrap(),
+        "packed4 single-rounding bias residual mismatch"
+    );
 }
 
 // ── Vision 2D-RoPE ───────────────────────────────────────────────
@@ -2132,4 +2247,106 @@ fn concat_2d_bf16_packs_gate_up_correctly() {
         }
     }
     assert_bf16_close_elementwise(&out, &expected);
+}
+
+#[test]
+fn layer_norm_quantize_w8a8_matches_separate_kernels_bitwise() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (rows, cols) = (41usize, 1536usize);
+    let eps = 1e-5f32;
+    let input = (0..rows * cols)
+        .map(|index| ((index * 17 % 509) as f32 - 254.0) / 128.0)
+        .collect::<Vec<_>>();
+    let weight = (0..cols)
+        .map(|index| 1.0 + ((index * 13 % 127) as f32 - 63.0) / 512.0)
+        .collect::<Vec<_>>();
+    let bias = (0..cols)
+        .map(|index| ((index * 29 % 251) as f32 - 125.0) / 1024.0)
+        .collect::<Vec<_>>();
+    let input = upload_fp32_as_bf16(&ctx, &input, vec![rows, cols]).unwrap();
+    let weight = upload_fp32_as_bf16(&ctx, &weight, vec![cols]).unwrap();
+    let bias = upload_fp32_as_bf16(&ctx, &bias, vec![cols]).unwrap();
+    let separate_normalized = layer(&ctx, &input, &weight, &bias, eps).unwrap();
+    let separate_quantized =
+        crate::kernels::gemm::quantize_w8a8_activation(&ctx, &separate_normalized).unwrap();
+    let (fused_normalized, fused_quantized) =
+        crate::kernels::gemm::layer_norm_quantize_w8a8_activation(
+            &ctx, &input, &weight, &bias, eps,
+        )
+        .unwrap();
+    assert_eq!(
+        download_bf16_as_fp32(&fused_normalized).unwrap(),
+        download_bf16_as_fp32(&separate_normalized).unwrap()
+    );
+    assert_eq!(
+        fused_quantized.quantized_bytes().unwrap(),
+        separate_quantized.quantized_bytes().unwrap()
+    );
+    assert_eq!(
+        fused_quantized.row_scale_bits().unwrap(),
+        separate_quantized.row_scale_bits().unwrap()
+    );
+}
+
+#[test]
+fn cached_bias_then_residual_adaptive_layer_norm_1536_is_bitwise_exact_sm87_small_rows() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    if ctx.caps().sm != 87 {
+        return;
+    }
+    let (rows, cols) = (3usize, 1536usize);
+    let projection: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.017).sin())
+        .collect();
+    let residual: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.013).cos())
+        .collect();
+    let projection_bias: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.0001 - 0.05).collect();
+    let modulation: Vec<f32> = (0..2 * cols)
+        .map(|i| ((i as f32) * 0.0003).sin() * 0.25)
+        .collect();
+    let projection = upload_fp32_as_bf16(&ctx, &projection, vec![rows, cols]).unwrap();
+    let residual = upload_fp32_as_bf16(&ctx, &residual, vec![rows, cols]).unwrap();
+    let projection_bias = upload_fp32_as_bf16(&ctx, &projection_bias, vec![cols]).unwrap();
+    let modulation = upload_fp32_as_bf16(&ctx, &modulation, vec![2 * cols]).unwrap();
+    let biased =
+        crate::kernels::elementwise::bias_bf16(&ctx, &projection, Some(&projection_bias)).unwrap();
+    let legacy_hidden = add(&ctx, &biased, &residual).unwrap();
+    let legacy_normalized =
+        crate::kernels::norm::adaptive_layer(&ctx, &legacy_hidden, &modulation, 1.0e-6).unwrap();
+    let cached = crate::kernels::fused::bias_then_residual_adaptive_layer_bf16_cached_1536(
+        &ctx,
+        &projection,
+        &projection_bias,
+        &residual,
+        &modulation,
+        1.0e-6,
+    )
+    .unwrap();
+    assert_eq!(
+        download_bf16_as_fp32(&legacy_hidden).unwrap(),
+        download_bf16_as_fp32(&cached.hidden).unwrap()
+    );
+    assert_eq!(
+        download_bf16_as_fp32(&legacy_normalized).unwrap(),
+        download_bf16_as_fp32(&cached.normalized).unwrap()
+    );
+}
+
+#[test]
+fn qk_rms_mrope_threads_preserve_per_architecture_shapes() {
+    use crate::kernels::rope::qk_rms_mrope_block_threads as threads;
+    for (sm, seq_len, expected) in [
+        (110, 90, 128),
+        (110, 156, 128),
+        (87, 90, 256),
+        (87, 156, 128),
+        (89, 156, 256),
+    ] {
+        assert_eq!(threads(sm, seq_len, 128, 16, 8, false), expected);
+        assert_eq!(threads(sm, seq_len, 128, 16, 8, true), 256);
+    }
+    assert_eq!(threads(110, 41, 128, 16, 8, false), 256);
+    assert_eq!(threads(110, 90, 64, 16, 8, false), 256);
+    assert_eq!(threads(87, 156, 128, 8, 8, false), 256);
 }

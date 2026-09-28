@@ -295,6 +295,32 @@ pub fn bias_gelu_bf16(ctx: &CudaContext, input: &Tensor, value: Option<&Tensor>)
     bias_activation(ctx, input, value, 1)
 }
 
+pub fn bias_gelu_bf16_packed8(ctx: &CudaContext, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    let (rows, cols) = matrix_shape(input, "packed8 bias GELU")?;
+    if input.dtype() != DType::BF16
+        || bias.dtype() != DType::BF16
+        || bias.shape().dims() != [cols]
+        || cols % 8 != 0
+    {
+        return Err(Error::Other(
+            "packed8 BF16 bias GELU has incompatible dtype or shape".into(),
+        ));
+    }
+    let output = bf16_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_bias_gelu_bf16_packed8(
+            gpu_ptr(input)?,
+            gpu_ptr(bias)?,
+            output.ptr(),
+            rows as i32,
+            cols as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(matrix_tensor(ctx, rows, cols, output))
+}
+
 pub fn bias_silu_bf16(ctx: &CudaContext, input: &Tensor, value: Option<&Tensor>) -> Result<Tensor> {
     bias_activation(ctx, input, value, 2)
 }

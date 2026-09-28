@@ -19,6 +19,8 @@ use super::vision_weights::Qwen3VLVisionWeights;
 
 #[cfg(feature = "cuda")]
 const USE_FUSED_VISION_QKV_ROPE: bool = true;
+#[cfg(feature = "cuda")]
+const USE_CACHED_VISION_RESIDUAL_LAYER_NORM: bool = true;
 pub struct VisionOutput {
     /// Primary embedding `[N/4, out_hidden]` injected at the image_pad
     /// positions in the LLM input embedding stream.
@@ -38,6 +40,8 @@ pub(crate) type VisionSegmentedAttention<'a> =
     dyn Fn(&Tensor, &Tensor, &Tensor, &[usize], usize, usize) -> Result<Option<Tensor>> + 'a;
 pub(crate) type VisionResidualNormMatmul<'a> = dyn Fn(&str, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor, f32, &Tensor) -> Result<(Tensor, Tensor)>
     + 'a;
+pub(crate) type VisionBiasResidual<'a> =
+    dyn Fn(&str, &Tensor, &Tensor, &Tensor) -> Result<Tensor> + 'a;
 
 fn fused_vision_mlp_residual_norm_shape_supported(
     n_patches: usize,
@@ -162,6 +166,10 @@ pub(crate) fn forward_with_prepared_positions_and_matmul(
     concat_quant: Option<&VisionConcatQuant<'_>>,
     residual_norm_matmul: Option<&VisionResidualNormMatmul<'_>>,
     allow_gr00t_fused_mlp_residual_norm: bool,
+    bias_residual: Option<&VisionBiasResidual<'_>>,
+    allow_cached_residual_layer_norm: bool,
+    allow_batched_segmented_attention: bool,
+    prefer_precomputed_qkv_vec2: bool,
 ) -> Result<VisionOutput> {
     forward_impl(
         cfg,
@@ -179,6 +187,10 @@ pub(crate) fn forward_with_prepared_positions_and_matmul(
         residual_norm_matmul,
         true,
         allow_gr00t_fused_mlp_residual_norm,
+        bias_residual,
+        allow_cached_residual_layer_norm,
+        allow_batched_segmented_attention,
+        prefer_precomputed_qkv_vec2,
     )
 }
 
@@ -198,9 +210,17 @@ fn forward_impl(
     residual_norm_matmul: Option<&VisionResidualNormMatmul<'_>>,
     allow_gr00t_fused_qkv_rope: bool,
     allow_gr00t_fused_mlp_residual_norm: bool,
+    bias_residual: Option<&VisionBiasResidual<'_>>,
+    allow_cached_residual_layer_norm: bool,
+    allow_batched_segmented_attention: bool,
+    prefer_precomputed_qkv_vec2: bool,
 ) -> Result<VisionOutput> {
     #[cfg(not(feature = "cuda"))]
-    let _ = allow_gr00t_fused_qkv_rope;
+    let _ = (
+        allow_gr00t_fused_qkv_rope,
+        allow_batched_segmented_attention,
+        prefer_precomputed_qkv_vec2,
+    );
     let _vision_range = crate::profiling::trace::range("vision_encoder");
     let vc = &cfg.vision;
     let hidden = vc.hidden_size; // 1024
@@ -229,6 +249,21 @@ fn forward_impl(
         )));
     }
     let attention_segments = validate_grid_layout(grid_thw, n_patches, merge)?;
+    let use_cached_residual_layer_norm = {
+        #[cfg(feature = "cuda")]
+        {
+            allow_gr00t_fused_qkv_rope
+                && USE_CACHED_VISION_RESIDUAL_LAYER_NORM
+                && allow_cached_residual_layer_norm
+                && n_patches == 512
+                && hidden == 1024
+                && std::env::var_os("APXINF_GR00T_BF16_LEGACY_VISION_RESIDUAL_LN").is_none()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    };
 
     // ── Patch embedding: pixel_values @ W^T + bias → [N, 1024] ──────
     // patch_embed_weight is [1536, 1024] (already transposed). matmul
@@ -337,17 +372,39 @@ fn forward_impl(
                         let cuda = b.as_any().downcast_ref::<CudaBackend>().ok_or_else(|| {
                             Error::Other("Qwen3-VL CUDA position/backend mismatch".into())
                         })?;
-                        let split = if let Some(rotation_table) = rotation_table {
-                            kernels::rope::split_qkv_bias_apply_vision_2d_precomputed(
-                                cuda.context(),
-                                &qkv,
-                                &blk.qkv_b,
-                                n_heads,
-                                head_dim,
-                                rotation_table,
-                            )
-                        } else {
-                            kernels::rope::split_qkv_bias_apply_vision_2d(
+                        let split = match rotation_table {
+                            Some(rotation_table)
+                                if cuda.context().caps().sm != 87
+                                    || std::env::var_os(
+                                        "APXINF_GR00T_LEGACY_VISION_ROPE_POSITIONS",
+                                    )
+                                    .is_none() =>
+                            {
+                                if prefer_precomputed_qkv_vec2
+                                    && n_patches == 512
+                                    && n_heads == 16
+                                    && head_dim == 64
+                                {
+                                    kernels::rope::split_qkv_bias_apply_vision_2d_precomputed_vec2(
+                                        cuda.context(),
+                                        &qkv,
+                                        &blk.qkv_b,
+                                        n_heads,
+                                        head_dim,
+                                        rotation_table,
+                                    )
+                                } else {
+                                    kernels::rope::split_qkv_bias_apply_vision_2d_precomputed(
+                                        cuda.context(),
+                                        &qkv,
+                                        &blk.qkv_b,
+                                        n_heads,
+                                        head_dim,
+                                        rotation_table,
+                                    )
+                                }
+                            }
+                            _ => kernels::rope::split_qkv_bias_apply_vision_2d(
                                 cuda.context(),
                                 &qkv,
                                 &blk.qkv_b,
@@ -355,7 +412,7 @@ fn forward_impl(
                                 head_dim,
                                 10000.0,
                                 positions,
-                            )
+                            ),
                         }
                         .map_err(|error| {
                             Error::Other(format!("vision block {i} fused QKV/RoPE failed: {error}"))
@@ -404,6 +461,7 @@ fn forward_impl(
             &output_name,
             segmented_attention,
             concat_quant,
+            allow_batched_segmented_attention,
         )
         .map_err(|error| Error::Other(format!("vision block {i} attention failed: {error}")))?;
         // Output projection + residual + pre-MLP LayerNorm
@@ -443,6 +501,7 @@ fn forward_impl(
                 &blk.norm2_w,
                 &blk.norm2_b,
                 eps,
+                use_cached_residual_layer_norm,
             )
             .map_err(|error| {
                 Error::Other(format!("vision block {i} residual/norm failed: {error}"))
@@ -464,8 +523,9 @@ fn forward_impl(
             &blk.fc2_w,
         )
         .map_err(|error| Error::Other(format!("vision block {i} FC2 failed: {error}")))?;
-        if allow_gr00t_fused_mlp_residual_norm
-            && fused_vision_mlp_residual_norm_shape_supported(n_patches, hidden, i, w.blocks.len())
+        if (allow_gr00t_fused_mlp_residual_norm
+            && fused_vision_mlp_residual_norm_shape_supported(n_patches, hidden, i, w.blocks.len()))
+            || (use_cached_residual_layer_norm && i + 1 < w.blocks.len())
         {
             // Block 23 intentionally retains the legacy residual path. Its
             // consumer is the primary merger, not another vision block.
@@ -478,6 +538,7 @@ fn forward_impl(
                 &next.norm1_w,
                 &next.norm1_b,
                 eps,
+                use_cached_residual_layer_norm,
             )
             .map_err(|error| {
                 Error::Other(format!(
@@ -487,7 +548,15 @@ fn forward_impl(
             x = residual_hidden;
             prepared_norm1 = Some(normed);
         } else {
-            x = apply_bias_residual(b, &h2, &blk.fc2_b, &x).map_err(|error| {
+            x = vision_bias_residual(
+                bias_residual,
+                b,
+                &format!("backbone.vision.blocks.{i}.fc2"),
+                &h2,
+                &blk.fc2_b,
+                &x,
+            )
+            .map_err(|error| {
                 Error::Other(format!("vision block {i} MLP residual failed: {error}"))
             })?;
         }
@@ -656,6 +725,20 @@ fn apply_bias_residual(
     b.add(residual, &projection)
 }
 
+fn vision_bias_residual(
+    callback: Option<&VisionBiasResidual<'_>>,
+    b: &dyn Backend,
+    name: &str,
+    projection: &Tensor,
+    bias: &Tensor,
+    residual: &Tensor,
+) -> Result<Tensor> {
+    match callback {
+        Some(callback) => callback(name, projection, bias, residual),
+        None => apply_bias_residual(b, projection, bias, residual),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_bias_residual_layer_norm(
     b: &dyn Backend,
@@ -665,18 +748,31 @@ fn apply_bias_residual_layer_norm(
     norm_weight: &Tensor,
     norm_bias: &Tensor,
     eps: f32,
+    use_cached_1024: bool,
 ) -> Result<(Tensor, Tensor)> {
     #[cfg(feature = "cuda")]
     if let Some(cuda) = b.as_any().downcast_ref::<CudaBackend>() {
-        let fused = kernels::fused::bias_residual_layer_bf16(
-            cuda.context(),
-            projection,
-            Some(projection_bias),
-            residual,
-            norm_weight,
-            norm_bias,
-            eps,
-        )?;
+        let fused = if use_cached_1024 {
+            kernels::fused::bias_residual_layer_bf16_cached_1024(
+                cuda.context(),
+                projection,
+                Some(projection_bias),
+                residual,
+                norm_weight,
+                norm_bias,
+                eps,
+            )?
+        } else {
+            kernels::fused::bias_residual_layer_bf16(
+                cuda.context(),
+                projection,
+                Some(projection_bias),
+                residual,
+                norm_weight,
+                norm_bias,
+                eps,
+            )?
+        };
         return Ok((fused.hidden, fused.normalized));
     }
 
@@ -879,6 +975,7 @@ fn segmented_vision_sdpa(
     output_name: &str,
     segmented_attention: Option<&VisionSegmentedAttention<'_>>,
     concat_quant: Option<&VisionConcatQuant<'_>>,
+    allow_batched_segmented_attention: bool,
 ) -> Result<Tensor> {
     if segment_lengths.is_empty() {
         return Err(Error::Other(
@@ -930,6 +1027,24 @@ fn segmented_vision_sdpa(
                     return Ok(output);
                 }
             }
+        }
+        if allow_batched_segmented_attention
+            && cuda.context().caps().sm == 87
+            && segment_lengths == [256, 256]
+            && n_heads == 16
+            && head_dim == 64
+            && std::env::var_os("APXINF_GR00T_LEGACY_VISION_BATCHED_ATTENTION").is_none()
+        {
+            return kernels::attention::noncausal_batched_equal(
+                cuda.context(),
+                q,
+                k,
+                v,
+                2,
+                256,
+                n_heads,
+                head_dim,
+            );
         }
         let q = q.reshape(vec![total_rows, row_width])?;
         let k = k.reshape(vec![total_rows, row_width])?;

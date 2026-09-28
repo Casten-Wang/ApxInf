@@ -144,6 +144,10 @@ P50/P95 and the complete normalized model-core output. Generated fixtures,
 reference dumps, logs, tactic databases, and result JSON belong under
 `devlocal/gr00t-n1d7/` and are not committed.
 
+See [optimization and local tuning](gr00t-performance-tactics.md) for the Thor
+and Orin optimization scope, fresh-database commands, and the distinction
+between operator tuning and full-model acceptance.
+
 The repository's shared LIBERO evaluator selects the GR00T state adapter while
 leaving the existing OpenPI state wire format unchanged for other policies:
 

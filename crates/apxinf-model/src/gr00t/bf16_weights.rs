@@ -41,7 +41,9 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
     }
 
     fn packed8_bias(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Option<Tensor>> {
-        if std::env::var_os("APXINF_GR00T_BF16_LEGACY_PACKED8_BIAS_ACTIVATION").is_some() {
+        if backend.context().caps().sm != 110
+            || std::env::var_os("APXINF_GR00T_BF16_LEGACY_PACKED8_BIAS_ACTIVATION").is_some()
+        {
             return Ok(None);
         }
         kernels::activation::gr00t_bias_activation_bf16_packed8(
@@ -57,7 +59,9 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
         input: &Tensor,
         backend: &RuntimeBackend,
     ) -> Result<Option<Tensor>> {
-        if std::env::var_os("APXINF_GR00T_BF16_LEGACY_PACKED8_BIAS_ACTIVATION").is_some() {
+        if backend.context().caps().sm != 110
+            || std::env::var_os("APXINF_GR00T_BF16_LEGACY_PACKED8_BIAS_ACTIVATION").is_some()
+        {
             return Ok(None);
         }
         kernels::activation::gr00t_bias_activation_bf16_packed8(
@@ -76,7 +80,7 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
         eps: f32,
         backend: &RuntimeBackend,
     ) -> Result<Option<(Tensor, Tensor)>> {
-        if backend.context().caps().sm != 110
+        if !matches!(backend.context().caps().sm, 87 | 110)
             || projection.shape().dims() != [41, 1536]
             || residual.shape() != projection.shape()
             || self.weights.bias.shape().dims() != [1536]
@@ -104,7 +108,7 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
         eps: f32,
         backend: &RuntimeBackend,
     ) -> Result<Option<(Tensor, Tensor)>> {
-        if backend.context().caps().sm != 110
+        if !matches!(backend.context().caps().sm, 87 | 110)
             || projection.shape().dims() != [41, 1536]
             || residual.shape() != projection.shape()
             || self.weights.bias.shape().dims() != [1536]

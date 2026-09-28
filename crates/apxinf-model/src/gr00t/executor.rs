@@ -77,6 +77,14 @@ pub(super) trait Gr00tPrecisionExecution: Sized + 'static {
     const USE_PACKED8_BF16_BIAS_ACTIVATION: bool = false;
     const USE_BIAS_RESIDUAL_ADAPTIVE_LAYER_NORM: bool = false;
     const USE_BIAS_RESIDUAL_LAYER_NORM: bool = false;
+    /// Architectures covered by this precision's accepted execution plan.
+    const OPTIMIZED_SMS: &'static [u32] = &[];
+    const USE_CACHED_VISION_RESIDUAL_LAYER_NORM: bool = false;
+    const USE_VISION_POINTWISE_PACK: bool = false;
+    const USE_BATCHED_VISION_ATTENTION: bool = false;
+    const USE_PACKED_ATTENTION_BIAS_RESIDUAL: bool = false;
+    const USE_PACKED_VISION_FC2_RESIDUAL: bool = false;
+    const VISION_POINTWISE_LEGACY_ENV: Option<&'static str> = None;
 
     fn transfer_dense(
         &self,
@@ -105,6 +113,14 @@ pub(super) trait Gr00tPrecisionExecution: Sized + 'static {
         vision: &Qwen3VLVisionWeights,
         backend: &RuntimeBackend,
     ) -> Result<BTreeMap<String, Self::Backbone>>;
+}
+
+fn use_thor_fp8_fusions<E: Gr00tPrecisionExecution>(sm: u32) -> bool {
+    E::NAME == "fp8" && sm == 110
+}
+
+fn use_w8a8_qkv_bias_fusion<E: Gr00tPrecisionExecution>(sm: u32, query_len: usize) -> bool {
+    E::NAME == "int8" && sm == 87 && query_len == 41
 }
 
 /// Processor-owned, fully normalized input used by the device executor.
@@ -880,8 +896,10 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 &self.backbone_vision,
                 &*self.backend,
                 &observation.image_grid_thw,
-                E::USE_PRECOMPUTED_BF16_VISION_ROPE
-                    && std::env::var_os("APXINF_GR00T_BF16_LEGACY_VISION_ROPE").is_none(),
+                (E::USE_PRECOMPUTED_BF16_VISION_ROPE
+                    && self.backend.context().caps().sm == 110
+                    && std::env::var_os("APXINF_GR00T_BF16_LEGACY_VISION_ROPE").is_none())
+                    || (E::USE_VISION_POINTWISE_PACK && self.backend.context().caps().sm == 87),
             )?;
             self.vision_position_cache = Some((observation.image_grid_thw.clone(), positions));
         }
@@ -924,8 +942,12 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 weight,
             )
         };
+        let use_vision_pointwise_pack = E::USE_VISION_POINTWISE_PACK
+            && self.backend.context().caps().sm == 87
+            && E::VISION_POINTWISE_LEGACY_ENV.is_some_and(|name| std::env::var_os(name).is_none());
+        let use_thor_fp8_fusions = use_thor_fp8_fusions::<E>(self.backend.context().caps().sm);
         let vision_bias_gelu = |name: &str, input: &Tensor, bias: &Tensor| {
-            if let Some(prefix) = name.strip_suffix(".fc1") {
+            if let Some(prefix) = name.strip_suffix(".fc1").filter(|_| use_thor_fp8_fusions) {
                 let output_name = format!("{prefix}.fc2");
                 if let Some(linear) = self.backbone_linears.get(&output_name) {
                     if let Some(scale) = linear.activation_scale() {
@@ -938,7 +960,17 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     }
                 }
             }
+            if use_vision_pointwise_pack
+                && matches!(input.shape().dims(), [512, 4096] | [128, 4096])
+            {
+                return kernels::activation::bias_gelu_bf16_packed8(
+                    self.backend.context(),
+                    input,
+                    bias,
+                );
+            }
             if E::USE_PACKED8_BF16_BIAS_ACTIVATION
+                && self.backend.context().caps().sm == 110
                 && std::env::var_os("APXINF_GR00T_BF16_LEGACY_PACKED8_BIAS_ACTIVATION").is_none()
             {
                 if let Some(output) = kernels::activation::gr00t_bias_activation_bf16_packed8(
@@ -955,8 +987,10 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
         // BF16 explicitly opts into this exact-shape path. The legacy composed
         // path remains in the same ELF for controlled benchmark comparisons.
         let use_direct_bf16_vision_segment_output = E::USE_DIRECT_BF16_VISION_SEGMENT_OUTPUT
+            && matches!(self.backend.context().caps().sm, 87 | 110)
             && std::env::var_os("APXINF_GR00T_BF16_LEGACY_VISION_SEGMENT_OUTPUT").is_none();
         let use_fused_bf16_vision_mlp_residual_norm = E::USE_FUSED_BF16_VISION_MLP_RESIDUAL_NORM
+            && self.backend.context().caps().sm == 110
             && std::env::var_os("APXINF_GR00T_BF16_LEGACY_VISION_MLP_RESIDUAL_NORM").is_none();
         let vision_segmented_attention =
             |q: &Tensor,
@@ -979,6 +1013,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 Ok(None)
             };
         let use_fused_vision_concat_quant = USE_FUSED_FP8_VISION_CONCAT_QUANT
+            && use_thor_fp8_fusions
             && std::env::var_os("APXINF_GR00T_FP8_LEGACY_VISION_CONCAT_QUANT").is_none();
         let vision_concat_quant = |name: &str, first: &Tensor, second: &Tensor| {
             if use_fused_vision_concat_quant {
@@ -999,6 +1034,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
         // Benchmarking can select the legacy composed path in the same binary,
         // avoiding build-to-build differences when the expected gain is small.
         let use_fused_vision_residual_norm_quant = USE_FUSED_FP8_VISION_RESIDUAL_LAYER_NORM_QUANT
+            && use_thor_fp8_fusions
             && std::env::var_os("APXINF_GR00T_FP8_LEGACY_VISION_RESIDUAL_NORM").is_none();
         let vision_residual_norm_matmul =
             |name: &str,
@@ -1046,6 +1082,28 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 )?;
                 Ok((fused.hidden, output))
             };
+        let vision_bias_residual =
+            |_name: &str, projection: &Tensor, bias: &Tensor, residual: &Tensor| {
+                if E::USE_PACKED_VISION_FC2_RESIDUAL
+                    && self.backend.context().caps().sm == 87
+                    && projection.shape().dims() == [512, 1024]
+                    && std::env::var_os("APXINF_GR00T_LEGACY_VISION_FC2_RESIDUAL").is_none()
+                {
+                    kernels::fused::bias_residual_bf16_packed4(
+                        self.backend.context(),
+                        projection,
+                        bias,
+                        residual,
+                    )
+                } else {
+                    kernels::fused::bias_residual_bf16(
+                        self.backend.context(),
+                        projection,
+                        Some(bias),
+                        residual,
+                    )
+                }
+            };
         let vision_output = vision::forward_with_prepared_positions_and_matmul(
             &self.backbone_config,
             &self.backbone_vision,
@@ -1058,8 +1116,16 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             Some(&vision_bias_gelu),
             Some(&vision_segmented_attention),
             Some(&vision_concat_quant),
-            Some(&vision_residual_norm_matmul),
+            if use_thor_fp8_fusions {
+                Some(&vision_residual_norm_matmul)
+            } else {
+                None
+            },
             use_fused_bf16_vision_mlp_residual_norm,
+            Some(&vision_bias_residual),
+            E::USE_CACHED_VISION_RESIDUAL_LAYER_NORM && self.backend.context().caps().sm == 87,
+            E::USE_BATCHED_VISION_ATTENTION && self.backend.context().caps().sm == 87,
+            use_vision_pointwise_pack,
         )
         .map_err(|error| Error::Other(format!("GR00T vision forward failed: {error}")))?;
         let image_positions = &token_groups.image;
@@ -1130,6 +1196,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 &self.backbone_text,
                 &self.backbone_linears,
                 E::USE_FUSED_QK_RMS_MROPE
+                    && E::OPTIMIZED_SMS.contains(&self.backend.context().caps().sm)
                     && E::QK_RMS_MROPE_LEGACY_ENV
                         .is_none_or(|name| std::env::var_os(name).is_none()),
                 &hidden,
@@ -1249,13 +1316,9 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             None
         };
         let use_bias_residual_adaptive_layer_norm = E::USE_BIAS_RESIDUAL_ADAPTIVE_LAYER_NORM
-            && self.backend.context().caps().sm == 110
+            && matches!(self.backend.context().caps().sm, 87 | 110)
             && hidden.shape().dims() == [41, 1536]
             && std::env::var_os("APXINF_GR00T_BF16_LEGACY_BIAS_RESIDUAL_ADAPTIVE_LN").is_none();
-        let use_bias_residual_layer_norm = E::USE_BIAS_RESIDUAL_LAYER_NORM
-            && self.backend.context().caps().sm == 110
-            && hidden.shape().dims() == [41, 1536]
-            && std::env::var_os("APXINF_GR00T_BF16_LEGACY_BIAS_RESIDUAL_LN").is_none();
         let mut pending_feed_forward: Option<(Tensor, Tensor)> = None;
 
         for (layer_index, block) in self.action.dit_blocks.iter().enumerate() {
@@ -1383,6 +1446,15 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 Gr00tDitAttentionSource::ImageBackbone => image_backbone,
                 Gr00tDitAttentionSource::StateActionSelf => &normalized,
             };
+            let use_bias_residual_layer_norm = E::USE_BIAS_RESIDUAL_LAYER_NORM
+                && matches!(self.backend.context().caps().sm, 87 | 110)
+                && hidden.shape().dims() == [41, 1536]
+                && std::env::var_os("APXINF_GR00T_BF16_LEGACY_BIAS_RESIDUAL_LN").is_none();
+            let fuse_attention_bias_residual = E::USE_PACKED_ATTENTION_BIAS_RESIDUAL
+                && self.backend.context().caps().sm == 87
+                && hidden.shape().dims() == [41, self.config.input_embedding_dim]
+                && std::env::var_os("APXINF_GR00T_W8A8_LEGACY_ATTENTION_BIAS_RESIDUAL").is_none();
+            let defer_attention_bias = use_bias_residual_layer_norm || fuse_attention_bias_residual;
             let attention = match prepared_key_value {
                 Some(key_value) => forward_attention_with_prepared_key_value(
                     &*self.backend,
@@ -1392,7 +1464,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     &block.attention,
                     self.config.diffusion.num_attention_heads,
                     self.config.diffusion.attention_head_dim,
-                    !use_bias_residual_layer_norm,
+                    !defer_attention_bias,
                 )?,
                 None => forward_attention(
                     &*self.backend,
@@ -1403,10 +1475,11 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     &block.attention,
                     self.config.diffusion.num_attention_heads,
                     self.config.diffusion.attention_head_dim,
-                    !use_bias_residual_layer_norm,
+                    !defer_attention_bias,
                 )?,
             };
             let fused_normalized = if USE_FUSED_FP8_DIT_RESIDUAL_LAYER_NORM_QUANT
+                && use_thor_fp8_fusions::<E>(self.backend.context().caps().sm)
                 && std::env::var_os("APXINF_GR00T_FP8_LEGACY_DIT_RESIDUAL_LN").is_none()
             {
                 block.feed_forward.input.residual_layer_norm_quantized(
@@ -1428,8 +1501,11 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     &residual,
                 )?
             } else {
-                let (residual, normalized) = if use_bias_residual_layer_norm {
-                    block
+                let normalized_quantized;
+                let normalized;
+                let residual;
+                if use_bias_residual_layer_norm {
+                    let (fused_hidden, fused_normalized) = block
                         .attention
                         .output
                         .bias_residual_layer_norm(
@@ -1445,18 +1521,40 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                                 "GR00T BF16 bias-residual-LayerNorm capability returned no output"
                                     .into(),
                             )
-                        })?
+                        })?;
+                    residual = fused_hidden;
+                    normalized = fused_normalized;
+                    normalized_quantized = None;
                 } else {
-                    let residual = self.backend.add(&hidden, &attention)?;
-                    let normalized = layer_norm(
-                        &self.backend,
+                    residual = if fuse_attention_bias_residual {
+                        kernels::fused::bias_then_residual_bf16_packed4(
+                            self.backend.context(),
+                            &attention,
+                            block.attention.output.bias(),
+                            &hidden,
+                        )?
+                    } else {
+                        self.backend.add(&hidden, &attention)?
+                    };
+                    normalized_quantized = block.feed_forward.input.layer_norm_quantized(
                         &residual,
                         &self.action.dit_norm_weight,
                         &self.action.dit_norm_bias,
                         self.config.diffusion.norm_eps,
+                        &self.backend,
                     )?;
-                    (residual, normalized)
-                };
+                    normalized = if let Some((normalized, _)) = &normalized_quantized {
+                        normalized.clone()
+                    } else {
+                        layer_norm(
+                            &self.backend,
+                            &residual,
+                            &self.action.dit_norm_weight,
+                            &self.action.dit_norm_bias,
+                            self.config.diffusion.norm_eps,
+                        )?
+                    };
+                }
                 if use_bias_residual_adaptive_layer_norm {
                     pending_feed_forward = Some((
                         forward_feed_forward_projection(
@@ -1470,9 +1568,12 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 } else if USE_FUSED_FFN_BIAS_RESIDUAL
                     && block.feed_forward.output.uses_quantized_output()
                 {
-                    forward_feed_forward_residual(
+                    forward_feed_forward_residual_with_quantized_input(
                         &*self.backend,
                         &normalized,
+                        normalized_quantized
+                            .as_ref()
+                            .map(|(_, quantized)| quantized),
                         &block.feed_forward,
                         &residual,
                     )?
@@ -2050,26 +2151,60 @@ fn forward_feed_forward_projection<E: Gr00tPrecisionExecution>(
     input: &Tensor,
     weights: &Gr00tDeviceFeedForwardWeights<E>,
 ) -> Result<Tensor> {
+    forward_feed_forward_projection_with_quantized_input(backend, input, None, weights)
+}
+
+fn forward_feed_forward_projection_with_quantized_input<E: Gr00tPrecisionExecution>(
+    backend: &RuntimeBackend,
+    input: &Tensor,
+    quantized_input: Option<&<E::FeedForward as DeviceLinearWeights>::ReusableInput>,
+    weights: &Gr00tDeviceFeedForwardWeights<E>,
+) -> Result<Tensor> {
     let fused_quantized_bias_gelu = USE_FUSED_FP8_BIAS_GELU_QUANT
-        && weights.input.activation_scale().is_some()
-        && weights.output.activation_scale().is_some();
+        && (E::NAME != "int8" || backend.context().caps().sm == 87)
+        && weights.output.supports_fused_bias_gelu_quantization();
     if fused_quantized_bias_gelu {
-        let hidden = weights.input.forward(input, backend)?;
         let bias = weights.input.bias().ok_or_else(|| {
             Error::Other("GR00T fused quantized bias GELU requires input bias".into())
         })?;
+        if let Some(quantized) = quantized_input {
+            if let Some((activated, hidden)) = weights
+                .input
+                .forward_reusable_quantized_bias_gelu_quantized(quantized, bias, backend)?
+            {
+                let output = weights
+                    .output
+                    .forward_reusable_quantized(&hidden, backend)?;
+                drop(activated);
+                return Ok(output);
+            }
+        }
+        let hidden = if let Some(quantized) = quantized_input {
+            weights
+                .input
+                .forward_reusable_quantized(quantized, backend)?
+        } else {
+            weights.input.forward(input, backend)?
+        };
         let hidden = weights
             .output
             .quantize_bias_gelu_reusable_input(&hidden, bias, backend)?
             .ok_or_else(|| {
-                Error::Other("GR00T FP8 bias-GELU fusion did not produce quantized input".into())
+                Error::Other("GR00T bias-GELU fusion did not produce quantized input".into())
             })?;
         let output = weights
             .output
             .forward_reusable_quantized(&hidden, backend)?;
         return Ok(output);
     }
-    let hidden = linear_gelu(backend, input, &weights.input)?;
+    let hidden = if let Some(quantized) = quantized_input {
+        let hidden = weights
+            .input
+            .forward_reusable_quantized(quantized, backend)?;
+        kernels::activation::bias_gelu_bf16(backend.context(), &hidden, weights.input.bias())?
+    } else {
+        linear_gelu(backend, input, &weights.input)?
+    };
     weights.output.forward(&hidden, backend)
 }
 
@@ -2124,7 +2259,30 @@ fn forward_feed_forward_residual<E: Gr00tPrecisionExecution>(
     weights: &Gr00tDeviceFeedForwardWeights<E>,
     residual: &Tensor,
 ) -> Result<Tensor> {
-    let output = forward_feed_forward_projection(backend, input, weights)?;
+    forward_feed_forward_residual_with_quantized_input(backend, input, None, weights, residual)
+}
+
+fn forward_feed_forward_residual_with_quantized_input<E: Gr00tPrecisionExecution>(
+    backend: &RuntimeBackend,
+    input: &Tensor,
+    quantized_input: Option<&<E::FeedForward as DeviceLinearWeights>::ReusableInput>,
+    weights: &Gr00tDeviceFeedForwardWeights<E>,
+    residual: &Tensor,
+) -> Result<Tensor> {
+    let output = forward_feed_forward_projection_with_quantized_input(
+        backend,
+        input,
+        quantized_input,
+        weights,
+    )?;
+    if let Some(output) = weights.output.packed_bias_then_residual(
+        &output,
+        weights.output.bias(),
+        residual,
+        backend,
+    )? {
+        return Ok(output);
+    }
     kernels::fused::bias_then_residual_bf16(
         backend.context(),
         &output,
@@ -2141,7 +2299,10 @@ fn noncausal_attention<E: Gr00tPrecisionExecution>(
     heads: usize,
     head_dim: usize,
 ) -> Result<Tensor> {
-    if E::USE_HDIM96_BM64_ATTENTION && std::env::var_os("APXINF_GR00T_LEGACY_FA2_BM64").is_none() {
+    if E::USE_HDIM96_BM64_ATTENTION
+        && E::OPTIMIZED_SMS.contains(&backend.context().caps().sm)
+        && std::env::var_os("APXINF_GR00T_LEGACY_FA2_BM64").is_none()
+    {
         if let Some(output) = kernels::attention::noncausal_hdim96_bm64(
             backend.context(),
             query,
@@ -2162,7 +2323,10 @@ fn noncausal_strided_qkv_attention<E: Gr00tPrecisionExecution>(
     heads: usize,
     head_dim: usize,
 ) -> Result<Tensor> {
-    if E::USE_HDIM96_BM64_ATTENTION && std::env::var_os("APXINF_GR00T_LEGACY_FA2_BM64").is_none() {
+    if E::USE_HDIM96_BM64_ATTENTION
+        && E::OPTIMIZED_SMS.contains(&backend.context().caps().sm)
+        && std::env::var_os("APXINF_GR00T_LEGACY_FA2_BM64").is_none()
+    {
         if let Some(output) = kernels::attention::noncausal_strided_qkv_hdim96_bm64(
             backend.context(),
             qkv,
@@ -2202,15 +2366,25 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
                     owned_input.as_ref()
                 };
                 let qkv = if let Some(input) = quantized_input {
-                    let projected = fused_qkv.forward_reusable_quantized(input, backend)?;
-                    if let Some(output) = fused_qkv.packed8_bias(&projected, backend)? {
-                        output
+                    let biased =
+                        if use_w8a8_qkv_bias_fusion::<E>(backend.context().caps().sm, query_len) {
+                            fused_qkv.forward_reusable_quantized_with_bias(input, backend)?
+                        } else {
+                            None
+                        };
+                    if let Some(projected) = biased {
+                        projected
                     } else {
-                        kernels::elementwise::bias_bf16(
-                            backend.context(),
-                            &projected,
-                            fused_qkv.bias(),
-                        )?
+                        let projected = fused_qkv.forward_reusable_quantized(input, backend)?;
+                        if let Some(output) = fused_qkv.packed8_bias(&projected, backend)? {
+                            output
+                        } else {
+                            kernels::elementwise::bias_bf16(
+                                backend.context(),
+                                &projected,
+                                fused_qkv.bias(),
+                            )?
+                        }
                     }
                 } else {
                     linear(backend, query_input, fused_qkv)?
@@ -2606,7 +2780,11 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
     let key = key.reshape(vec![sequence_len * text.n_kv_heads, text.head_dim])?;
     let value = value.reshape(vec![sequence_len, text.n_kv_heads, text.head_dim])?;
     let use_fused_qk_rms_mrope = use_fused_qk_rms_mrope
-        && matches!(sequence_len, 90 | 156)
+        && match backend.context().caps().sm {
+            87 => sequence_len == 156,
+            110 => matches!(sequence_len, 90 | 156),
+            _ => false,
+        }
         && text.n_heads == 16
         && text.n_kv_heads == 8
         && text.head_dim == 128;
@@ -2926,7 +3104,36 @@ fn validate_runtime_support(config: &Gr00tConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        bf16_executor::Gr00tBf16Execution, fp8_executor::Gr00tFp8Execution,
+        int8_executor::Gr00tInt8Execution,
+    };
     use super::*;
+
+    #[test]
+    fn thor_fp8_fusions_preserve_other_architecture_and_precision_paths() {
+        assert!(use_thor_fp8_fusions::<Gr00tFp8Execution>(110));
+        for sm in [0, 80, 87, 89, 90, 100, 103, 120] {
+            assert!(!use_thor_fp8_fusions::<Gr00tFp8Execution>(sm));
+        }
+        for sm in [87, 110] {
+            assert!(!use_thor_fp8_fusions::<Gr00tBf16Execution>(sm));
+            assert!(!use_thor_fp8_fusions::<Gr00tInt8Execution>(sm));
+        }
+    }
+
+    #[test]
+    fn w8a8_qkv_bias_keeps_other_horizons_on_the_composed_path() {
+        assert!(use_w8a8_qkv_bias_fusion::<Gr00tInt8Execution>(87, 41));
+        for rows in [0, 1, 40, 42, 64] {
+            assert!(!use_w8a8_qkv_bias_fusion::<Gr00tInt8Execution>(87, rows));
+        }
+        for sm in [80, 89, 90, 100, 110] {
+            assert!(!use_w8a8_qkv_bias_fusion::<Gr00tInt8Execution>(sm, 41));
+        }
+        assert!(!use_w8a8_qkv_bias_fusion::<Gr00tBf16Execution>(87, 41));
+        assert!(!use_w8a8_qkv_bias_fusion::<Gr00tFp8Execution>(110, 41));
+    }
 
     fn qwen_config() -> Qwen3VLConfig {
         Qwen3VLConfig::from_json_str(

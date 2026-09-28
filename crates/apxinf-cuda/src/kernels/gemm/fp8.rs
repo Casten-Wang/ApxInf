@@ -1931,7 +1931,90 @@ pub fn gemm_fp8_bf16(
     activation_scale: f32,
     weight: Fp8WeightView<'_>,
 ) -> Result<Tensor> {
-    gemm_fp8_bf16_impl(ctx, activation, activation_scale, weight, None)
+    if activation.dtype() != DType::F8E4M3 || weight.values_e4m3.dtype() != DType::F8E4M3 {
+        return Err(Error::Other(format!(
+            "gemm_fp8_bf16 expects E4M3 operands, got {} and {}",
+            activation.dtype(),
+            weight.values_e4m3.dtype()
+        )));
+    }
+    if weight.dual_geglu_interleaved {
+        return Err(Error::Other(
+            "FP8 dual GeGLU interleaved weight cannot be used by plain FP8 GEMM".into(),
+        ));
+    }
+    if !activation_scale.is_finite()
+        || activation_scale <= 0.0
+        || !weight.scale.is_finite()
+        || weight.scale <= 0.0
+    {
+        return Err(Error::Other(
+            "FP8 GEMM scales must be finite and positive".into(),
+        ));
+    }
+    let a = activation.shape().dims();
+    let b = weight.values_e4m3.shape().dims();
+    if a.len() != 2 || b.len() != 2 || a[1] != b[0] {
+        return Err(Error::Other(format!(
+            "gemm_fp8_bf16 shape mismatch: {a:?} @ {b:?}"
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    if activation.device() != expected_device || weight.values_e4m3.device() != expected_device {
+        return Err(Error::DeviceMismatch {
+            expected: expected_device,
+            got: if activation.device() != expected_device {
+                activation.device()
+            } else {
+                weight.values_e4m3.device()
+            },
+        });
+    }
+    if !native_fp8_gemm_supported(ctx)? {
+        return Err(Error::Other(
+            "FP8-to-BF16 GEMM requires native E4M3 Tensor Core support".into(),
+        ));
+    }
+
+    let (m, k, n) = (a[0], a[1], b[1]);
+    let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+    let weight_buffer = CudaBuffer::from_tensor(weight.values_e4m3).map_err(Error::Cuda)?;
+    let alpha = activation_scale * weight.scale;
+    let key = bf16_output_tuning_key(ctx, m, n, k);
+    let plan = resolve_fp8_bf16_plan(ctx, &key, &activation, &weight_buffer, alpha)?;
+    let selected_tactic = plan.tactic;
+    let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
+    let selected_result = launch_tactic_fp8_bf16(
+        ctx,
+        &key,
+        &activation,
+        &weight_buffer,
+        &output,
+        alpha,
+        selected_tactic,
+    );
+    if let Err(error) = selected_result {
+        if selected_tactic.backend == TacticBackend::Vendor {
+            return Err(error);
+        }
+        eprintln!(
+            "[apxinf] FP8-to-BF16 tactic {selected_tactic:?} failed for {key:?}: {error}; using vendor fallback"
+        );
+        ctx.gemm_plans().fallback(ctx, &key)?;
+        launch_tactic_fp8_bf16(
+            ctx,
+            &key,
+            &activation,
+            &weight_buffer,
+            &output,
+            alpha,
+            TacticId {
+                backend: TacticBackend::Vendor,
+                value: 0,
+            },
+        )?;
+    }
+    Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
 }
 
 /// Opt-in FP8-to-BF16 GEMM using explicit cuBLASLt algorithm attributes.
@@ -1943,7 +2026,91 @@ pub fn gemm_fp8_bf16_custom(
     weight: Fp8WeightView<'_>,
     config: Fp8Bf16CustomConfig,
 ) -> Result<Tensor> {
-    gemm_fp8_bf16_impl(ctx, activation, activation_scale, weight, Some(config))
+    if activation.dtype() != DType::F8E4M3 || weight.values_e4m3.dtype() != DType::F8E4M3 {
+        return Err(Error::Other(format!(
+            "gemm_fp8_bf16 expects E4M3 operands, got {} and {}",
+            activation.dtype(),
+            weight.values_e4m3.dtype()
+        )));
+    }
+    if weight.dual_geglu_interleaved {
+        return Err(Error::Other(
+            "FP8 dual GeGLU interleaved weight cannot be used by plain FP8 GEMM".into(),
+        ));
+    }
+    if !activation_scale.is_finite()
+        || activation_scale <= 0.0
+        || !weight.scale.is_finite()
+        || weight.scale <= 0.0
+    {
+        return Err(Error::Other(
+            "FP8 GEMM scales must be finite and positive".into(),
+        ));
+    }
+    let a = activation.shape().dims();
+    let b = weight.values_e4m3.shape().dims();
+    if a.len() != 2 || b.len() != 2 || a[1] != b[0] {
+        return Err(Error::Other(format!(
+            "gemm_fp8_bf16 shape mismatch: {a:?} @ {b:?}"
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    if activation.device() != expected_device || weight.values_e4m3.device() != expected_device {
+        return Err(Error::DeviceMismatch {
+            expected: expected_device,
+            got: if activation.device() != expected_device {
+                activation.device()
+            } else {
+                weight.values_e4m3.device()
+            },
+        });
+    }
+    if !native_fp8_gemm_supported(ctx)? {
+        return Err(Error::Other(
+            "FP8-to-BF16 GEMM requires native E4M3 Tensor Core support".into(),
+        ));
+    }
+
+    let (m, k, n) = (a[0], a[1], b[1]);
+    let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+    let weight_buffer = CudaBuffer::from_tensor(weight.values_e4m3).map_err(Error::Cuda)?;
+    let alpha = activation_scale * weight.scale;
+    let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
+
+    let status = unsafe {
+        ffi::apxinf_static_prepare_fp8_gemm_bf16_custom(
+            m as i32,
+            n as i32,
+            k as i32,
+            config.tile_id,
+            config.custom_option,
+            config.stages_id,
+            config.cluster_shape_id,
+        )
+    };
+    ffi::check_cublas(status).map_err(Error::Cuda)?;
+    let scratch = fp8_weight_scratch(ctx, n, k)?;
+    let status = unsafe {
+        ffi::apxinf_static_fp8_gemm_bf16_custom(
+            activation.ptr(),
+            weight_buffer.ptr(),
+            output.ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            alpha,
+            scratch
+                .as_ref()
+                .map_or(std::ptr::null_mut(), CudaBuffer::ptr),
+            config.tile_id,
+            config.custom_option,
+            config.stages_id,
+            config.cluster_shape_id,
+            ctx.stream().handle(),
+        )
+    };
+    ffi::check_cublas(status).map_err(Error::Cuda)?;
+    Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
 }
 
 /// Private exact-shape GR00T DiT FC2 backend. This is intentionally separate
@@ -2055,135 +2222,6 @@ pub fn gemm_fp8_bias_then_residual_bf16_m41(
         }
         Ok(output.into_tensor(Shape::new(vec![M, N]), DType::BF16))
     }
-}
-
-fn gemm_fp8_bf16_impl(
-    ctx: &CudaContext,
-    activation: &Tensor,
-    activation_scale: f32,
-    weight: Fp8WeightView<'_>,
-    custom: Option<Fp8Bf16CustomConfig>,
-) -> Result<Tensor> {
-    if activation.dtype() != DType::F8E4M3 || weight.values_e4m3.dtype() != DType::F8E4M3 {
-        return Err(Error::Other(format!(
-            "gemm_fp8_bf16 expects E4M3 operands, got {} and {}",
-            activation.dtype(),
-            weight.values_e4m3.dtype()
-        )));
-    }
-    if weight.dual_geglu_interleaved {
-        return Err(Error::Other(
-            "FP8 dual GeGLU interleaved weight cannot be used by plain FP8 GEMM".into(),
-        ));
-    }
-    if !activation_scale.is_finite()
-        || activation_scale <= 0.0
-        || !weight.scale.is_finite()
-        || weight.scale <= 0.0
-    {
-        return Err(Error::Other(
-            "FP8 GEMM scales must be finite and positive".into(),
-        ));
-    }
-    let a = activation.shape().dims();
-    let b = weight.values_e4m3.shape().dims();
-    if a.len() != 2 || b.len() != 2 || a[1] != b[0] {
-        return Err(Error::Other(format!(
-            "gemm_fp8_bf16 shape mismatch: {a:?} @ {b:?}"
-        )));
-    }
-    let expected_device = Device::Cuda(ctx.device_id());
-    if activation.device() != expected_device || weight.values_e4m3.device() != expected_device {
-        return Err(Error::DeviceMismatch {
-            expected: expected_device,
-            got: if activation.device() != expected_device {
-                activation.device()
-            } else {
-                weight.values_e4m3.device()
-            },
-        });
-    }
-    if !native_fp8_gemm_supported(ctx)? {
-        return Err(Error::Other(
-            "FP8-to-BF16 GEMM requires native E4M3 Tensor Core support".into(),
-        ));
-    }
-
-    let (m, k, n) = (a[0], a[1], b[1]);
-    let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
-    let weight_buffer = CudaBuffer::from_tensor(weight.values_e4m3).map_err(Error::Cuda)?;
-    let alpha = activation_scale * weight.scale;
-    let key = bf16_output_tuning_key(ctx, m, n, k);
-    let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
-    if let Some(config) = custom {
-        let status = unsafe {
-            ffi::apxinf_static_prepare_fp8_gemm_bf16_custom(
-                m as i32,
-                n as i32,
-                k as i32,
-                config.tile_id,
-                config.custom_option,
-                config.stages_id,
-                config.cluster_shape_id,
-            )
-        };
-        ffi::check_cublas(status).map_err(Error::Cuda)?;
-        let scratch = fp8_weight_scratch(ctx, n, k)?;
-        let status = unsafe {
-            ffi::apxinf_static_fp8_gemm_bf16_custom(
-                activation.ptr(),
-                weight_buffer.ptr(),
-                output.ptr(),
-                m as i32,
-                n as i32,
-                k as i32,
-                alpha,
-                scratch
-                    .as_ref()
-                    .map_or(std::ptr::null_mut(), CudaBuffer::ptr),
-                config.tile_id,
-                config.custom_option,
-                config.stages_id,
-                config.cluster_shape_id,
-                ctx.stream().handle(),
-            )
-        };
-        ffi::check_cublas(status).map_err(Error::Cuda)?;
-    } else {
-        let plan = resolve_fp8_bf16_plan(ctx, &key, &activation, &weight_buffer, alpha)?;
-        let selected_tactic = plan.tactic;
-        let selected_result = launch_tactic_fp8_bf16(
-            ctx,
-            &key,
-            &activation,
-            &weight_buffer,
-            &output,
-            alpha,
-            selected_tactic,
-        );
-        if let Err(error) = selected_result {
-            if selected_tactic.backend == TacticBackend::Vendor {
-                return Err(error);
-            }
-            eprintln!(
-                "[apxinf] FP8-to-BF16 tactic {selected_tactic:?} failed for {key:?}: {error}; using vendor fallback"
-            );
-            ctx.gemm_plans().fallback(ctx, &key)?;
-            launch_tactic_fp8_bf16(
-                ctx,
-                &key,
-                &activation,
-                &weight_buffer,
-                &output,
-                alpha,
-                TacticId {
-                    backend: TacticBackend::Vendor,
-                    value: 0,
-                },
-            )?;
-        }
-    }
-    Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
 }
 
 pub fn prepare_cublaslt_fp8_gemm_split(m: usize, n: usize, k: usize) -> Result<()> {

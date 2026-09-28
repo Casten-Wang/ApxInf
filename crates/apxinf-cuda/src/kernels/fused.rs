@@ -260,6 +260,40 @@ pub fn bias_residual_bf16(
     Ok(matrix_tensor(ctx, rows, cols, output))
 }
 
+pub fn bias_residual_bf16_packed4(
+    ctx: &CudaContext,
+    projection: &Tensor,
+    bias: &Tensor,
+    residual: &Tensor,
+) -> Result<Tensor> {
+    let (rows, cols) = matrix_shape(projection, "packed4 bias residual")?;
+    if projection.dtype() != DType::BF16
+        || residual.dtype() != DType::BF16
+        || residual.shape() != projection.shape()
+        || bias.dtype() != DType::BF16
+        || bias.shape().dims() != [cols]
+        || cols % 4 != 0
+    {
+        return Err(Error::Other(
+            "static inference packed4 BF16 bias residual has incompatible dtype or shape".into(),
+        ));
+    }
+    let output = bf16_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_bias_residual_bf16_packed4(
+            gpu_ptr(projection)?,
+            gpu_ptr(bias)?,
+            gpu_ptr(residual)?,
+            output.ptr(),
+            rows as i32,
+            cols as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(matrix_tensor(ctx, rows, cols, output))
+}
+
 pub fn bias_then_residual_bf16(
     ctx: &CudaContext,
     projection: &Tensor,
@@ -279,6 +313,40 @@ pub fn bias_then_residual_bf16(
     let output = bf16_output(ctx, rows, cols)?;
     unsafe {
         ffi::check_cuda(ffi::apxinf_static_bias_then_residual_bf16(
+            gpu_ptr(projection)?,
+            optional_ptr(bias)?,
+            gpu_ptr(residual)?,
+            output.ptr(),
+            rows as i32,
+            cols as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(matrix_tensor(ctx, rows, cols, output))
+}
+
+pub fn bias_then_residual_bf16_packed4(
+    ctx: &CudaContext,
+    projection: &Tensor,
+    bias: Option<&Tensor>,
+    residual: &Tensor,
+) -> Result<Tensor> {
+    let (rows, cols) = matrix_shape(projection, "packed4 bias then residual")?;
+    if projection.dtype() != DType::BF16
+        || residual.dtype() != DType::BF16
+        || residual.shape() != projection.shape()
+        || cols % 4 != 0
+        || bias.is_some_and(|value| value.dtype() != DType::BF16 || value.shape().dims() != [cols])
+    {
+        return Err(Error::Other(
+            "static inference packed4 BF16 bias-then-residual has incompatible dtype or shape"
+                .into(),
+        ));
+    }
+    let output = bf16_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_bias_then_residual_bf16_packed4(
             gpu_ptr(projection)?,
             optional_ptr(bias)?,
             gpu_ptr(residual)?,
@@ -612,7 +680,7 @@ pub fn bias_then_residual_adaptive_layer_bf16_cached_1536(
     eps: f32,
 ) -> Result<ResidualNormTensors> {
     let (rows, cols) = matrix_shape(projection, "cached bias residual adaptive LayerNorm")?;
-    if rows != 41
+    if (ctx.caps().sm == 110 && rows != 41)
         || cols != 1536
         || [projection, projection_bias, residual, modulation]
             .into_iter()
@@ -622,7 +690,7 @@ pub fn bias_then_residual_adaptive_layer_bf16_cached_1536(
         || modulation.shape().dims() != [2 * cols]
     {
         return Err(Error::Other(
-            "cached BF16 bias residual adaptive LayerNorm requires shape [41, 1536] and matching inputs"
+            "cached BF16 bias residual adaptive LayerNorm requires width 1536 (41 rows on SM110) and matching inputs"
                 .into(),
         ));
     }
@@ -691,6 +759,57 @@ pub fn bias_then_residual_layer_bf16_cached_1536(
             ffi::apxinf_static_bias_then_residual_layer_norm_bf16_cached_1536(
                 gpu_ptr(projection)?,
                 gpu_ptr(projection_bias)?,
+                gpu_ptr(residual)?,
+                gpu_ptr(norm_weight)?,
+                gpu_ptr(norm_bias)?,
+                hidden.ptr(),
+                normalized.ptr(),
+                rows as i32,
+                cols as i32,
+                eps,
+                ctx.stream().handle(),
+            ),
+        )
+        .map_err(Error::Cuda)?;
+    }
+    Ok(ResidualNormTensors {
+        hidden: matrix_tensor(ctx, rows, cols, hidden),
+        normalized: matrix_tensor(ctx, rows, cols, normalized),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn bias_residual_layer_bf16_cached_1024(
+    ctx: &CudaContext,
+    projection: &Tensor,
+    projection_bias: Option<&Tensor>,
+    residual: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: &Tensor,
+    eps: f32,
+) -> Result<ResidualNormTensors> {
+    let (rows, cols) = matrix_shape(projection, "cached residual LayerNorm")?;
+    if cols != 1024
+        || [projection, residual, norm_weight, norm_bias]
+            .into_iter()
+            .any(|tensor| tensor.dtype() != DType::BF16)
+        || residual.shape() != projection.shape()
+        || norm_weight.shape().dims() != [cols]
+        || norm_bias.shape().dims() != [cols]
+        || projection_bias
+            .is_some_and(|value| value.dtype() != DType::BF16 || value.shape().dims() != [cols])
+    {
+        return Err(Error::Other(
+            "cached BF16 residual LayerNorm requires width 1024 and matching shapes".into(),
+        ));
+    }
+    let hidden = bf16_output(ctx, rows, cols)?;
+    let normalized = bf16_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(
+            ffi::apxinf_static_bias_residual_layer_norm_bf16_cached_1024(
+                gpu_ptr(projection)?,
+                optional_ptr(projection_bias)?,
                 gpu_ptr(residual)?,
                 gpu_ptr(norm_weight)?,
                 gpu_ptr(norm_bias)?,

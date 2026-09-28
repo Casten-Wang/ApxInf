@@ -159,10 +159,13 @@ thread_local void* g_workspace = nullptr;
 thread_local std::unordered_map<ShapeKey, GemmPlan, ShapeHash> g_plans;
 thread_local std::unordered_map<ShapeKey, GemmPlan, ShapeHash>
     g_fp8_bf16_plans;
-// Explicit custom algorithms use their own cache. This leaves the public
-// heuristic-selected FP8->BF16 route unchanged unless a caller opts in.
-thread_local std::unordered_map<CustomGemmKey, GemmPlan, CustomGemmHash>
-    g_fp8_bf16_custom_plans;
+// Initialize the opt-in cache only when a custom entry is called. Ordinary
+// GEMMs retain their existing thread-local initialization and plan maps.
+auto& fp8_bf16_custom_plans() {
+  static thread_local std::unordered_map<CustomGemmKey, GemmPlan, CustomGemmHash>
+      plans;
+  return plans;
+}
 thread_local std::unordered_map<ShapeKey, Bf16GemmPlan, ShapeHash>
     g_bf16_plans;
 thread_local std::unordered_map<ResidualKey, Bf16GemmPlan, ResidualHash>
@@ -938,8 +941,8 @@ cublasStatus_t prepare_fp8_bf16_custom_plan(
     const CustomGemmKey& key) {
   cublasStatus_t status = initialize();
   if (status != CUBLAS_STATUS_SUCCESS) return status;
-  if (g_fp8_bf16_custom_plans.find(key) !=
-      g_fp8_bf16_custom_plans.end()) {
+  auto& plans = fp8_bf16_custom_plans();
+  if (plans.find(key) != plans.end()) {
     return CUBLAS_STATUS_SUCCESS;
   }
   GemmPlan plan;
@@ -948,7 +951,7 @@ cublasStatus_t prepare_fp8_bf16_custom_plan(
     destroy_plan(&plan);
     return status;
   }
-  g_fp8_bf16_custom_plans.emplace(key, plan);
+  plans.emplace(key, plan);
   return CUBLAS_STATUS_SUCCESS;
 }
 
@@ -1521,8 +1524,9 @@ extern "C" int apxinf_static_fp8_gemm_bf16_custom(
   CustomGemmKey key{
       ShapeKey{m, n, k},
       CustomAlgoConfig{tile_id, custom_option, stages_id, cluster_shape_id}};
-  auto it = g_fp8_bf16_custom_plans.find(key);
-  if (it == g_fp8_bf16_custom_plans.end())
+  auto& plans = fp8_bf16_custom_plans();
+  auto it = plans.find(key);
+  if (it == plans.end())
     return static_cast<int>(CUBLAS_STATUS_NOT_INITIALIZED);
   const float beta = 0.0f;
   GemmPlan& plan = it->second;

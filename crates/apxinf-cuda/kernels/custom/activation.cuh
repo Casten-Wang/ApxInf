@@ -599,6 +599,40 @@ __global__ void bias_activation_bf16_packed4_kernel(
   }
 }
 
+struct alignas(16) Bf16Pairx8 {
+  Bf16x4 first;
+  Bf16x4 second;
+};
+
+__device__ __forceinline__ Bf16x4 bias_gelu_bf16_quad(
+    const Bf16x4 input, const Bf16x4 bias) {
+  const float v0 = gelu_tanh(
+      __bfloat162float(input.low.x) + __bfloat162float(bias.low.x));
+  const float v1 = gelu_tanh(
+      __bfloat162float(input.low.y) + __bfloat162float(bias.low.y));
+  const float v2 = gelu_tanh(
+      __bfloat162float(input.high.x) + __bfloat162float(bias.high.x));
+  const float v3 = gelu_tanh(
+      __bfloat162float(input.high.y) + __bfloat162float(bias.high.y));
+  return Bf16x4{
+      __floats2bfloat162_rn(v0, v1), __floats2bfloat162_rn(v2, v3)};
+}
+
+__global__ void bias_gelu_bf16_packed8_kernel(
+    const Bf16Pairx8* input, const Bf16Pairx8* bias, Bf16Pairx8* output,
+    int64_t octet_count, int octets_per_row) {
+  int64_t index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < octet_count; index += stride) {
+    const Bf16Pairx8 value = input[index];
+    const Bf16Pairx8 row_bias = bias[index % octets_per_row];
+    output[index] = Bf16Pairx8{
+        bias_gelu_bf16_quad(value.first, row_bias.first),
+        bias_gelu_bf16_quad(value.second, row_bias.second)};
+  }
+}
+
 __global__ void bias_activation_bf16_packed8_kernel(
     const __nv_bfloat16* input, const __nv_bfloat16* bias,
     __nv_bfloat16* output, int64_t oct_count, int cols, int activation) {

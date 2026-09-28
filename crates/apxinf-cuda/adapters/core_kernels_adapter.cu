@@ -486,34 +486,25 @@ extern "C" cudaError_t apxinf_rope_mrope_bf16(
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t apxinf_qk_rms_norm_mrope_bf16(
+extern "C" cudaError_t apxinf_qk_rms_norm_mrope_bf16_with_threads(
     const void* query_input, const void* query_weight, void* query_output,
     const void* key_input, const void* key_weight, void* key_output,
     uint32_t head_dim, uint32_t query_heads, uint32_t key_heads,
     uint32_t seq_len, float eps, float theta, const void* pos_ids,
-    uint32_t sec_h, uint32_t sec_w, void* stream)
+    uint32_t sec_h, uint32_t sec_w, uint32_t block_threads, void* stream)
 {
-    if (query_input == nullptr || query_weight == nullptr ||
+    if ((block_threads != 128 && block_threads != 256) ||
+        query_input == nullptr || query_weight == nullptr ||
         query_output == nullptr || key_input == nullptr ||
         key_weight == nullptr || key_output == nullptr ||
         pos_ids == nullptr || head_dim == 0 || (head_dim % 2) != 0 ||
         query_heads == 0 || key_heads == 0 || seq_len == 0 ||
-        head_dim * sizeof(__nv_bfloat16) > 48 * 1024 ||
+        head_dim / 2 > block_threads ||
         !(eps > 0.0f) || !(theta > 0.0f)) {
         return cudaErrorInvalidValue;
     }
     dim3 grid(seq_len, query_heads + key_heads, 1);
-    // GR00T's production Qwen shapes have D=128, so 128 threads cover one
-    // complete row while preserving the established reduction tree.  Avoid
-    // scheduling four empty warps per (sequence, head) block.  Every other
-    // shape keeps the model-neutral default launch geometry.
-    const bool legacy_threads =
-        std::getenv("APXINF_GR00T_LEGACY_QK_MROPE_THREADS") != nullptr;
-    const bool gr00t_shape = head_dim == 128 && query_heads == 16 &&
-                             key_heads == 8 &&
-                             (seq_len == 90 || seq_len == 156);
-    const uint32_t threads = !legacy_threads && gr00t_shape ? 128 : BLOCK_SIZE;
-    dim3 block(threads, 1, 1);
+    dim3 block(block_threads, 1, 1);
     qk_rms_norm_mrope_bf16_kernel<<<
         grid, block, head_dim * sizeof(__nv_bfloat16),
         static_cast<cudaStream_t>(stream)>>>(
@@ -526,6 +517,26 @@ extern "C" cudaError_t apxinf_qk_rms_norm_mrope_bf16(
         key_heads, seq_len, eps, theta, static_cast<const uint32_t*>(pos_ids),
         sec_h, sec_w);
     return cudaGetLastError();
+}
+
+// Compatibility entry: retain its established shape-only launch selection and
+// legacy environment switch. Device-aware callers use the explicit entry above.
+extern "C" cudaError_t apxinf_qk_rms_norm_mrope_bf16(
+    const void* query_input, const void* query_weight, void* query_output,
+    const void* key_input, const void* key_weight, void* key_output,
+    uint32_t head_dim, uint32_t query_heads, uint32_t key_heads,
+    uint32_t seq_len, float eps, float theta, const void* pos_ids,
+    uint32_t sec_h, uint32_t sec_w, void* stream)
+{
+    const bool legacy_threads =
+        std::getenv("APXINF_GR00T_LEGACY_QK_MROPE_THREADS") != nullptr;
+    const bool measured_shape = head_dim == 128 && query_heads == 16 &&
+                                key_heads == 8 && (seq_len == 90 || seq_len == 156);
+    const uint32_t threads = !legacy_threads && measured_shape ? 128 : BLOCK_SIZE;
+    return apxinf_qk_rms_norm_mrope_bf16_with_threads(
+        query_input, query_weight, query_output, key_input, key_weight, key_output,
+        head_dim, query_heads, key_heads, seq_len, eps, theta, pos_ids,
+        sec_h, sec_w, threads, stream);
 }
 
 extern "C" cudaError_t apxinf_rope_mrope_decode_bf16(
@@ -706,6 +717,28 @@ extern "C" cudaError_t apxinf_qkv_split_bias_vision_rope_precomputed_bf16(
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_qkv_split_bias_vision_rope_precomputed_vec2_bf16(
+    const void* qkv, const void* bias, void* q_out, void* k_out, void* v_out,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    const void* rotation_table, void* stream) {
+  if (qkv == nullptr || bias == nullptr || q_out == nullptr || k_out == nullptr ||
+      v_out == nullptr || rotation_table == nullptr || head_dim == 0 ||
+      head_dim % 4 != 0 || n_heads == 0 || seq_len == 0)
+    return cudaErrorInvalidValue;
+  const uint64_t total =
+      static_cast<uint64_t>(seq_len) * n_heads * (head_dim / 4);
+  constexpr uint32_t threads = 128;
+  const dim3 grid(static_cast<uint32_t>((total + threads - 1) / threads), 1, 1);
+  qkv_split_bias_vision_rope_precomputed_bf16_vec2_kernel<<<
+      grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const __nv_bfloat16*>(qkv),
+      static_cast<const __nv_bfloat16*>(bias),
+      static_cast<__nv_bfloat16*>(q_out),
+      static_cast<__nv_bfloat16*>(k_out),
+      static_cast<__nv_bfloat16*>(v_out), head_dim, n_heads, seq_len,
+      static_cast<const float2*>(rotation_table));
+  return cudaGetLastError();
+}
 extern "C" cudaError_t apxinf_vision_sdpa_bf16(
     const void* q, const void* k, const void* v, void* out,
     uint32_t seq_len, uint32_t n_heads, uint32_t head_dim, float scale, void* stream)

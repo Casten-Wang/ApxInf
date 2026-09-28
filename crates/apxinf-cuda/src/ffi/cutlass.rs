@@ -173,4 +173,42 @@ extern "C" {
         input_dim: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(apxinf_cutlass_int8_sm80)]
+    pub fn apxinf_static_cutlass_int8_gemm_bf16_m41_n6144_k1536(
+        activation: *const c_void,
+        weight_output_major: *const c_void,
+        row_scales: *const c_void,
+        column_scales: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        output_dim: i32,
+        input_dim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    #[cfg(apxinf_cutlass_int8_sm80)]
+    pub fn apxinf_static_cutlass_int8_gemm_bias_bf16_m41_n4608_k1536(
+        activation: *const c_void,
+        weight_output_major: *const c_void,
+        row_scales: *const c_void,
+        column_scales: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        output_dim: i32,
+        input_dim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    #[cfg(apxinf_cutlass_int8_sm80)]
+    pub fn apxinf_static_cutlass_int8_gemm_bias_gelu_bf16_m41_n6144_k1536(
+        activation: *const c_void,
+        weight_output_major: *const c_void,
+        row_scales: *const c_void,
+        column_scales: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        output_dim: i32,
+        input_dim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 }

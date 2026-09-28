@@ -1406,6 +1406,80 @@ pub fn noncausal_hdim96_bm64(
     Ok(None)
 }
 
+/// GR00T opt-in for multiple equal-length, contiguous vision segments.
+/// Each segment remains an independent FA2 batch; the public single-segment
+/// operator and its default dispatch are unchanged.
+pub fn noncausal_batched_equal(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    batches: usize,
+    sequence_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    if batches < 2 || sequence_len == 0 {
+        return Err(Error::Other(
+            "batched noncausal attention requires at least two non-empty segments".into(),
+        ));
+    }
+    let total_rows = batches
+        .checked_mul(sequence_len)
+        .ok_or_else(|| Error::Other("batched noncausal row count overflow".into()))?;
+    let shape = [total_rows, n_heads, head_dim];
+    if q.dtype() != DType::BF16
+        || k.dtype() != DType::BF16
+        || v.dtype() != DType::BF16
+        || q.shape().dims() != shape
+        || k.shape().dims() != shape
+        || v.shape().dims() != shape
+        || n_heads == 0
+        || head_dim == 0
+        || head_dim > 64
+        || head_dim % 2 != 0
+    {
+        return Err(Error::Other(format!(
+            "batched noncausal attention expected BF16 {shape:?}, got {} {:?}, {} {:?}, {} {:?}",
+            q.dtype(),
+            q.shape().dims(),
+            k.dtype(),
+            k.shape().dims(),
+            v.dtype(),
+            v.shape().dims()
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    for tensor in [q, k, v] {
+        if tensor.device() != expected_device {
+            return Err(Error::DeviceMismatch {
+                expected: expected_device,
+                got: tensor.device(),
+            });
+        }
+    }
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        let output = fa2_attention(
+            ctx,
+            q,
+            k,
+            v,
+            batches,
+            sequence_len,
+            sequence_len,
+            n_heads,
+            n_heads,
+            head_dim,
+        )?;
+        return output.reshape(vec![total_rows, n_heads * head_dim]);
+    }
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    Err(Error::Other(
+        "batched noncausal attention requires the FA2 provider".into(),
+    ))
+}
+
 pub fn noncausal_strided_qkv(
     ctx: &CudaContext,
     qkv: &Tensor,
@@ -3495,4 +3569,38 @@ pub fn mqa_f16_e4m3_522(
     Err(Error::Other(
         "FA2 direct E4M3 requires an SM100-family FA2 build".into(),
     ))
+}
+
+#[cfg(test)]
+mod segmented_output_tests {
+    use super::segmented_noncausal_contiguous_output_bf16_shape_supported;
+
+    #[test]
+    fn direct_segmented_bf16_output_gate_is_exact() {
+        assert!(segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[256, 256],
+            16,
+            64
+        ));
+        assert!(!segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[256],
+            16,
+            64
+        ));
+        assert!(!segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[128, 128],
+            16,
+            64
+        ));
+        assert!(!segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[256, 256],
+            8,
+            64
+        ));
+        assert!(!segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[256, 256],
+            16,
+            128
+        ));
+    }
 }
