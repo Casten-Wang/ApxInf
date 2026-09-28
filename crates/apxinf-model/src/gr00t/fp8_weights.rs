@@ -414,7 +414,7 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         if bias.shape().dims() != [6144] {
             return Ok(None);
         }
-        kernels::fused::try_gr00t_fp8_m41_fc1_bias_gelu_quant_e4m3(
+        kernels::fused::try_fp8_bias_gelu_quant_e4m3_m41(
             backend.context(),
             input,
             &self.weight,
@@ -483,14 +483,14 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
             dual_geglu_interleaved: false,
             dual_geglu_auto_interleaved: None,
         };
-        Ok(Some(kernels::gemm::fp8_bias_then_residual_bf16_m41(
+        kernels::gemm::try_fp8_bias_then_residual_bf16(
             backend.context(),
             input,
             self.activation_scale,
             weight,
             bias,
             residual,
-        )?))
+        )
     }
 
     fn quantize_tensor_input(

@@ -66,6 +66,26 @@ and that model's tokenizer/normalizer assets); none ships with this package.
 Resize, tokenization, normalization, and the flow sampler all run inside `infer`
 — pass raw frames.
 
+### Load GR00T N1.7
+
+GR00T requires **two explicit local paths**. `model_dir` contains the GR00T
+checkpoint, including both backbone and action-head inference weights, and its
+official processor metadata. `backbone` supplies the matching Cosmos-Reason2-2B
+architecture config and tokenizer/image/video processor resources:
+
+```python
+policy = AutoPolicy.from_pretrained(
+    "/models/GR00T-N1.7-LIBERO/libero_10",
+    backbone="/models/nvidia/Cosmos-Reason2-2B",
+    precision="bf16",
+)
+```
+
+The local Cosmos asset is required even though GR00T's weights are already in
+`model_dir`. ApxInf does not locate or download it from checkpoint metadata.
+See [GR00T loading](doc/gr00t-n1.7.md#loading) for the required files, offline
+processor dependencies, and the additional FP8 snapshot-identity requirement.
+
 ### Serve it with OpenPI compatible websocket server
 
 ```bash
@@ -74,6 +94,9 @@ python python/apxinf/examples/openpi_server.py \
   --image-keys observation/image,observation/wrist_image \
   --state-key observation/state
 ```
+
+For GR00T, replace `--model-variant bf16` with `--precision bf16` and add
+`--policy-options '{"backbone":"/models/nvidia/Cosmos-Reason2-2B"}'`.
 
 An unmodified `openpi-client` connects to it:
 

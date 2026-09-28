@@ -253,37 +253,64 @@ pub(super) fn bias_activation(
     Ok(matrix_tensor(ctx, rows, cols, output))
 }
 
-/// GR00T-private SM110 packed8 route for the exact BF16 bias/activation
-/// shapes established by the model profile. Unsupported devices and shapes
-/// return `None`, leaving the model to use the ordinary public operator.
-pub fn gr00t_bias_activation_bf16_packed8(
+/// Add a BF16 row bias with optional GELU-tanh (`activation = 1`; 0 is identity).
+/// Addition and activation use FP32, with a single BF16 rounding at the store.
+/// Declines empty matrices, widths not divisible by eight, and unaligned storage.
+/// Callers own the policy for selecting this explicitly requested packed8 path.
+pub fn try_bias_activation_bf16_packed8(
     ctx: &CudaContext,
     input: &Tensor,
     bias: &Tensor,
     activation: i32,
 ) -> Result<Option<Tensor>> {
-    let (rows, cols) = matrix_shape(input, "GR00T packed8 bias activation")?;
+    let (rows, cols) = matrix_shape(input, "packed8 bias activation")?;
     if input.dtype() != DType::BF16 || bias.dtype() != DType::BF16 || bias.shape().dims() != [cols]
     {
         return Err(Error::Other(
-            "GR00T packed8 bias activation has incompatible dtype or shape".into(),
+            "packed8 bias activation has incompatible dtype or shape".into(),
         ));
     }
-    let supported_shape = matches!(
-        (rows, cols, activation),
-        (41, 1536, 0) | (41, 4608, 0) | (41, 6144, 1) | (256, 4096, 1) | (512, 4096, 1)
-    );
-    if ctx.caps().sm != 110 || !supported_shape {
+    if !matches!(activation, 0 | 1) {
+        return Err(Error::Other(
+            "packed8 bias activation expects identity or GELU-tanh".into(),
+        ));
+    }
+    if rows == 0 || cols == 0 || cols % 8 != 0 {
+        return Ok(None);
+    }
+    let rows_i32 = i32::try_from(rows)
+        .map_err(|_| Error::Other("packed8 bias activation rows exceed i32".into()))?;
+    let cols_i32 = i32::try_from(cols)
+        .map_err(|_| Error::Other("packed8 bias activation columns exceed i32".into()))?;
+    let input_buffer = CudaBuffer::from_tensor(input).map_err(Error::Cuda)?;
+    let bias_buffer = CudaBuffer::from_tensor(bias).map_err(Error::Cuda)?;
+    require_buffers(
+        ctx,
+        "packed8 bias activation",
+        &[
+            (
+                "input",
+                &input_buffer,
+                checked_bytes(DType::BF16, &[rows, cols], "packed8 input")?,
+            ),
+            (
+                "bias",
+                &bias_buffer,
+                checked_bytes(DType::BF16, &[cols], "packed8 bias")?,
+            ),
+        ],
+    )?;
+    if input_buffer.ptr() as usize % 16 != 0 || bias_buffer.ptr() as usize % 16 != 0 {
         return Ok(None);
     }
     let output = bf16_output(ctx, rows, cols)?;
     unsafe {
-        check_cuda(ffi::apxinf_gr00t_bias_activation_bf16_packed8(
-            gpu_ptr(input)?,
-            gpu_ptr(bias)?,
+        check_cuda(ffi::apxinf_bias_activation_bf16_packed8(
+            input_buffer.ptr(),
+            bias_buffer.ptr(),
             output.ptr(),
-            rows as i32,
-            cols as i32,
+            rows_i32,
+            cols_i32,
             activation,
             ctx.stream().handle(),
         ))?;

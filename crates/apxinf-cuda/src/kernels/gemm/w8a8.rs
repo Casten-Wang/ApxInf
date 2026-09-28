@@ -917,6 +917,23 @@ pub fn try_gemm_quantized_w8a8_m41_n6144_k1536(
     ))
 }
 
+/// Try the fixed-shape W8A8 projection with separately rounded BF16 bias.
+///
+/// Returns `None` when the optional INT8 CUTLASS backend was not compiled.
+/// Otherwise the strict SM87 M41 N4608 K1536 operand contract and execution
+/// errors are preserved.
+pub fn try_gemm_quantized_w8a8_bias(
+    ctx: &CudaContext,
+    activation: &W8A8Activation,
+    weight: W8A8WeightView<'_>,
+    bias: &Tensor,
+) -> Result<Option<Tensor>> {
+    if !cfg!(apxinf_cutlass_int8_sm80) {
+        return Ok(None);
+    }
+    gemm_quantized_w8a8_bias_exact_qkv(ctx, activation, weight, bias).map(Some)
+}
+
 /// Explicit SM87 M41 N4608 K1536 projection with a BF16 rounding boundary
 /// before bias addition.
 pub fn gemm_quantized_w8a8_bias_exact_qkv(

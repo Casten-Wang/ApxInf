@@ -201,12 +201,12 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         {
             return Ok(None);
         }
-        Ok(Some(kernels::gemm::gemm_quantized_w8a8_bias_exact_qkv(
+        kernels::gemm::try_gemm_quantized_w8a8_bias(
             backend.context(),
             input,
             self.as_kernel_view(),
             bias,
-        )?))
+        )
     }
 
     fn fused_silu_mul(

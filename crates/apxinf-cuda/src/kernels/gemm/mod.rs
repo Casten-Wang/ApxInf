@@ -147,15 +147,16 @@ pub use fp8::{
     exact_fp8_tactic, gemm_fp8 as fp8, gemm_fp8_bf16 as fp8_bf16,
     gemm_fp8_bf16_custom as fp8_bf16_custom, gemm_fp8_dynamic_bf16,
     gemm_fp8_geglu_fused as fp8_geglu_fused, native_fp8_gemm_supported as native_fp8_supported,
-    DynamicFp8WeightView, Fp8Bf16CustomConfig, Fp8WeightView,
+    try_fp8_bias_then_residual_bf16, DynamicFp8WeightView, Fp8Bf16CustomConfig, Fp8WeightView,
 };
 pub use w8a8::{
     adaptive_layer_norm_quantize_w8a8_activation, bias_gelu_quantize_w8a8_activation,
     gemm_quantized_w8a8, gemm_quantized_w8a8_bias_exact_qkv, gemm_w8a8 as w8a8,
     layer_norm_quantize_w8a8_activation, quantize_w8a8_activation,
     quantize_w8a8_silu_mul_activation, quantize_w8a8_silu_mul_activation_packed4,
-    try_gemm_quantized_w8a8_bias_gelu_quantized, try_gemm_quantized_w8a8_m41_n6144_k1536,
-    try_gemm_w8a8_m41_n6144_k1536, W8A8Activation, W8A8Layout, W8A8ScaleMode, W8A8WeightView,
+    try_gemm_quantized_w8a8_bias, try_gemm_quantized_w8a8_bias_gelu_quantized,
+    try_gemm_quantized_w8a8_m41_n6144_k1536, try_gemm_w8a8_m41_n6144_k1536, W8A8Activation,
+    W8A8Layout, W8A8ScaleMode, W8A8WeightView,
 };
 #[cfg(test)]
 pub(crate) use w8a8::{gemm_w8a8_with_preference, w8a8_tuning_key_for_test};

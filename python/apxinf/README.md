@@ -166,6 +166,27 @@ Any default step is replaceable at construction (`image_pipeline=`,
 `tokenizer=`, `unnormalizer=`, `noise=`) for a custom high-performance
 implementation.
 
+### GR00T local assets
+
+`AutoPolicy` dispatches GR00T by its checkpoint config, but GR00T requires an
+explicit `backbone=` path as well:
+
+```python
+policy = AutoPolicy.from_pretrained(
+    "/models/GR00T-N1.7-LIBERO/libero_10",
+    backbone="/models/nvidia/Cosmos-Reason2-2B",
+    precision="bf16",
+)
+```
+
+The GR00T directory contains both backbone and action-head inference weights
+and NVIDIA's checkpoint processor metadata. The Cosmos directory supplies the
+architecture config and tokenizer/image/video processor resources. Both paths
+must be local; ApxInf does not infer or download the Cosmos asset. See the
+[GR00T loading contract](../../doc/gr00t-n1.7.md#loading) for asset files and the
+current FP8 calibration identity requirement to retain the complete Cosmos
+snapshot. GR00T uses `precision=`, rather than PI0.5's `model_variant=`.
+
 ## Policy contract
 
 `apxinf.Policy` is a structural `typing.Protocol` every L2 policy satisfies:

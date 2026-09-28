@@ -115,12 +115,12 @@ pub fn gemm_bias_gelu_fp8(
     super::activation::bias_gelu_quant_f16_e4m3(ctx, &projection, bias, output_scale)
 }
 
-/// GR00T-only opt-in for the exact Thor DiT FC1 shape.
+/// Explicit FP8 GEMM + bias + GELU-tanh + quantization for M=41, K=1536, N=6144.
 ///
 /// The epilogue preserves the production BF16 projection and GELU rounding
 /// boundaries before writing E4M3. Generic FP8 dispatch never selects it.
 #[allow(clippy::too_many_arguments)]
-pub fn try_gr00t_fp8_m41_fc1_bias_gelu_quant_e4m3(
+pub fn try_fp8_bias_gelu_quant_e4m3_m41(
     ctx: &CudaContext,
     activation: &Tensor,
     weight: &Tensor,
@@ -141,7 +141,7 @@ pub fn try_gr00t_fp8_m41_fc1_bias_gelu_quant_e4m3(
         || bias.dtype() != DType::BF16
     {
         return Err(Error::Other(format!(
-            "GR00T Thor FP8 M41 FC1 fusion expects E4M3 activation/weight and BF16 bias, got {}, {}, and {}",
+            "FP8 M41 bias/GELU/quantization fusion expects E4M3 activation/weight and BF16 bias, got {}, {}, and {}",
             activation.dtype(),
             weight.dtype(),
             bias.dtype()
@@ -155,7 +155,7 @@ pub fn try_gr00t_fp8_m41_fc1_bias_gelu_quant_e4m3(
         || output_scale <= 0.0
     {
         return Err(Error::Other(format!(
-            "invalid GR00T Thor FP8 M41 FC1 fusion scales: activation={activation_scale}, weight={weight_scale}, output={output_scale}"
+            "invalid FP8 M41 bias/GELU/quantization fusion scales: activation={activation_scale}, weight={weight_scale}, output={output_scale}"
         )));
     }
 
@@ -178,7 +178,7 @@ pub fn try_gr00t_fp8_m41_fc1_bias_gelu_quant_e4m3(
         };
         if status != 0 {
             return Err(Error::Cuda(format!(
-                "GR00T Thor FP8 M41 FC1 CUTLASS M64xN128xK128 launch failed ({status})"
+                "FP8 M41 bias/GELU/quantization CUTLASS M64xN128xK128 launch failed ({status})"
             )));
         }
         return Ok(Some(make_gpu_tensor(
@@ -668,9 +668,8 @@ pub fn bias_residual_layer_quant_bf16_e4m3(
     })
 }
 
-/// GR00T-only exact-width composition for an FFN projection followed by the
-/// next DiT block's adaptive LayerNorm. Public/default normalization dispatch
-/// does not select this helper.
+/// Explicit width-1536 bias + residual + adaptive LayerNorm composition.
+/// Public/default normalization dispatch does not select this helper.
 pub fn bias_then_residual_adaptive_layer_bf16_cached_1536(
     ctx: &CudaContext,
     projection: &Tensor,

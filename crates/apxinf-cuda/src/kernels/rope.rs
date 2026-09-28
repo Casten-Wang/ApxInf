@@ -257,32 +257,11 @@ pub fn apply_mrope(
     ))
 }
 
-pub(crate) const fn qk_rms_mrope_block_threads(
-    sm: u32,
-    seq_len: usize,
-    head_dim: usize,
-    query_heads: usize,
-    key_heads: usize,
-    legacy_threads: bool,
-) -> u32 {
-    let measured_arch_shape =
-        (sm == 110 && (seq_len == 90 || seq_len == 156)) || (sm == 87 && seq_len == 156);
-    if !legacy_threads
-        && measured_arch_shape
-        && head_dim == 128
-        && query_heads == 16
-        && key_heads == 8
-    {
-        128
-    } else {
-        256
-    }
-}
-
 /// Apply per-head RMSNorm and multimodal RoPE to Q and K in one launch.
 /// The normalized values are rounded to BF16 before rotation, matching the
 /// decomposed RMSNorm-then-RoPE contract.
 /// Head dimensions above 512 require the decomposed path.
+/// Uses the default 256-thread launch independently of model environment.
 #[allow(clippy::too_many_arguments)]
 pub fn rms_norm_apply_mrope_qk(
     ctx: &CudaContext,
@@ -299,6 +278,50 @@ pub fn rms_norm_apply_mrope_qk(
     sections: [usize; 3],
     pos_ids: &CudaBuffer,
 ) -> Result<(Tensor, Tensor)> {
+    rms_norm_apply_mrope_qk_with_block_threads(
+        ctx,
+        query,
+        query_weight,
+        key,
+        key_weight,
+        seq_len,
+        query_heads,
+        key_heads,
+        head_dim,
+        eps,
+        theta,
+        sections,
+        pos_ids,
+        256,
+    )
+}
+
+/// The same RMSNorm + mRoPE contract with an explicit 128- or 256-thread launch.
+/// The caller selects the launch size; no model-specific environment is read.
+/// Each thread handles a rotary pair, so `head_dim / 2 <= block_threads` is required.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_apply_mrope_qk_with_block_threads(
+    ctx: &CudaContext,
+    query: &Tensor,
+    query_weight: &Tensor,
+    key: &Tensor,
+    key_weight: &Tensor,
+    seq_len: usize,
+    query_heads: usize,
+    key_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    theta: f32,
+    sections: [usize; 3],
+    pos_ids: &CudaBuffer,
+    block_threads: u32,
+) -> Result<(Tensor, Tensor)> {
+    if !matches!(block_threads, 128 | 256) || head_dim / 2 > block_threads as usize {
+        return Err(Error::Other(
+            "Q/K RMSNorm mRoPE requires 128 or 256 block threads and head_dim / 2 <= block_threads"
+                .into(),
+        ));
+    }
     require_finite("Q/K RMSNorm mRoPE", &[eps, theta])?;
     if query.dtype() != DType::BF16
         || key.dtype() != DType::BF16
@@ -359,19 +382,6 @@ pub fn rms_norm_apply_mrope_qk(
     )?;
     let query_output = output_buffer(ctx, query_bytes)?;
     let key_output = output_buffer(ctx, key_bytes)?;
-    let legacy_threads = match ctx.caps().sm {
-        110 => std::env::var_os("APXINF_GR00T_LEGACY_QK_MROPE_THREADS").is_some(),
-        87 => std::env::var_os("APXINF_GR00T_BF16_LEGACY_QK_MROPE_THREADS").is_some(),
-        _ => false,
-    };
-    let block_threads = qk_rms_mrope_block_threads(
-        ctx.caps().sm,
-        seq_len,
-        head_dim,
-        query_heads,
-        key_heads,
-        legacy_threads,
-    );
     check_cuda(unsafe {
         ffi::apxinf_qk_rms_norm_mrope_bf16_with_threads(
             query_buffer.ptr(),

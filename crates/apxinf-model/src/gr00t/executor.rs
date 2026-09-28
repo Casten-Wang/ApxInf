@@ -969,16 +969,10 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     bias,
                 );
             }
-            if E::USE_PACKED8_BF16_BIAS_ACTIVATION
-                && self.backend.context().caps().sm == 110
-                && std::env::var_os("APXINF_GR00T_BF16_LEGACY_PACKED8_BIAS_ACTIVATION").is_none()
-            {
-                if let Some(output) = kernels::activation::gr00t_bias_activation_bf16_packed8(
-                    self.backend.context(),
-                    input,
-                    bias,
-                    1,
-                )? {
+            if E::USE_PACKED8_BF16_BIAS_ACTIVATION {
+                if let Some(output) =
+                    super::backend::try_packed8_bias_activation(&self.backend, input, bias, 1)?
+                {
                     return Ok(output);
                 }
             }
@@ -2789,7 +2783,20 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
         && text.n_kv_heads == 8
         && text.head_dim == 128;
     let (query, key) = if use_fused_qk_rms_mrope {
-        kernels::rope::rms_norm_apply_mrope_qk(
+        let legacy_threads = match backend.context().caps().sm {
+            110 => std::env::var_os("APXINF_GR00T_LEGACY_QK_MROPE_THREADS").is_some(),
+            87 => std::env::var_os("APXINF_GR00T_BF16_LEGACY_QK_MROPE_THREADS").is_some(),
+            _ => false,
+        };
+        let block_threads = super::backend::qk_rms_mrope_block_threads(
+            backend.context().caps().sm,
+            sequence_len,
+            text.head_dim,
+            text.n_heads,
+            text.n_kv_heads,
+            legacy_threads,
+        );
+        kernels::rope::rms_norm_apply_mrope_qk_with_block_threads(
             backend.context(),
             &query,
             &layer.q_norm_weight,
@@ -2803,6 +2810,7 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
             text.rope_theta,
             text.mrope_section,
             position_ids,
+            block_threads,
         )?
     } else {
         let query = rms_norm(backend, &query, &layer.q_norm_weight, text.rms_norm_eps)?

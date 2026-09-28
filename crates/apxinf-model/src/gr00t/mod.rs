@@ -8,7 +8,7 @@
 mod action_weights;
 #[cfg(any(feature = "cuda", test))]
 mod backbone;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 mod backend;
 #[cfg(feature = "cuda")]
 mod bf16_executor;

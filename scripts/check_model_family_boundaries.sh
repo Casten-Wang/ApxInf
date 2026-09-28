@@ -51,4 +51,24 @@ fi
 
 python3 "$repo_root/scripts/check_pi05_module_boundaries.py"
 
+# GR00T selects its measured shapes and launch overrides in the model layer.
+# Shared Rust operators must not acquire GR00T-named APIs or environment knobs.
+cuda_policy_roots=(
+    "$repo_root/crates/apxinf-cuda/src/kernels"
+    "$repo_root/crates/apxinf-cuda/adapters"
+    "$repo_root/crates/apxinf-cuda/kernels/custom"
+)
+gr00t_policy_pattern='APXINF_GR00T_|pub(\([^)]*\))?[[:space:]]+(unsafe[[:space:]]+)?(const[[:space:]]+)?fn[[:space:]]+(try_)?gr00t_'
+if command -v rg >/dev/null 2>&1; then
+    if rg -n -g '*.rs' -g '*.cu' -g '*.cuh' "$gr00t_policy_pattern" "${cuda_policy_roots[@]}"; then
+        violations=1
+    fi
+elif grep -R -n -E --include='*.rs' --include='*.cu' --include='*.cuh' "$gr00t_policy_pattern" "${cuda_policy_roots[@]}"; then
+    violations=1
+fi
+if ((violations)); then
+    echo 'model/backend boundary violation: move GR00T API and launch policy to its model seam' >&2
+    exit 1
+fi
+
 echo 'model-family boundary checks passed'

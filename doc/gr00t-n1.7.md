@@ -40,6 +40,25 @@ uses W8A8 only for the validated FFN and eligible fused self-QKV matrices.
 
 ## Loading
 
+**Supply both `model_dir` and `backbone` as local paths**, including when using
+`AutoPolicy`. The GR00T checkpoint already packages the backbone and action-head
+weights together; all inference weight tensors are loaded from `model_dir`.
+The separate `backbone` argument supplies the compatible Cosmos-Reason2-2B
+architecture configuration and official processor resources.
+
+| Argument | Required local assets |
+| --- | --- |
+| `model_dir` | GR00T `config.json` and SafeTensors weights (including the index and referenced shards for a sharded checkpoint); NVIDIA `processor_config.json`, `statistics.json`, and `embodiment_id.json`. The processor files may be at the checkpoint root or together in its `processor/` subdirectory. |
+| `backbone` | A compatible Cosmos-Reason2-2B asset directory containing `config.json` and its Qwen3-VL tokenizer, chat template, image processor, and video processor resources. Preserve the snapshot's processor/tokenizer files and any files they reference. |
+
+The Cosmos resources commonly include `tokenizer.json`, `tokenizer_config.json`,
+`chat_template.json`, `preprocessor_config.json`, and
+`video_preprocessor_config.json`, together with the tokenizer's vocabulary and
+merges files. Rust reads the Cosmos architecture config; NVIDIA's processor
+loads its own resources from the same directory. Install the compatible
+Isaac-GR00T and Transformers environment before loading a policy. Processor
+loading uses `local_files_only=True`.
+
 ```python
 from apxinf import AutoPolicy
 
@@ -66,11 +85,30 @@ result = policy.infer({
 actions = result["actions"]
 ```
 
-The GR00T checkpoint is the primary `AutoModel` artifact. The complete
-Cosmos-Reason2-2B architecture/processor snapshot is passed as the named
-`backbone` asset; it is not discovered through an environment variable. FP8
-additionally requires an explicit calibration JSON. Device-specific tactics are
-also explicit load arguments.
+The Python policy forwards `backbone` as `ModelRunner.load(...,
+assets={"backbone": ...})`; native Rust callers set
+`LoadOptions.assets["backbone"]`. ApxInf does not resolve this local directory
+from an environment variable or checkpoint metadata, and does not download it.
+The checkpoint's `model_name` may name a Hub repository or a path from its
+training/export machine; it does not establish an available, compatible local
+snapshot. Omitting `backbone=` therefore raises an error.
+
+BF16 and INT8 inference do not read the Cosmos SafeTensors files. **Current FP8
+calibration identity validation additionally hashes the weight shards in both
+supplied directories.** For FP8, retain the complete Cosmos snapshot used to
+produce the calibration JSON, including those shards. They participate in the
+identity check; the model's inference weights still come from the GR00T
+checkpoint. Pass the calibration JSON explicitly with `calibration=` and a
+device-specific tactics database with `tactics=` when needed.
+
+The generic command-line example accepts the same second path through its
+existing policy options:
+
+```bash
+python python/apxinf/examples/autopolicy_infer.py \
+  --model-dir /models/GR00T-N1.7-LIBERO/libero_10 --precision bf16 \
+  --policy-options '{"backbone":"/models/nvidia/Cosmos-Reason2-2B"}'
+```
 
 For LIBERO, GR00T's official state contract has eight values: XYZ, axis-angle
 rotation, and both mirrored gripper joint positions. Do not pass the seven-value
@@ -111,8 +149,9 @@ profile = CalibrationRunner(
 ).run(public_observations)
 ```
 
-The identity covers both the GR00T action-head checkpoint and the separately
-supplied Cosmos backbone. The emitted artifact uses
+The current identity hashes the weight shards in the combined GR00T checkpoint
+and the supplied Cosmos snapshot, as described under [Loading](#loading).
+The emitted artifact uses
 `apxinf.fp8-calibration.v1`. Runtime loading rejects
 the wrong model family, checkpoint identity, scale formula, missing or unknown
 consumer/site, incomplete provenance, and non-production data labels. The

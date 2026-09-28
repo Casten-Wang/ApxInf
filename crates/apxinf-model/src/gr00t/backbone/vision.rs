@@ -1035,7 +1035,7 @@ fn segmented_vision_sdpa(
             && head_dim == 64
             && std::env::var_os("APXINF_GR00T_LEGACY_VISION_BATCHED_ATTENTION").is_none()
         {
-            return kernels::attention::noncausal_batched_equal(
+            if let Some(output) = kernels::attention::try_noncausal_batched_equal(
                 cuda.context(),
                 q,
                 k,
@@ -1044,7 +1044,9 @@ fn segmented_vision_sdpa(
                 256,
                 n_heads,
                 head_dim,
-            );
+            )? {
+                return Ok(output);
+            }
         }
         let q = q.reshape(vec![total_rows, row_width])?;
         let k = k.reshape(vec![total_rows, row_width])?;

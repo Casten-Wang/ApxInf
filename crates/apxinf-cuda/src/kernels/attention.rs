@@ -1320,10 +1320,10 @@ pub fn segmented_noncausal_contiguous_output_bf16(
     Ok(None)
 }
 
-/// Optional SM87/SM110 specialization for the GR00T-sized non-causal BF16
-/// attention family. Returns `None` outside the measured production envelope
-/// so callers can preserve the normal FA2 dispatch as their fallback.
-pub(crate) const fn gr00t_hdim96_bm64_shape_supported(
+/// Supported envelope of the explicit SM87/SM110 non-causal BF16 BM64 kernel:
+/// 41 queries, 28/41/128 keys, 32 heads and head dimension 48.
+/// Callers select this specialization; the default FA2 dispatch is unchanged.
+pub(crate) const fn noncausal_hdim96_bm64_shape_supported(
     compute_major: u32,
     compute_minor: u32,
     query_tokens: usize,
@@ -1349,7 +1349,7 @@ pub fn noncausal_hdim96_bm64(
     let q_dims = q.shape().dims();
     let k_dims = k.shape().dims();
     let supported_shape = k_dims.first().is_some_and(|&key_tokens| {
-        gr00t_hdim96_bm64_shape_supported(
+        noncausal_hdim96_bm64_shape_supported(
             ctx.caps().compute_major,
             ctx.caps().compute_minor,
             q_dims.first().copied().unwrap_or(0),
@@ -1406,7 +1406,29 @@ pub fn noncausal_hdim96_bm64(
     Ok(None)
 }
 
-/// GR00T opt-in for multiple equal-length, contiguous vision segments.
+/// Try multiple equal-length, contiguous non-causal attention segments.
+///
+/// Returns `None` when FA2 was not compiled so callers can use their existing
+/// per-segment path. Operand validation and execution errors from an available
+/// provider are propagated.
+#[allow(clippy::too_many_arguments)]
+pub fn try_noncausal_batched_equal(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    batches: usize,
+    sequence_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Option<Tensor>> {
+    if !cfg!(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)) {
+        return Ok(None);
+    }
+    noncausal_batched_equal(ctx, q, k, v, batches, sequence_len, n_heads, head_dim).map(Some)
+}
+
+/// Explicit batched attention for multiple equal-length, contiguous segments.
 /// Each segment remains an independent FA2 batch; the public single-segment
 /// operator and its default dispatch are unchanged.
 pub fn noncausal_batched_equal(
@@ -1564,7 +1586,7 @@ pub fn noncausal_strided_qkv_hdim96_bm64(
     n_heads: usize,
     head_dim: usize,
 ) -> Result<Option<Tensor>> {
-    if !gr00t_hdim96_bm64_shape_supported(
+    if !noncausal_hdim96_bm64_shape_supported(
         ctx.caps().compute_major,
         ctx.caps().compute_minor,
         qkv.shape().dims().first().copied().unwrap_or(0),

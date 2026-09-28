@@ -571,8 +571,8 @@ extern "C" {
         activation: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
-    /// GR00T-only SM110 exact-shape packed8 BF16 bias/activation path.
-    pub fn apxinf_gr00t_bias_activation_bf16_packed8(
+    /// Packed8 BF16 bias/activation; aligned pointers and a width divisible by 8.
+    pub fn apxinf_bias_activation_bf16_packed8(
         input: *const c_void,
         bias: *const c_void,
         output: *mut c_void,

@@ -519,8 +519,8 @@ extern "C" cudaError_t apxinf_qk_rms_norm_mrope_bf16_with_threads(
     return cudaGetLastError();
 }
 
-// Compatibility entry: retain its established shape-only launch selection and
-// legacy environment switch. Device-aware callers use the explicit entry above.
+// Default operator launch. Callers with a measured launch policy use the
+// explicit entry above; this shared entry does not read model environment.
 extern "C" cudaError_t apxinf_qk_rms_norm_mrope_bf16(
     const void* query_input, const void* query_weight, void* query_output,
     const void* key_input, const void* key_weight, void* key_output,
@@ -528,15 +528,10 @@ extern "C" cudaError_t apxinf_qk_rms_norm_mrope_bf16(
     uint32_t seq_len, float eps, float theta, const void* pos_ids,
     uint32_t sec_h, uint32_t sec_w, void* stream)
 {
-    const bool legacy_threads =
-        std::getenv("APXINF_GR00T_LEGACY_QK_MROPE_THREADS") != nullptr;
-    const bool measured_shape = head_dim == 128 && query_heads == 16 &&
-                                key_heads == 8 && (seq_len == 90 || seq_len == 156);
-    const uint32_t threads = !legacy_threads && measured_shape ? 128 : BLOCK_SIZE;
     return apxinf_qk_rms_norm_mrope_bf16_with_threads(
         query_input, query_weight, query_output, key_input, key_weight, key_output,
         head_dim, query_heads, key_heads, seq_len, eps, theta, pos_ids,
-        sec_h, sec_w, threads, stream);
+        sec_h, sec_w, BLOCK_SIZE, stream);
 }
 
 extern "C" cudaError_t apxinf_rope_mrope_decode_bf16(

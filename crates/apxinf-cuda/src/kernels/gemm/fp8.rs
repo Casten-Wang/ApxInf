@@ -2113,7 +2113,28 @@ pub fn gemm_fp8_bf16_custom(
     Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
 }
 
-/// Private exact-shape GR00T DiT FC2 backend. This is intentionally separate
+/// Try the fixed-shape FP8 GEMM with separately rounded BF16 bias and residual.
+///
+/// Returns `None` when the optional CUTLASS backend was not compiled. With the
+/// backend available, the strict SM110 M41 N1536 K6144 operand contract and all
+/// execution errors are preserved.
+#[allow(clippy::too_many_arguments)]
+pub fn try_fp8_bias_then_residual_bf16(
+    ctx: &CudaContext,
+    activation: &Tensor,
+    activation_scale: f32,
+    weight: Fp8WeightView<'_>,
+    bias: &Tensor,
+    residual: &Tensor,
+) -> Result<Option<Tensor>> {
+    if !cfg!(apxinf_cutlass_gemm) {
+        return Ok(None);
+    }
+    gemm_fp8_bias_then_residual_bf16_m41(ctx, activation, activation_scale, weight, bias, residual)
+        .map(Some)
+}
+
+/// Explicit SM110 M41 N1536 K6144 epilogue. This is intentionally separate
 /// from the public FP8 GEMM planner: it fuses bias and residual while retaining
 /// all three production BF16 rounding boundaries.
 #[doc(hidden)]

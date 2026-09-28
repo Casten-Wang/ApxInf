@@ -39,6 +39,9 @@ class AutoPolicy:
 
         ``model_type`` overrides the value detected from the checkpoint. Extra
         ``kwargs`` pass through to the concrete policy's ``from_pretrained``.
+        GR00T requires ``backbone="/local/Cosmos-Reason2-2B"`` for architecture
+        and processor resources, in addition to ``model_dir`` containing all
+        GR00T inference weights. This asset is not inferred or downloaded.
 
         Built-in policies register themselves when :mod:`apxinf.policies` is
         imported (which always happens before this method is reachable), so the

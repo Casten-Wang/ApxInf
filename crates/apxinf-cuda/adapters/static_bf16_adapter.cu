@@ -101,17 +101,12 @@ extern "C" cudaError_t apxinf_static_bias_activation_bf16(
   return cudaGetLastError();
 }
 
-extern "C" cudaError_t apxinf_gr00t_bias_activation_bf16_packed8(
+extern "C" cudaError_t apxinf_bias_activation_bf16_packed8(
     const void* input, const void* bias, void* output,
     int rows, int cols, int activation, cudaStream_t stream) {
   if (input == nullptr || bias == nullptr || output == nullptr || rows <= 0 ||
       cols <= 0 || cols % 8 != 0 || (activation != 0 && activation != 1))
     return cudaErrorInvalidValue;
-  const bool supported =
-      (rows == 41 && activation == 0 && (cols == 1536 || cols == 4608)) ||
-      (rows == 41 && activation == 1 && cols == 6144) ||
-      ((rows == 256 || rows == 512) && activation == 1 && cols == 4096);
-  if (!supported) return cudaErrorInvalidValue;
   if (reinterpret_cast<uintptr_t>(input) % alignof(Bf16x8) != 0 ||
       reinterpret_cast<uintptr_t>(bias) % alignof(Bf16x8) != 0 ||
       reinterpret_cast<uintptr_t>(output) % alignof(Bf16x8) != 0)

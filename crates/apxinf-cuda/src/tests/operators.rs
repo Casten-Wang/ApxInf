@@ -83,7 +83,7 @@ fn sdpa_fa2_prefill_supports_direct_output_projection() {
 
 #[test]
 fn gr00t_hdim96_bm64_gate_is_exact_and_falls_back() {
-    use crate::kernels::attention::gr00t_hdim96_bm64_shape_supported as supported;
+    use crate::kernels::attention::noncausal_hdim96_bm64_shape_supported as supported;
 
     assert!(supported(8, 7, 41, 28, 32, 48));
     assert!(supported(8, 7, 41, 41, 32, 48));
@@ -2331,22 +2331,4 @@ fn cached_bias_then_residual_adaptive_layer_norm_1536_is_bitwise_exact_sm87_smal
         download_bf16_as_fp32(&legacy_normalized).unwrap(),
         download_bf16_as_fp32(&cached.normalized).unwrap()
     );
-}
-
-#[test]
-fn qk_rms_mrope_threads_preserve_per_architecture_shapes() {
-    use crate::kernels::rope::qk_rms_mrope_block_threads as threads;
-    for (sm, seq_len, expected) in [
-        (110, 90, 128),
-        (110, 156, 128),
-        (87, 90, 256),
-        (87, 156, 128),
-        (89, 156, 256),
-    ] {
-        assert_eq!(threads(sm, seq_len, 128, 16, 8, false), expected);
-        assert_eq!(threads(sm, seq_len, 128, 16, 8, true), 256);
-    }
-    assert_eq!(threads(110, 41, 128, 16, 8, false), 256);
-    assert_eq!(threads(110, 90, 64, 16, 8, false), 256);
-    assert_eq!(threads(87, 156, 128, 8, 8, false), 256);
 }

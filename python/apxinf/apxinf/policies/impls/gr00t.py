@@ -124,17 +124,26 @@ class Gr00tPolicy:
         noise_mode: str = "stream",
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> "Gr00tPolicy":
-        """Load a checkpoint and its official processor.
+        """Load GR00T weights and processor metadata with an explicit Cosmos asset.
 
-        ``backbone`` is the local Cosmos-Reason2-2B directory. FP8 additionally
-        requires ``calibration``. Raw observations use the same friendly keys as
+        ``model_dir`` contains both backbone and action-head inference weights,
+        plus NVIDIA's checkpoint processor metadata. Required ``backbone`` points
+        to the compatible local Cosmos-Reason2-2B architecture config and
+        tokenizer/image/video processor resources; it is not inferred or
+        downloaded. FP8 additionally requires ``calibration`` and retains the
+        Cosmos snapshot's weight shards for the current calibration identity
+        check, although inference weights are loaded from ``model_dir``.
+
+        Raw observations use the same friendly keys as
         Pi0.5 by default: ``observation/image``, ``observation/wrist_image``,
         ``observation/state`` and ``prompt``.
         """
         model_dir = Path(model_dir)
         if backbone is None:
             raise ValueError(
-                "Gr00tPolicy: backbone= must point to the local Cosmos-Reason2-2B directory"
+                "Gr00tPolicy: backbone= is required; pass the local Cosmos-Reason2-2B "
+                "config/processor asset directory. GR00T inference weights are read "
+                "from model_dir."
             )
         backbone = Path(backbone)
         if precision not in ("auto", "bf16", "fp8", "int8"):
