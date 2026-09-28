@@ -63,7 +63,7 @@ After preparation, normal loads do not require the source snapshot path.
 
 | Location | Required local assets |
 | --- | --- |
-| `model_dir` | GR00T `config.json` and SafeTensors weights (including the index and referenced shards for a sharded checkpoint); NVIDIA `processor_config.json`, `statistics.json`, and `embodiment_id.json`. The processor files may be at the checkpoint root or together in its `processor/` subdirectory. |
+| `model_dir` | GR00T `config.json` and SafeTensors weights (including the index and referenced shards for a sharded checkpoint); NVIDIA `processor_config.json` and `statistics.json`, with optional `embodiment_id.json`. The processor files may be at the checkpoint root or together in its `processor/` subdirectory. |
 | `model_dir/assets/cosmos/` | Matching Cosmos-Reason2-2B `config.json`, Qwen3-VL tokenizer, chat template, image/video processor resources, and the generated `apxinf_assets.json` manifest. No Cosmos inference weights are needed here. |
 
 The Cosmos resources commonly include `tokenizer.json`, `tokenizer_config.json`,
@@ -108,14 +108,15 @@ search environment variables, `/tmp/fakehub`, paths from checkpoint metadata,
 or the network. The checkpoint's `model_name` may refer to its training/export
 machine and is not used to guess a local snapshot.
 
-FP8 requires a calibration identity matching the selected resources. The new
-layout binds the GR00T weight shards and actual local resource hashes. A legacy
-calibration identity cannot be directly reused with this prepared directory.
-Legacy profiles remain supported with an explicit `backbone=` pointing to the
-complete original Cosmos snapshot, whose weight shards participate in the old
-identity check. Those Cosmos shards are not used as inference weights. Pass the
-calibration JSON explicitly with `calibration=` and a device-specific tactics
-database with `tactics=` when needed.
+FP8 requires a calibration identity matching the weights and selected resources,
+including GR00T's own model configuration and processor metadata. The versioned
+`gr00t-processor-v1` identity applies to both prepared bundles and explicit
+`backbone=` snapshots. Profiles created before this metadata binding was added
+are rejected for both layouts and require recalibration. An explicit full
+Cosmos snapshot still contributes its weight-shard hashes to the identity;
+those Cosmos shards are not used as inference weights. Pass the calibration
+JSON explicitly with `calibration=` and a device-specific tactics database with
+`tactics=` when needed.
 
 The generic command-line example uses the same default resource directory:
 
@@ -163,13 +164,23 @@ profile = CalibrationRunner(
 ).run(public_observations)
 ```
 
-The default identity hashes the combined GR00T checkpoint weights and the
-actual prepared configuration and processor resources, as described under
-[Loading](#loading). Use a calibration for that identity; preparing assets does
-not automatically convert an existing profile. A legacy profile is validated
-with the legacy identity only when its original complete Cosmos snapshot is
-selected explicitly. The emitted artifact uses
-`apxinf.fp8-calibration.v1`. Runtime loading rejects
+The identity hashes the GR00T checkpoint weights, the selected Cosmos resources,
+and versioned GR00T metadata. The metadata component uses
+`apxinf.gr00t-processor.v1` and binds the checkpoint-root `config.json`, plus
+`config.json`, `processor_config.json`, `statistics.json`, and optional
+`embodiment_id.json` in the directory actually selected for NVIDIA's processor.
+The checkpoint root wins when it has `processor_config.json`; otherwise an
+existing `processor/` directory is selected. Unselected copies do not affect
+the identity. File content is hashed after following valid metadata symlinks;
+broken links and non-files are rejected. Missing files have explicit identity
+markers for native callers supplying preprocessed tensors, while the public
+Python processor still requires its configuration and statistics files.
+
+Recalibrate using the selected files whenever their content changes or when
+upgrading from a profile without this metadata component. Preparing resources
+or editing an old profile's `model.checkpoint` does not perform calibration;
+there is no fallback to the previous identity for explicit snapshots. The
+shared artifact format remains `apxinf.fp8-calibration.v1`. Runtime loading rejects
 the wrong model family, checkpoint identity, scale formula, missing or unknown
 consumer/site, incomplete provenance, and non-production data labels. The
 profile is an external deployment artifact passed through `calibration=`; it is

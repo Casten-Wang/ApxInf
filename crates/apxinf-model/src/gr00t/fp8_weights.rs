@@ -140,7 +140,7 @@ impl Gr00tFp8Calibration {
         }
         if document.model.checkpoint != checkpoint {
             return Err(Error::Other(format!(
-                "GR00T FP8 calibration checkpoint identity mismatch: profile={}, runtime={checkpoint}",
+                "GR00T FP8 calibration checkpoint identity mismatch: profile={}, runtime={checkpoint}; regenerate calibration for the current weights and processor resources",
                 document.model.checkpoint
             )));
         }
@@ -633,7 +633,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/checkpoint_identity");
         assert_eq!(
             checkpoint_identity(&fixture, &fixture).unwrap(),
-            "sha256:d23faece91e5ba14630dd918ed491b712b32c905f153a2bbb5065f355b5df094"
+            "sha256:db8f2f5b6bf722562e68038fe7f0f7cd8f0acc4deec17d24ca69a126150fb256"
         );
     }
 
@@ -728,6 +728,55 @@ mod tests {
             &["action_head.other".into()],
         )
         .is_err());
+    }
+
+    #[test]
+    fn calibration_file_rejects_mutated_processor_resources() {
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(std::env::temp_dir().join(format!(
+            "apxinf-gr00t-calibration-processor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+        let root = &fixture.0;
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("model.safetensors"), b"test weights").unwrap();
+        for name in [
+            "processor_config.json",
+            "statistics.json",
+            "embodiment_id.json",
+        ] {
+            std::fs::write(root.join(name), b"{}\n").unwrap();
+        }
+        let identity = checkpoint_identity(root, root).unwrap();
+        let profile = root.join("calibration.json");
+        std::fs::write(
+            &profile,
+            document(112.0, 0.25).replace("sha256:test", &identity),
+        )
+        .unwrap();
+        let consumers = ["action_head.test".into()];
+        assert!(Gr00tFp8Calibration::from_json_file(&profile, root, root, &consumers).is_ok());
+        for name in [
+            "processor_config.json",
+            "statistics.json",
+            "embodiment_id.json",
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, b"{\"changed\":true}\n").unwrap();
+            let error =
+                Gr00tFp8Calibration::from_json_file(&profile, root, root, &consumers).unwrap_err();
+            assert!(error.to_string().contains("checkpoint identity mismatch"));
+            std::fs::write(&path, b"{}\n").unwrap();
+        }
     }
 
     #[test]

@@ -197,8 +197,9 @@ processor metadata remain in the GR00T checkpoint. `backbone=` is an optional
 local override for existing deployments. Loading does not search environment
 paths or checkpoint export paths, or download missing resources. See the
 [GR00T loading contract](../../doc/gr00t-n1.7.md#loading) for the required assets
-and a calibration identity matching the new layout for FP8. Legacy calibration
-identities cannot be directly reused with the prepared resource directory.
+and an FP8 calibration bound to the selected model/processor metadata. Profiles
+without the versioned GR00T processor identity require recalibration for both
+prepared resources and explicit `backbone=` snapshots.
 GR00T uses `precision=`, rather than PI0.5's `model_variant=`.
 
 ## Policy contract

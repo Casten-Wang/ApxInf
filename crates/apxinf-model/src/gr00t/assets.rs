@@ -1,7 +1,8 @@
 //! GR00T-local resource discovery and calibration content identities.
 //!
 //! The bundled layout needs Cosmos configuration and processor files, not a
-//! second tensor checkpoint. Explicit legacy assets retain their old identity.
+//! second tensor checkpoint. Calibration also binds the checkpoint processor
+//! metadata for both bundled assets and explicit legacy snapshots.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -14,6 +15,13 @@ use serde::Deserialize;
 const DEFAULT_SUBDIR: &str = "assets/cosmos";
 const MANIFEST: &str = "apxinf_assets.json";
 const SCHEMA: &str = "apxinf.gr00t-assets.v1";
+const PROCESSOR_SCHEMA: &str = "apxinf.gr00t-processor.v1";
+const PROCESSOR_NAMES: &[&str] = &[
+    "config.json",
+    "embodiment_id.json",
+    "processor_config.json",
+    "statistics.json",
+];
 const RESOURCE_NAMES: &[&str] = &[
     "config.json",
     "tokenizer_config.json",
@@ -213,8 +221,8 @@ fn asset_identity(root: &Path) -> Result<String> {
 
 /// Content identity shared with the model-neutral Python calibration runner.
 ///
-/// Bundled assets use a versioned resource identity. Legacy explicit snapshots
-/// retain the original two-weight-root identity, without relabeling profiles.
+/// Both asset layouts bind the selected checkpoint processor metadata. Profiles
+/// from before the processor-v1 identity must be regenerated, not relabeled.
 pub(super) fn checkpoint_identity(checkpoint: &Path, backbone: &Path) -> Result<String> {
     let primary = single_checkpoint_identity(checkpoint)?;
     let (name, backbone) =
@@ -224,10 +232,61 @@ pub(super) fn checkpoint_identity(checkpoint: &Path, backbone: &Path) -> Result<
             ("backbone", single_checkpoint_identity(backbone)?)
         };
     let mut digest = LocalSha256::new();
-    for (name, identity) in [("primary", primary), (name, backbone)] {
+    for (name, identity) in [
+        ("primary", primary),
+        (name, backbone),
+        ("gr00t-processor-v1", processor_identity(checkpoint)?),
+    ] {
         digest.update(name.as_bytes());
         digest.update(&[0]);
         digest.update(identity.as_bytes());
+        digest.update(&[0]);
+    }
+    Ok(format!("sha256:{}", digest.finish_hex()))
+}
+
+/// Mirror the public policy's root-first NVIDIA processor directory selection.
+/// Missing resources are recorded as well: native tensor-only callers may omit
+/// processor metadata, but adding it must invalidate a prior calibration.
+fn processor_identity(checkpoint: &Path) -> Result<String> {
+    let model_dir = if checkpoint.is_dir() {
+        checkpoint
+    } else {
+        checkpoint.parent().unwrap_or_else(|| Path::new("."))
+    };
+    let nested = model_dir.join("processor");
+    let root = if nested.is_dir() && !model_dir.join("processor_config.json").exists() {
+        nested.as_path()
+    } else {
+        model_dir
+    };
+    let mut digest = LocalSha256::new();
+    digest.update(PROCESSOR_SCHEMA.as_bytes());
+    digest.update(&[0]);
+    let files = std::iter::once((
+        "model/config.json".to_owned(),
+        model_dir.join("config.json"),
+    ))
+    .chain(
+        PROCESSOR_NAMES
+            .iter()
+            .map(|name| (format!("processor/{name}"), root.join(name))),
+    );
+    for (name, path) in files {
+        let content = if path.exists() || path.is_symlink() {
+            if !path.is_file() {
+                return Err(Error::Other(format!(
+                    "GR00T processor resource must be a file: {}",
+                    path.display()
+                )));
+            }
+            file_digest(&path)?
+        } else {
+            "missing".to_owned()
+        };
+        digest.update(name.as_bytes());
+        digest.update(&[0]);
+        digest.update(content.as_bytes());
         digest.update(&[0]);
     }
     Ok(format!("sha256:{}", digest.finish_hex()))
@@ -537,7 +596,7 @@ mod tests {
         );
         assert_eq!(
             checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap(),
-            "sha256:652d1192021049f00f97e3450a39f340271cbd5d97f3d37c10d91feffb0004d6"
+            "sha256:18c589ec37e968e774086d4f681cd51e985ed421db6420c66dbefdbd3bed017b"
         );
         assert_eq!(resolve_assets(&fixture.0, None).unwrap(), fixture.bundle());
         let renamed = fixture.0.join("relocated-cosmos");
@@ -548,18 +607,130 @@ mod tests {
         );
         assert_eq!(
             checkpoint_identity(&fixture.0, &renamed).unwrap(),
-            "sha256:652d1192021049f00f97e3450a39f340271cbd5d97f3d37c10d91feffb0004d6"
+            "sha256:18c589ec37e968e774086d4f681cd51e985ed421db6420c66dbefdbd3bed017b"
         );
     }
 
     #[test]
-    fn legacy_calibration_identity_stays_unchanged() {
+    fn legacy_snapshots_also_bind_processor_metadata() {
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/checkpoint_identity");
-        assert_eq!(
+        assert_ne!(
             checkpoint_identity(&fixture, &fixture).unwrap(),
             "sha256:d23faece91e5ba14630dd918ed491b712b32c905f153a2bbb5065f355b5df094"
         );
+    }
+
+    #[test]
+    fn processor_metadata_mutations_additions_and_removals_change_identity() {
+        let fixture = Fixture::new();
+        for name in PROCESSOR_NAMES {
+            std::fs::write(fixture.0.join(name), b"{}\n").unwrap();
+        }
+        let original = checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap();
+        for name in PROCESSOR_NAMES {
+            let path = fixture.0.join(name);
+            std::fs::write(&path, b"{\"changed\":true}\n").unwrap();
+            assert_ne!(
+                checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap(),
+                original
+            );
+            std::fs::remove_file(&path).unwrap();
+            assert_ne!(
+                checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap(),
+                original
+            );
+            std::fs::write(&path, b"{}\n").unwrap();
+            assert_eq!(
+                checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap(),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn processor_directory_selection_matches_the_public_policy() {
+        let fixture = Fixture::new();
+        let nested = fixture.0.join("processor");
+        std::fs::create_dir(&nested).unwrap();
+        for name in [
+            "processor_config.json",
+            "statistics.json",
+            "embodiment_id.json",
+        ] {
+            std::fs::write(nested.join(name), b"{}\n").unwrap();
+        }
+        let original = checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap();
+        // An unused root statistics file cannot shadow the selected nested one.
+        std::fs::write(fixture.0.join("statistics.json"), b"ignored").unwrap();
+        assert_eq!(
+            checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap(),
+            original
+        );
+        std::fs::write(nested.join("statistics.json"), b"changed").unwrap();
+        assert_ne!(
+            checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap(),
+            original
+        );
+        std::fs::write(nested.join("statistics.json"), b"{}\n").unwrap();
+        // Moving identical active metadata leaves its content identity unchanged.
+        for name in [
+            "processor_config.json",
+            "statistics.json",
+            "embodiment_id.json",
+        ] {
+            std::fs::rename(nested.join(name), fixture.0.join(name)).unwrap();
+        }
+        assert_eq!(
+            checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap(),
+            original
+        );
+        std::fs::write(nested.join("statistics.json"), b"unused").unwrap();
+        assert_eq!(
+            checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn nested_processor_and_model_configuration_are_both_bound() {
+        let fixture = Fixture::new();
+        let nested = fixture.0.join("processor");
+        std::fs::create_dir(&nested).unwrap();
+        for path in [fixture.0.join("config.json"), nested.join("config.json")] {
+            let original = checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap();
+            std::fs::write(&path, b"{}\n").unwrap();
+            assert_ne!(
+                checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap(),
+                original
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn processor_snapshot_symlinks_hash_contents_and_reject_broken_targets() {
+        let fixture = Fixture::new();
+        let resource = fixture.0.join("statistics.json");
+        let target = fixture.0.join("statistics-blob");
+        std::fs::write(&resource, b"{}\n").unwrap();
+        let original = checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap();
+        std::fs::rename(&resource, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &resource).unwrap();
+        assert_eq!(
+            checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap(),
+            original
+        );
+        std::fs::write(&target, b"changed").unwrap();
+        assert_ne!(
+            checkpoint_identity(&fixture.0, &fixture.bundle()).unwrap(),
+            original
+        );
+        std::fs::remove_file(&target).unwrap();
+        assert!(checkpoint_identity(&fixture.0, &fixture.bundle()).is_err());
+        std::fs::remove_file(&resource).unwrap();
+        std::fs::create_dir(&resource).unwrap();
+        assert!(checkpoint_identity(&fixture.0, &fixture.bundle()).is_err());
     }
 
     #[test]

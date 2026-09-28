@@ -33,6 +33,8 @@ from ._gr00t_assets import (
     MANIFEST as _ASSET_MANIFEST,
     asset_identity,
     prepare_assets as _prepare_assets,
+    processor_directory,
+    processor_identity,
     resolve_assets,
 )
 
@@ -138,7 +140,7 @@ class Gr00tPolicy:
         under that directory. ``backbone`` optionally overrides this location
         for existing scripts. No resources are downloaded. FP8 additionally
         requires ``calibration`` matching the selected weights and resources;
-        legacy explicit snapshots retain their original calibration identity.
+        FP8 profiles for both layouts bind the selected processor metadata.
 
         Raw observations use the same friendly keys as
         Pi0.5 by default: ``observation/image``, ``observation/wrist_image``,
@@ -202,8 +204,10 @@ class Gr00tPolicy:
     def checkpoint_identity(model_dir, backbone=None) -> str:
         """Bind FP8 calibration to weights and the selected local resources.
 
-        Prepared bundles bind actual processor/configuration contents. Explicit
-        legacy snapshots preserve the existing identity including Cosmos shards.
+        All layouts bind the model config and selected GR00T processor metadata
+        with a versioned identity. Prepared bundles additionally bind Cosmos
+        resource contents; explicit legacy snapshots still bind Cosmos shards.
+        Profiles created before the processor identity was added must be recalibrated.
         """
         backbone = resolve_assets(model_dir, backbone)
         manifest = backbone / _ASSET_MANIFEST
@@ -215,6 +219,7 @@ class Gr00tPolicy:
         for name, value in (
             ("primary", _single_checkpoint_identity(Path(model_dir))),
             (asset_name, identity),
+            ("gr00t-processor-v1", processor_identity(model_dir)),
         ):
             digest.update(name.encode("utf-8"))
             digest.update(b"\0")
@@ -440,12 +445,7 @@ class _NvidiaProcessorAdapter:
                 "Gr00tPolicy requires NVIDIA Isaac-GR00T and transformers. "
                 "Install the pinned Isaac-GR00T environment before loading a policy."
             ) from error
-        processor_dir = (
-            model_dir / "processor"
-            if (model_dir / "processor").is_dir()
-            and not (model_dir / "processor_config.json").exists()
-            else model_dir
-        )
+        processor_dir = processor_directory(model_dir)
         processor = AutoProcessor.from_pretrained(
             processor_dir,
             model_name=str(backbone.resolve()),

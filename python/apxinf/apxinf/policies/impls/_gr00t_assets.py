@@ -17,6 +17,7 @@ from typing import Mapping
 DEFAULT_SUBDIR = "assets/cosmos"
 MANIFEST = "apxinf_assets.json"
 SCHEMA = "apxinf.gr00t-assets.v1"
+PROCESSOR_SCHEMA = "apxinf.gr00t-processor.v1"
 
 RESOURCE_NAMES = frozenset(
     {
@@ -167,6 +168,45 @@ def asset_identity(root) -> str:
     for relative in sorted(files, key=lambda name: name.encode("utf-8")):
         digest.update(relative.encode("utf-8") + b"\0")
         digest.update(files[relative].encode("ascii") + b"\0")
+    return f"sha256:{digest.hexdigest()}"
+
+
+def processor_directory(checkpoint) -> Path:
+    """Select the same local directory passed to NVIDIA's AutoProcessor."""
+    checkpoint = Path(checkpoint)
+    root = checkpoint if checkpoint.is_dir() else checkpoint.parent
+    nested = root / "processor"
+    return nested if nested.is_dir() and not (root / "processor_config.json").exists() else root
+
+
+def processor_identity(checkpoint) -> str:
+    """Bind model/factory config and the selected GR00T processor metadata.
+
+    Missing files have explicit markers for native tensor-only checkpoints.
+    NVIDIA's Python processor still enforces its required files when loaded.
+    Metadata symlinks are followed, but broken links and non-files are rejected.
+    """
+    checkpoint = Path(checkpoint)
+    root = checkpoint if checkpoint.is_dir() else checkpoint.parent
+    selected = processor_directory(checkpoint)
+    files = {
+        "model/config.json": root / "config.json",
+        "processor/config.json": selected / "config.json",
+        "processor/embodiment_id.json": selected / "embodiment_id.json",
+        "processor/processor_config.json": selected / "processor_config.json",
+        "processor/statistics.json": selected / "statistics.json",
+    }
+    digest = hashlib.sha256(PROCESSOR_SCHEMA.encode("utf-8") + b"\0")
+    for label in sorted(files, key=lambda value: value.encode("utf-8")):
+        path = files[label]
+        if path.is_file():
+            value = _file_sha256(path)
+        elif path.exists() or path.is_symlink():
+            raise ValueError(f"GR00T processor metadata must be a readable file: {path}")
+        else:
+            value = "missing"
+        digest.update(label.encode("utf-8") + b"\0")
+        digest.update(value.encode("ascii") + b"\0")
     return f"sha256:{digest.hexdigest()}"
 
 

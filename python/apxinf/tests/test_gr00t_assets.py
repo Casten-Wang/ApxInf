@@ -265,5 +265,95 @@ class Gr00tAssetsTest(unittest.TestCase):
         expected = "sha256:" + hashlib.sha256(preimage).hexdigest()
         self.assertEqual(assets.asset_identity(self.prepare()), expected)
 
+    def test_processor_identity_missing_files_match_independent_protocol(self):
+        preimage = (
+            b"apxinf.gr00t-processor.v1\0"
+            b"model/config.json\0missing\0"
+            b"processor/config.json\0missing\0"
+            b"processor/embodiment_id.json\0missing\0"
+            b"processor/processor_config.json\0missing\0"
+            b"processor/statistics.json\0missing\0"
+        )
+        expected = "sha256:" + hashlib.sha256(preimage).hexdigest()
+        self.assertEqual(
+            expected,
+            "sha256:469b0dc9478d53a99d6383c35cc60a473a47e84f8f1358f3c78c02074a77f10a",
+        )
+        self.assertEqual(assets.processor_identity(self.model), expected)
+
+    def test_processor_identity_tracks_all_five_selected_files(self):
+        processor = self.model / "processor"
+        processor.mkdir()
+        paths = [
+            self.model / "config.json",
+            processor / "config.json",
+            processor / "embodiment_id.json",
+            processor / "processor_config.json",
+            processor / "statistics.json",
+        ]
+        for index, path in enumerate(paths):
+            path.write_text(json.dumps({"fixture": index}))
+        self.assertEqual(assets.processor_directory(self.model), processor)
+        initial = assets.processor_identity(self.model)
+        for path in paths:
+            with self.subTest(path=path.relative_to(self.model)):
+                original = path.read_bytes()
+                path.write_bytes(original + b"\n")
+                self.assertNotEqual(assets.processor_identity(self.model), initial)
+                path.write_bytes(original)
+
+    def test_processor_root_precedes_unused_nested_metadata(self):
+        for name in ("processor_config.json", "statistics.json"):
+            (self.model / name).write_text("{}")
+        nested = self.model / "processor"
+        nested.mkdir()
+        (nested / "statistics.json").write_text("unused")
+        self.assertEqual(assets.processor_directory(self.model), self.model)
+        initial = assets.processor_identity(self.model)
+        (nested / "statistics.json").write_text("still unused")
+        self.assertEqual(assets.processor_identity(self.model), initial)
+        (self.model / "statistics.json").write_text('{"changed": true}')
+        self.assertNotEqual(assets.processor_identity(self.model), initial)
+
+    def test_processor_identity_is_relocatable_and_accepts_weight_file_path(self):
+        (self.model / "model.safetensors").write_bytes(b"weights")
+        (self.model / "config.json").write_text("{}")
+        (self.model / "processor_config.json").write_text("{}")
+        (self.model / "statistics.json").write_text("{}")
+        initial = assets.processor_identity(self.model)
+        self.assertEqual(assets.processor_identity(self.model / "model.safetensors"), initial)
+        copied = self.root / "moved-model"
+        shutil.copytree(self.model, copied)
+        self.assertEqual(assets.processor_identity(copied), initial)
+        nested = copied / "processor"
+        nested.mkdir()
+        shutil.copyfile(copied / "config.json", nested / "config.json")
+        for name in ("processor_config.json", "statistics.json"):
+            (copied / name).rename(nested / name)
+        self.assertEqual(assets.processor_directory(copied), nested)
+        self.assertEqual(assets.processor_identity(copied), initial)
+
+    def test_processor_metadata_symlinks_bind_target_content(self):
+        path = self.model / "statistics.json"
+        path.write_bytes(b"original statistics")
+        initial = assets.processor_identity(self.model)
+        target = self.root / "statistics-target"
+        target.write_bytes(path.read_bytes())
+        path.unlink()
+        path.symlink_to(target)
+        self.assertEqual(assets.processor_identity(self.model), initial)
+        target.write_bytes(b"changed statistics")
+        self.assertNotEqual(assets.processor_identity(self.model), initial)
+        target.unlink()
+        with self.assertRaisesRegex(ValueError, "metadata must be a readable file"):
+            assets.processor_identity(self.model)
+
+    def test_processor_metadata_directories_are_rejected(self):
+        (self.model / "processor_config.json").mkdir()
+        (self.model / "processor").mkdir()
+        self.assertEqual(assets.processor_directory(self.model), self.model)
+        with self.assertRaisesRegex(ValueError, "metadata must be a readable file"):
+            assets.processor_identity(self.model)
+
 if __name__ == "__main__":
     unittest.main()

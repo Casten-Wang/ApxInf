@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -27,8 +29,10 @@ def test_prepared_directory_loads_without_backbone(tmp_path, monkeypatch, precis
         (source / name).write_bytes(b"{}\n")
     bundle = Gr00tPolicy.prepare_assets(model, source)
     identity = Gr00tPolicy.checkpoint_identity(model)
-    # Independently generated using hashlib, shared with the Rust unit fixture.
-    assert identity == "sha256:652d1192021049f00f97e3450a39f340271cbd5d97f3d37c10d91feffb0004d6"
+    # Independent byte-protocol vector: this fixture also has a primary config.
+    assert identity == "sha256:48b31c2a57686509f82b84ea2e7f9c5c017454b764d40da03f9d72778c583919"
+    # A profile made before GR00T processor metadata was included must not match.
+    assert identity != "sha256:652d1192021049f00f97e3450a39f340271cbd5d97f3d37c10d91feffb0004d6"
     assert identity == Gr00tPolicy.checkpoint_identity(model, bundle)
     calls = []
 
@@ -297,6 +301,57 @@ def test_checkpoint_identity_covers_primary_and_backbone(tmp_path):
 
     (backbone / "model.safetensors").write_bytes(b"backbone-v2")
     assert identity != Gr00tPolicy.checkpoint_identity(primary, backbone)
+
+
+def test_explicit_legacy_snapshot_does_not_preserve_old_calibration_identity(tmp_path):
+    primary, backbone = tmp_path / "primary", tmp_path / "backbone"
+    old = hashlib.sha256()
+    for name, root, content in (
+        ("primary", primary, b"primary-v1"),
+        ("backbone", backbone, b"backbone-v1"),
+    ):
+        root.mkdir()
+        (root / "model.safetensors").write_bytes(content)
+        file_identity = "sha256:" + hashlib.sha256(b"model.safetensors\0" + content).hexdigest()
+        old.update(name.encode() + b"\0" + file_identity.encode("ascii") + b"\0")
+    assert Gr00tPolicy.checkpoint_identity(primary, backbone) != "sha256:" + old.hexdigest()
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "config.json", "processor/config.json", "processor/embodiment_id.json",
+        "processor/processor_config.json", "processor/statistics.json",
+    ],
+)
+def test_processor_mutation_changes_calibration_checkpoint(tmp_path, prepared, relative):
+    primary, source = tmp_path / "primary", tmp_path / "source"
+    primary.mkdir()
+    source.mkdir()
+    (primary / "processor").mkdir()
+    (primary / "model.safetensors").write_bytes(b"primary-v1")
+    (source / "model.safetensors").write_bytes(b"backbone-v1")
+    for name in ("config.json", "tokenizer_config.json", "preprocessor_config.json", "tokenizer.json"):
+        (source / name).write_text("{}")
+    for name in (
+        "config.json", "processor/config.json", "processor/embodiment_id.json",
+        "processor/processor_config.json", "processor/statistics.json",
+    ):
+        (primary / name).write_text("{}")
+    backbone = Gr00tPolicy.prepare_assets(primary, source) if prepared else source
+    identity = Gr00tPolicy.checkpoint_identity(primary, backbone)
+    policy = Gr00tPolicy(_FakeModel(), processor=_FakeProcessor(), action_dim=3)
+    profile = CalibrationRunner(
+        policy,
+        policy.calibration_plan(),
+        checkpoint=identity,
+        data_identity="sha256:fixed-observations",
+        source_revision="test-revision",
+        device={"requested": "cuda:0", "host": "test-host"},
+    ).run([{"prompt": "test"}])
+    (primary / relative).write_text('{"changed": true}')
+    assert profile["model"]["checkpoint"] != Gr00tPolicy.checkpoint_identity(primary, backbone)
 
 
 def test_w8a8_is_not_a_public_precision_name(tmp_path):
