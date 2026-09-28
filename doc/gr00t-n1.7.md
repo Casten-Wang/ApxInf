@@ -40,16 +40,31 @@ uses W8A8 only for the validated FFN and eligible fused self-QKV matrices.
 
 ## Loading
 
-**Supply both `model_dir` and `backbone` as local paths**, including when using
-`AutoPolicy`. The GR00T checkpoint already packages the backbone and action-head
-weights together; all inference weight tensors are loaded from `model_dir`.
-The separate `backbone` argument supplies the compatible Cosmos-Reason2-2B
-architecture configuration and official processor resources.
+Load GR00T from one local `model_dir`. The checkpoint already packages the
+backbone and action-head weights together; all inference weight tensors come
+from that directory. Configuration and official processor resources live beside
+them in `model_dir/assets/cosmos/`.
 
-| Argument | Required local assets |
+Prepare those resources once from a compatible local Cosmos-Reason2-2B snapshot:
+
+```python
+from apxinf import Gr00tPolicy
+
+Gr00tPolicy.prepare_assets(
+    "/models/GR00T-N1.7-LIBERO/libero_10",
+    "/models/nvidia/Cosmos-Reason2-2B",
+)
+```
+
+The method copies configuration, tokenizer, image/video processor and
+chat-template resources and writes an `apxinf_assets.json` manifest in the
+asset directory. It does not copy Cosmos weight shards or download files.
+After preparation, normal loads do not require the source snapshot path.
+
+| Location | Required local assets |
 | --- | --- |
 | `model_dir` | GR00T `config.json` and SafeTensors weights (including the index and referenced shards for a sharded checkpoint); NVIDIA `processor_config.json`, `statistics.json`, and `embodiment_id.json`. The processor files may be at the checkpoint root or together in its `processor/` subdirectory. |
-| `backbone` | A compatible Cosmos-Reason2-2B asset directory containing `config.json` and its Qwen3-VL tokenizer, chat template, image processor, and video processor resources. Preserve the snapshot's processor/tokenizer files and any files they reference. |
+| `model_dir/assets/cosmos/` | Matching Cosmos-Reason2-2B `config.json`, Qwen3-VL tokenizer, chat template, image/video processor resources, and the generated `apxinf_assets.json` manifest. No Cosmos inference weights are needed here. |
 
 The Cosmos resources commonly include `tokenizer.json`, `tokenizer_config.json`,
 `chat_template.json`, `preprocessor_config.json`, and
@@ -57,14 +72,14 @@ The Cosmos resources commonly include `tokenizer.json`, `tokenizer_config.json`,
 merges files. Rust reads the Cosmos architecture config; NVIDIA's processor
 loads its own resources from the same directory. Install the compatible
 Isaac-GR00T and Transformers environment before loading a policy. Processor
-loading uses `local_files_only=True`.
+loading uses `local_files_only=True`; the official processor and inference
+arithmetic are unchanged.
 
 ```python
 from apxinf import AutoPolicy
 
 policy = AutoPolicy.from_pretrained(
     "/models/GR00T-N1.7-LIBERO/libero_10",
-    backbone="/models/nvidia/Cosmos-Reason2-2B",
     precision="bf16",
 )
 
@@ -85,29 +100,28 @@ result = policy.infer({
 actions = result["actions"]
 ```
 
-The Python policy forwards `backbone` as `ModelRunner.load(...,
-assets={"backbone": ...})`; native Rust callers set
-`LoadOptions.assets["backbone"]`. ApxInf does not resolve this local directory
-from an environment variable or checkpoint metadata, and does not download it.
-The checkpoint's `model_name` may name a Hub repository or a path from its
-training/export machine; it does not establish an available, compatible local
-snapshot. Omitting `backbone=` therefore raises an error.
+Python `AutoPolicy` and Rust `AutoModel` both resolve the prepared directory by
+default. Python's `backbone=` and Rust's `LoadOptions.assets["backbone"]` remain
+optional local overrides for existing scripts. Missing or invalid default
+resources produce an error with preparation instructions. Loading does not
+search environment variables, `/tmp/fakehub`, paths from checkpoint metadata,
+or the network. The checkpoint's `model_name` may refer to its training/export
+machine and is not used to guess a local snapshot.
 
-BF16 and INT8 inference do not read the Cosmos SafeTensors files. **Current FP8
-calibration identity validation additionally hashes the weight shards in both
-supplied directories.** For FP8, retain the complete Cosmos snapshot used to
-produce the calibration JSON, including those shards. They participate in the
-identity check; the model's inference weights still come from the GR00T
-checkpoint. Pass the calibration JSON explicitly with `calibration=` and a
-device-specific tactics database with `tactics=` when needed.
+FP8 requires a calibration identity matching the selected resources. The new
+layout binds the GR00T weight shards and actual local resource hashes. A legacy
+calibration identity cannot be directly reused with this prepared directory.
+Legacy profiles remain supported with an explicit `backbone=` pointing to the
+complete original Cosmos snapshot, whose weight shards participate in the old
+identity check. Those Cosmos shards are not used as inference weights. Pass the
+calibration JSON explicitly with `calibration=` and a device-specific tactics
+database with `tactics=` when needed.
 
-The generic command-line example accepts the same second path through its
-existing policy options:
+The generic command-line example uses the same default resource directory:
 
 ```bash
 python python/apxinf/examples/autopolicy_infer.py \
-  --model-dir /models/GR00T-N1.7-LIBERO/libero_10 --precision bf16 \
-  --policy-options '{"backbone":"/models/nvidia/Cosmos-Reason2-2B"}'
+  --model-dir /models/GR00T-N1.7-LIBERO/libero_10 --precision bf16
 ```
 
 For LIBERO, GR00T's official state contract has eight values: XYZ, axis-angle
@@ -140,7 +154,7 @@ plan = policy.calibration_plan()
 profile = CalibrationRunner(
     policy,
     plan,
-    checkpoint=Gr00tPolicy.checkpoint_identity(checkpoint, backbone),
+    checkpoint=Gr00tPolicy.checkpoint_identity(checkpoint),
     data_identity=representative_dataset_identity,
     source_revision=source_revision,
     device={"requested": "cuda:0", "host": host_identity},
@@ -149,9 +163,12 @@ profile = CalibrationRunner(
 ).run(public_observations)
 ```
 
-The current identity hashes the weight shards in the combined GR00T checkpoint
-and the supplied Cosmos snapshot, as described under [Loading](#loading).
-The emitted artifact uses
+The default identity hashes the combined GR00T checkpoint weights and the
+actual prepared configuration and processor resources, as described under
+[Loading](#loading). Use a calibration for that identity; preparing assets does
+not automatically convert an existing profile. A legacy profile is validated
+with the legacy identity only when its original complete Cosmos snapshot is
+selected explicitly. The emitted artifact uses
 `apxinf.fp8-calibration.v1`. Runtime loading rejects
 the wrong model family, checkpoint identity, scale formula, missing or unknown
 consumer/site, incomplete provenance, and non-production data labels. The
@@ -194,7 +211,7 @@ action D2H; it excludes simulator and raw-observation preprocessing time.
 ```bash
 python scripts/bench_gr00t.py \
   --checkpoint /models/GR00T-N1.7-LIBERO/libero_10 \
-  --backbone /models/nvidia/Cosmos-Reason2-2B \
+  --backbone /models/GR00T-N1.7-LIBERO/libero_10/assets/cosmos \
   --fixture devlocal/gr00t-n1d7/fixtures/libero-two-view \
   --precision bf16 \
   --warmup 10 \
@@ -217,7 +234,6 @@ leaving the existing OpenPI state wire format unchanged for other policies:
 python scripts/eval_libero.py \
   --backend in-process \
   --model-dir /models/GR00T-N1.7-LIBERO/libero_10 \
-  --backbone /models/nvidia/Cosmos-Reason2-2B \
   --precision bf16 \
   --suite libero_10 \
   --trials-per-task 10 \

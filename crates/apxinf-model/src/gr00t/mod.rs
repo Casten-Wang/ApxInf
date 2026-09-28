@@ -7,6 +7,8 @@
 #[cfg(any(feature = "cuda", test))]
 mod action_weights;
 #[cfg(any(feature = "cuda", test))]
+mod assets;
+#[cfg(any(feature = "cuda", test))]
 mod backbone;
 #[cfg(any(feature = "cuda", test))]
 mod backend;

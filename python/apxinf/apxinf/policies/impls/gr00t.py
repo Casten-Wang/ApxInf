@@ -29,6 +29,12 @@ from ...calibration import (
 )
 from ...processors.transforms import has_key, lookup_key
 from ..registry import register_policy
+from ._gr00t_assets import (
+    MANIFEST as _ASSET_MANIFEST,
+    asset_identity,
+    prepare_assets as _prepare_assets,
+    resolve_assets,
+)
 
 __all__ = ["Gr00tPolicy"]
 
@@ -124,28 +130,22 @@ class Gr00tPolicy:
         noise_mode: str = "stream",
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> "Gr00tPolicy":
-        """Load GR00T weights and processor metadata with an explicit Cosmos asset.
+        """Load GR00T and its prepared local processor/configuration resources.
 
         ``model_dir`` contains both backbone and action-head inference weights,
-        plus NVIDIA's checkpoint processor metadata. Required ``backbone`` points
-        to the compatible local Cosmos-Reason2-2B architecture config and
-        tokenizer/image/video processor resources; it is not inferred or
-        downloaded. FP8 additionally requires ``calibration`` and retains the
-        Cosmos snapshot's weight shards for the current calibration identity
-        check, although inference weights are loaded from ``model_dir``.
+        plus NVIDIA's checkpoint processor metadata. By default, configuration
+        and tokenizer/image/video resources are verified in ``assets/cosmos``
+        under that directory. ``backbone`` optionally overrides this location
+        for existing scripts. No resources are downloaded. FP8 additionally
+        requires ``calibration`` matching the selected weights and resources;
+        legacy explicit snapshots retain their original calibration identity.
 
         Raw observations use the same friendly keys as
         Pi0.5 by default: ``observation/image``, ``observation/wrist_image``,
         ``observation/state`` and ``prompt``.
         """
         model_dir = Path(model_dir)
-        if backbone is None:
-            raise ValueError(
-                "Gr00tPolicy: backbone= is required; pass the local Cosmos-Reason2-2B "
-                "config/processor asset directory. GR00T inference weights are read "
-                "from model_dir."
-            )
-        backbone = Path(backbone)
+        backbone = resolve_assets(model_dir, backbone)
         if precision not in ("auto", "bf16", "fp8", "int8"):
             raise ValueError(
                 "Gr00tPolicy: precision must be 'auto', 'bf16', 'fp8', or 'int8'"
@@ -189,16 +189,36 @@ class Gr00tPolicy:
         )
 
     @staticmethod
-    def checkpoint_identity(model_dir, backbone) -> str:
-        """Return the content identity required by a GR00T FP8 manifest."""
+    def prepare_assets(model_dir, source) -> Path:
+        """Prepare local config/processor resources once for single-path loading.
+
+        Copies compatible Cosmos resources into ``model_dir/assets/cosmos``;
+        no tensor weights are copied, downloaded or modified. An existing
+        bundle is never overwritten. FP8 needs a matching calibration identity.
+        """
+        return _prepare_assets(model_dir, source)
+
+    @staticmethod
+    def checkpoint_identity(model_dir, backbone=None) -> str:
+        """Bind FP8 calibration to weights and the selected local resources.
+
+        Prepared bundles bind actual processor/configuration contents. Explicit
+        legacy snapshots preserve the existing identity including Cosmos shards.
+        """
+        backbone = resolve_assets(model_dir, backbone)
+        manifest = backbone / _ASSET_MANIFEST
+        if manifest.exists() or manifest.is_symlink():
+            asset_name, identity = "cosmos-assets-v1", asset_identity(backbone)
+        else:
+            asset_name, identity = "backbone", _single_checkpoint_identity(backbone)
         digest = hashlib.sha256()
-        for name, root in (
-            ("primary", Path(model_dir)),
-            ("backbone", Path(backbone)),
+        for name, value in (
+            ("primary", _single_checkpoint_identity(Path(model_dir))),
+            (asset_name, identity),
         ):
             digest.update(name.encode("utf-8"))
             digest.update(b"\0")
-            digest.update(_single_checkpoint_identity(root).encode("ascii"))
+            digest.update(value.encode("ascii"))
             digest.update(b"\0")
         return "sha256:" + digest.hexdigest()
 
