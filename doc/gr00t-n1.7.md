@@ -125,21 +125,21 @@ not copied into the read-only checkpoint and is not committed to this tree.
 - Fuse quantization, normalization, RoPE, attention, and projection epilogues to reduce kernel launches and intermediate tensors.
 - GR00T explicitly selects optimized operations; shared default paths and interfaces remain compatible.
 
-## Performance
+## Best measured performance
 
 | Device | Precision | 1-view P50 | 2-view P50 |
 | --- | --- | ---: | ---: |
-| Thor | BF16 | | |
-| Thor | FP8 | | |
-| Orin | BF16 | | |
-| Orin | W8A8 | | |
+| Thor | BF16 | 51.834 ms | 54.216 ms |
+| Thor | FP8 | 32.557 ms | 35.436 ms |
+| Orin | BF16 | 75.778 ms | 84.864 ms |
+| Orin | W8A8 | 56.711 ms | 64.924 ms |
 
 ## LIBERO-10 task accuracy
 
 | Device | Precision | Episodes | Successes | Success rate |
 | --- | --- | ---: | ---: | ---: |
 | Thor | BF16 | 100 | 94 | 94.0% |
-| Thor | FP8 | 100 | 90 | 90.0% |
+| Thor | FP8 | 100 | 92 | 92.0% |
 | Orin | BF16 | 100 | 93 | 93.0% |
 | Orin | W8A8 | 100 | 93 | 93.0% |
 
