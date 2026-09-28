@@ -119,6 +119,33 @@ consumer/site, incomplete provenance, and non-production data labels. The
 profile is an external deployment artifact passed through `calibration=`; it is
 not copied into the read-only checkpoint and is not committed to this tree.
 
+## Performance optimizations
+
+- Optimize Thor BF16/FP8 and Orin BF16/W8A8 inference.
+- Fuse quantization, normalization, RoPE, attention, and projection epilogues to reduce kernel launches and intermediate tensors.
+- GR00T explicitly selects optimized operations; shared default paths and interfaces remain compatible.
+
+## Performance
+
+| Device | Precision | 1-view P50 | 2-view P50 |
+| --- | --- | ---: | ---: |
+| Thor | BF16 | | |
+| Thor | FP8 | | |
+| Orin | BF16 | | |
+| Orin | W8A8 | | |
+
+## LIBERO-10 task accuracy
+
+| Device | Precision | Episodes | Successes | Success rate |
+| --- | --- | ---: | ---: | ---: |
+| Thor | BF16 | 100 | 94 | 94.0% |
+| Thor | FP8 | 100 | 90 | 90.0% |
+| Orin | BF16 | 100 | 93 | 93.0% |
+| Orin | W8A8 | 100 | 93 | 93.0% |
+
+Two views, 10 episodes for each of the 10 tasks, a 720-step limit, and eight
+executed actions per chunk.
+
 ## Fixed-input benchmark
 
 The maintained runner uses tensors produced by the official NVIDIA processor.
@@ -143,9 +170,6 @@ bundled database merely to bypass provenance validation. The report records
 P50/P95 and the complete normalized model-core output. Generated fixtures,
 reference dumps, logs, tactic databases, and result JSON belong under
 `devlocal/gr00t-n1d7/` and are not committed.
-
-See [performance and tuning](gr00t-performance-tactics.md) for optimization
-results and device-local tuning commands.
 
 The repository's shared LIBERO evaluator selects the GR00T state adapter while
 leaving the existing OpenPI state wire format unchanged for other policies:
