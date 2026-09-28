@@ -71,7 +71,7 @@ extern "C" {
         stream: cudaStream_t,
     ) -> i32;
     #[cfg(apxinf_cutlass_gemm)]
-    pub fn apxinf_gr00t_cutlass_fp8_m41_fc1_bias_gelu_quant_e4m3(
+    pub fn apxinf_static_cutlass_fp8_gemm_bias_gelu_quant_e4m3_m41(
         activation: *const c_void,
         weight: *const c_void,
         bias: *const c_void,

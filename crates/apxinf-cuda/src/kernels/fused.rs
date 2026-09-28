@@ -163,7 +163,7 @@ pub fn try_fp8_bias_gelu_quant_e4m3_m41(
     {
         let output = fp8_output(ctx, 41, 6144)?;
         let status = unsafe {
-            ffi::apxinf_gr00t_cutlass_fp8_m41_fc1_bias_gelu_quant_e4m3(
+            ffi::apxinf_static_cutlass_fp8_gemm_bias_gelu_quant_e4m3_m41(
                 gpu_ptr(activation)?,
                 gpu_ptr(weight)?,
                 gpu_ptr(bias)?,
