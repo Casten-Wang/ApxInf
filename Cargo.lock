@@ -109,6 +109,8 @@ name = "apxinf-cuda-new"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
+ "apxinf-loader",
+ "apxinf-tokenizer",
  "half",
 ]
 
