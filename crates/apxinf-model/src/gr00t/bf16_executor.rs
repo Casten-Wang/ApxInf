@@ -23,6 +23,13 @@ impl Gr00tPrecisionExecution for Gr00tBf16Execution {
 
     const NAME: &'static str = "bf16";
     const SUPPORTS_CALIBRATION: bool = true;
+    const USE_HDIM96_BM64_ATTENTION: bool = true;
+    const USE_FUSED_QK_RMS_MROPE: bool = true;
+    const QK_RMS_MROPE_LEGACY_ENV: Option<&'static str> =
+        Some("APXINF_GR00T_BF16_LEGACY_QK_RMS_MROPE");
+    const USE_DIRECT_BF16_VISION_SEGMENT_OUTPUT: bool = true;
+    const USE_PRECOMPUTED_BF16_VISION_ROPE: bool = true;
+    const USE_FUSED_BF16_VISION_MLP_RESIDUAL_NORM: bool = true;
 
     fn transfer_dense(
         &self,
@@ -72,4 +79,34 @@ pub(super) fn build(
     backend: Arc<RuntimeBackend>,
 ) -> Result<Gr00tBf16Executor> {
     Gr00tExecutor::from_backend(config, backbone, weights, Gr00tBf16Execution, backend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bf16_explicitly_opts_into_hdim96_bm64_attention() {
+        assert!(Gr00tBf16Execution::USE_HDIM96_BM64_ATTENTION);
+    }
+
+    #[test]
+    fn bf16_explicitly_opts_into_qk_rms_mrope_fusion() {
+        assert!(Gr00tBf16Execution::USE_FUSED_QK_RMS_MROPE);
+    }
+
+    #[test]
+    fn bf16_explicitly_opts_into_direct_vision_segment_output() {
+        assert!(Gr00tBf16Execution::USE_DIRECT_BF16_VISION_SEGMENT_OUTPUT);
+    }
+
+    #[test]
+    fn bf16_explicitly_opts_into_precomputed_vision_rope() {
+        assert!(Gr00tBf16Execution::USE_PRECOMPUTED_BF16_VISION_ROPE);
+    }
+
+    #[test]
+    fn bf16_explicitly_opts_into_vision_mlp_residual_norm_fusion() {
+        assert!(Gr00tBf16Execution::USE_FUSED_BF16_VISION_MLP_RESIDUAL_NORM);
+    }
 }

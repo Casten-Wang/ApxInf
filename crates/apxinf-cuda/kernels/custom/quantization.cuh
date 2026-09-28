@@ -43,6 +43,24 @@ __global__ void quantize_bf16_e4m3_kernel(
   }
 }
 
+__global__ void quantize_bf16_e4m3_packed8_kernel(
+    const Bf16Pack8* input, Fp8Pack8* output, int64_t vector_count,
+    float inverse_scale) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < vector_count; index += stride) {
+    const Bf16Pack8 values = input[index];
+    Fp8Pack8 quantized;
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+      float value = __bfloat162float(values.values[item]) * inverse_scale;
+      value = fminf(448.0f, fmaxf(-448.0f, value));
+      quantized.values[item] = static_cast<__nv_fp8_e4m3>(value);
+    }
+    output[index] = quantized;
+  }
+}
+
 __global__ void quantize_rows_bf16_e4m3_kernel(
     const __nv_bfloat16* input, __nv_fp8_e4m3* output, float* scales,
     int rows, int input_cols, int output_cols) {

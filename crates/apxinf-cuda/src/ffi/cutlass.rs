@@ -58,6 +58,32 @@ extern "C" {
         stream: cudaStream_t,
     ) -> i32;
     #[cfg(apxinf_cutlass_gemm)]
+    pub fn apxinf_static_cutlass_fp8_gemm_bias_then_residual_bf16_m41(
+        activation: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        residual: *const c_void,
+        output: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        stream: cudaStream_t,
+    ) -> i32;
+    #[cfg(apxinf_cutlass_gemm)]
+    pub fn apxinf_gr00t_cutlass_fp8_m41_fc1_bias_gelu_quant_e4m3(
+        activation: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        output_scale: f32,
+        stream: cudaStream_t,
+    ) -> i32;
+    #[cfg(apxinf_cutlass_gemm)]
     pub fn apxinf_dynamic_cutlass_fp8_gemm_bf16(
         activation: *const c_void,
         weight_nk: *const c_void,

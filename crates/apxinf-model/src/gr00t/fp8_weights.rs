@@ -280,6 +280,22 @@ pub(super) struct Gr00tFp8LinearWeights {
 }
 
 impl Gr00tFp8LinearWeights {
+    fn quantize_activation(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
+        if std::env::var_os("APXINF_GR00T_FP8_LEGACY_STATIC_QUANT").is_some() {
+            kernels::quantization::quantize_bf16_e4m3(
+                backend.context(),
+                input,
+                self.activation_scale,
+            )
+        } else {
+            kernels::quantization::quantize_bf16_e4m3_packed8(
+                backend.context(),
+                input,
+                self.activation_scale,
+            )
+        }
+    }
+
     pub(super) fn from_host(
         weights: Gr00tLinearWeights,
         activation_scale: f32,
@@ -338,11 +354,7 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
     type ReusableInput = Tensor;
 
     fn forward(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
-        let input = kernels::quantization::quantize_bf16_e4m3(
-            backend.context(),
-            input,
-            self.activation_scale,
-        )?;
+        let input = self.quantize_activation(input, backend)?;
         self.forward_quantized_tensor(&input, backend)
     }
 
@@ -363,11 +375,7 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         input: &Tensor,
         backend: &RuntimeBackend,
     ) -> Result<Option<Self::ReusableInput>> {
-        Ok(Some(kernels::quantization::quantize_bf16_e4m3(
-            backend.context(),
-            input,
-            self.activation_scale,
-        )?))
+        Ok(Some(self.quantize_activation(input, backend)?))
     }
 
     fn quantize_bias_gelu_reusable_input(
@@ -384,6 +392,58 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         )?))
     }
 
+    fn forward_reusable_quantized_bias_gelu(
+        &self,
+        input: &Self::ReusableInput,
+        output_scale: f32,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<Self::ReusableInput>> {
+        if std::env::var_os("APXINF_GR00T_FP8_LEGACY_M41_FC1_EPILOGUE").is_some()
+            || backend.context().caps().sm != 110
+            || input.shape().dims() != [41, 1536]
+            || self.weight.shape().dims() != [1536, 6144]
+        {
+            return Ok(None);
+        }
+        let Some(bias) = self.bias.as_ref() else {
+            return Ok(None);
+        };
+        if bias.shape().dims() != [6144] {
+            return Ok(None);
+        }
+        kernels::fused::try_gr00t_fp8_m41_fc1_bias_gelu_quant_e4m3(
+            backend.context(),
+            input,
+            &self.weight,
+            bias,
+            self.activation_scale,
+            self.weight_scale,
+            output_scale,
+        )
+    }
+
+    fn residual_layer_norm_quantized(
+        &self,
+        projection: &Tensor,
+        residual: &Tensor,
+        norm_weight: &Tensor,
+        norm_bias: &Tensor,
+        eps: f32,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<(Tensor, Self::ReusableInput)>> {
+        let fused = kernels::fused::bias_residual_layer_quant_bf16_e4m3(
+            backend.context(),
+            projection,
+            None,
+            residual,
+            norm_weight,
+            norm_bias,
+            eps,
+            self.activation_scale,
+        )?;
+        Ok(Some((fused.hidden, fused.normalized)))
+    }
+
     fn forward_reusable_quantized(
         &self,
         input: &Self::ReusableInput,
@@ -392,30 +452,80 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         self.forward_quantized_tensor(input, backend)
     }
 
+    fn forward_reusable_quantized_bias_residual(
+        &self,
+        input: &Self::ReusableInput,
+        residual: &Tensor,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        let Some(bias) = self.bias.as_ref() else {
+            return Ok(None);
+        };
+        let use_thor_m41_fc2_epilogue = backend.context().caps().sm == 110
+            && input.shape().dims() == [41, 6144]
+            && self.weight.shape().dims() == [6144, 1536]
+            && bias.shape().dims() == [1536]
+            && residual.shape().dims() == [41, 1536]
+            && std::env::var_os("APXINF_GR00T_FP8_LEGACY_M41_FC2_EPILOGUE").is_none();
+        if !use_thor_m41_fc2_epilogue {
+            return Ok(None);
+        }
+        let weight = kernels::gemm::Fp8WeightView {
+            values_e4m3: &self.weight,
+            scale: self.weight_scale,
+            dual_geglu_interleaved: false,
+            dual_geglu_auto_interleaved: None,
+        };
+        Ok(Some(kernels::gemm::fp8_bias_then_residual_bf16_m41(
+            backend.context(),
+            input,
+            self.activation_scale,
+            weight,
+            bias,
+            residual,
+        )?))
+    }
+
     fn quantize_tensor_input(
         &self,
         input: &Tensor,
         backend: &RuntimeBackend,
     ) -> Result<Option<Tensor>> {
-        Ok(Some(kernels::quantization::quantize_bf16_e4m3(
-            backend.context(),
-            input,
-            self.activation_scale,
-        )?))
+        Ok(Some(self.quantize_activation(input, backend)?))
     }
 
     fn forward_quantized_tensor(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
-        kernels::gemm::fp8_bf16(
-            backend.context(),
-            input,
-            self.activation_scale,
-            kernels::gemm::Fp8WeightView {
-                values_e4m3: &self.weight,
-                scale: self.weight_scale,
-                dual_geglu_interleaved: false,
-                dual_geglu_auto_interleaved: None,
-            },
-        )
+        let weight = kernels::gemm::Fp8WeightView {
+            values_e4m3: &self.weight,
+            scale: self.weight_scale,
+            dual_geglu_interleaved: false,
+            dual_geglu_auto_interleaved: None,
+        };
+        let use_thor_m41_ffn_down = backend.context().caps().sm == 110
+            && input.shape().dims() == [41, 6144]
+            && self.weight.shape().dims() == [6144, 1536]
+            && std::env::var_os("APXINF_GR00T_FP8_LEGACY_M41_FFN_DOWN").is_none();
+        if use_thor_m41_ffn_down {
+            kernels::gemm::fp8_bf16_custom(
+                backend.context(),
+                input,
+                self.activation_scale,
+                weight,
+                kernels::gemm::Fp8Bf16CustomConfig {
+                    tile_id: 409,
+                    custom_option: 3,
+                    stages_id: 36,
+                    cluster_shape_id: 3,
+                },
+            )
+        } else {
+            kernels::gemm::fp8_bf16(
+                backend.context(),
+                input,
+                self.activation_scale,
+                weight,
+            )
+        }
     }
 
     fn adaptive_layer_norm_quantized(

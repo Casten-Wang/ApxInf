@@ -44,6 +44,23 @@ extern "C" {
         scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_static_quantize_bf16_e4m3_packed8(
+        input: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_concat_rows_quantize_bf16_e4m3(
+        first: *const c_void,
+        second: *const c_void,
+        output: *mut c_void,
+        first_rows: i32,
+        second_rows: i32,
+        cols: i32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_dynamic_quantize_rows_bf16_e4m3(
         input: *const c_void,
         output: *mut c_void,
@@ -738,6 +755,20 @@ extern "C" {
         eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_static_bias_residual_layer_norm_quant_bf16_e4m3(
+        projection: *const c_void,
+        projection_bias: *const c_void,
+        residual: *const c_void,
+        norm_weight: *const c_void,
+        norm_bias: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_static_ada_rms_norm_bf16(
         input: *const c_void,
         style: *const c_void,
@@ -1243,6 +1274,25 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+    pub fn apxinf_qk_rms_norm_mrope_bf16(
+        query_input: *const c_void,
+        query_weight: *const c_void,
+        query_output: *mut c_void,
+        key_input: *const c_void,
+        key_weight: *const c_void,
+        key_output: *mut c_void,
+        head_dim: u32,
+        query_heads: u32,
+        key_heads: u32,
+        seq_len: u32,
+        eps: f32,
+        theta: f32,
+        pos_ids: *const c_void,
+        sec_h: u32,
+        sec_w: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     /// Argmax over [n] bf16 logits → writes the winning index to `out` (u32).
     /// Typically `out` is a host-mapped u32 so the CPU reads it zero-copy.
     pub fn apxinf_argmax_bf16(
@@ -1363,6 +1413,28 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+    pub fn apxinf_build_vision_rotation_table_f32(
+        pos_ids: *const c_void,
+        rotation_table: *mut c_void,
+        head_dim: u32,
+        seq_len: u32,
+        theta: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qkv_split_bias_vision_rope_precomputed_bf16(
+        qkv: *const c_void,
+        bias: *const c_void,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        v_out: *mut c_void,
+        head_dim: u32,
+        n_heads: u32,
+        seq_len: u32,
+        rotation_table: *const c_void,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     pub fn apxinf_vision_sdpa_bf16(
         q: *const c_void,
         k: *const c_void,
@@ -1375,7 +1447,6 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
-
     pub fn apxinf_vision_sdpa_bf16_v3(
         q: *const c_void,
         k: *const c_void,
@@ -1387,7 +1458,6 @@ extern "C" {
         scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
-
 
     pub fn apxinf_vision_sdpa_bf16_v3_hd72(
         q: *const c_void,

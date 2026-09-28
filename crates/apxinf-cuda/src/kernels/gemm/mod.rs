@@ -139,12 +139,15 @@ pub(crate) use plan::GemmPlanCache;
 pub use plan::{PlanSource, PreparedGemmPlan};
 
 pub use bf16::{gemm_bf16 as bf16, gemm_bf16_geglu_fused as bf16_geglu_fused};
+#[doc(hidden)]
+pub use fp8::gemm_fp8_bias_then_residual_bf16_m41 as fp8_bias_then_residual_bf16_m41;
 #[cfg(test)]
 pub(crate) use fp8::prepare_cublaslt_fp8_gemm;
 pub use fp8::{
-    exact_fp8_tactic, gemm_fp8 as fp8, gemm_fp8_bf16 as fp8_bf16, gemm_fp8_dynamic_bf16,
+    exact_fp8_tactic, gemm_fp8 as fp8, gemm_fp8_bf16 as fp8_bf16,
+    gemm_fp8_bf16_custom as fp8_bf16_custom, gemm_fp8_dynamic_bf16,
     gemm_fp8_geglu_fused as fp8_geglu_fused, native_fp8_gemm_supported as native_fp8_supported,
-    DynamicFp8WeightView, Fp8WeightView,
+    DynamicFp8WeightView, Fp8Bf16CustomConfig, Fp8WeightView,
 };
 #[cfg(test)]
 pub(crate) use w8a8::gemm_w8a8_with_preference;

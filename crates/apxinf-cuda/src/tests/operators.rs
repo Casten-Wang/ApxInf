@@ -82,6 +82,76 @@ fn sdpa_fa2_prefill_supports_direct_output_projection() {
 }
 
 #[test]
+fn gr00t_hdim96_bm64_gate_is_exact_and_falls_back() {
+    use crate::kernels::attention::gr00t_hdim96_bm64_shape_supported as supported;
+
+    assert!(supported(8, 7, 41, 28, 32, 48));
+    assert!(supported(8, 7, 41, 41, 32, 48));
+    assert!(supported(8, 7, 41, 128, 32, 48));
+    assert!(supported(11, 0, 41, 41, 32, 48));
+    assert!(!supported(8, 7, 40, 41, 32, 48));
+    assert!(!supported(8, 7, 41, 42, 32, 48));
+    assert!(!supported(8, 9, 41, 41, 32, 48));
+    assert!(!supported(11, 1, 41, 41, 32, 48));
+}
+
+#[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+#[test]
+fn gr00t_hdim96_bm64_matches_default_fa2_bitwise() {
+    let _guard = super::gpu_smem_guard();
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    if !matches!(ctx.caps().sm, 87 | 110) {
+        return;
+    }
+    const QUERY: usize = 41;
+    const HEADS: usize = 32;
+    const DIM: usize = 48;
+    let values = |count: usize, phase: f32| {
+        (0..count)
+            .map(|index| ((index as f32 * 0.013 + phase).sin()) * 0.2)
+            .collect::<Vec<_>>()
+    };
+    let q_count = QUERY * HEADS * DIM;
+    let q = upload_fp32_as_bf16(&ctx, &values(q_count, 0.1), vec![QUERY, HEADS, DIM]).unwrap();
+    for key_tokens in [28, 41, 128] {
+        let kv_count = key_tokens * HEADS * DIM;
+        let k = upload_fp32_as_bf16(&ctx, &values(kv_count, 0.3), vec![key_tokens, HEADS, DIM])
+            .unwrap();
+        let v = upload_fp32_as_bf16(&ctx, &values(kv_count, 0.5), vec![key_tokens, HEADS, DIM])
+            .unwrap();
+        let reference = crate::kernels::attention::noncausal(&ctx, &q, &k, &v, HEADS, DIM).unwrap();
+        let candidate =
+            crate::kernels::attention::noncausal_hdim96_bm64(&ctx, &q, &k, &v, HEADS, DIM)
+                .unwrap()
+                .expect("measured GR00T production shape must select BM64");
+        assert_eq!(candidate.shape(), reference.shape(), "key_tokens={key_tokens}");
+        assert_eq!(
+            download_bf16_as_fp32(&reference).unwrap(),
+            download_bf16_as_fp32(&candidate).unwrap(),
+            "key_tokens={key_tokens}"
+        );
+    }
+
+    let qkv = upload_fp32_as_bf16(
+        &ctx,
+        &values(QUERY * 3 * HEADS * DIM, 0.7),
+        vec![QUERY, 3 * HEADS * DIM],
+    )
+    .unwrap();
+    let reference =
+        crate::kernels::attention::noncausal_strided_qkv(&ctx, &qkv, HEADS, DIM).unwrap();
+    let candidate =
+        crate::kernels::attention::noncausal_strided_qkv_hdim96_bm64(&ctx, &qkv, HEADS, DIM)
+            .unwrap()
+            .expect("measured GR00T production strided shape must select BM64");
+    assert_eq!(candidate.shape(), reference.shape());
+    assert_eq!(
+        download_bf16_as_fp32(&reference).unwrap(),
+        download_bf16_as_fp32(&candidate).unwrap()
+    );
+}
+
+#[test]
 fn gdn_preparation_separates_prefill_and_decode_precision() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
     let mut values = (1..=8).map(|v| v as f32).collect::<Vec<_>>();
@@ -621,8 +691,9 @@ fn vision_segmented_mha_error_against_fp64_oracle() {
     // above, so the oracle has to start from those, not from the fp32 draws.
     let to_bf16 = |x: f32| -> f64 {
         let bits = x.to_bits();
-        let rounded = ((bits >> 16) + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32
-            | ((bits >> 16) & 1)))) << 16;
+        let rounded = ((bits >> 16)
+            + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1))))
+            << 16;
         f32::from_bits(rounded) as f64
     };
 
@@ -639,7 +710,14 @@ fn vision_segmented_mha_error_against_fp64_oracle() {
     }
 
     let out = crate::kernels::attention::segmented_mha_bf16(
-        &ctx, &q, &k, &v, &offsets, &host_offsets, segments, seg_tokens,
+        &ctx,
+        &q,
+        &k,
+        &v,
+        &offsets,
+        &host_offsets,
+        segments,
+        seg_tokens,
     )
     .unwrap();
     let got = download_bf16_as_fp32(&out).unwrap();
@@ -772,18 +850,34 @@ fn gdn_recurrent_decode_error_against_fp64_oracle() {
         }
         buf
     };
-    let (qb, kb, vb, bb, gb) = (upload(&q), upload(&k), upload(&v), upload(&beta), upload(&g));
+    let (qb, kb, vb, bb, gb) = (
+        upload(&q),
+        upload(&k),
+        upload(&v),
+        upload(&beta),
+        upload(&g),
+    );
     let sb = upload(&state0);
     let out = CudaBuffer::alloc(heads * vdim * 2, 0).unwrap();
 
     crate::kernels::linear_attention::gdn_recurrent(
-        &ctx, &qb, &kb, &vb, &bb, &gb, &sb,
-        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16).unwrap(),
-        heads, kdim, vdim,
+        &ctx,
+        &qb,
+        &kb,
+        &vb,
+        &bb,
+        &gb,
+        &sb,
+        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16)
+            .unwrap(),
+        heads,
+        kdim,
+        vdim,
     )
     .unwrap();
     let got = download_bf16_as_fp32(
-        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16).unwrap(),
+        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16)
+            .unwrap(),
     )
     .unwrap();
 
@@ -896,7 +990,12 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
         buf
     };
     let (qb, kb, gb, tb, vtb, kcdb) = (
-        upload(&q), upload(&k), upload(&g_cum), upload(&t), upload(&vt), upload(&kcd),
+        upload(&q),
+        upload(&k),
+        upload(&g_cum),
+        upload(&t),
+        upload(&vt),
+        upload(&kcd),
     );
     let sb = upload(&state0);
     let out = CudaBuffer::alloc(seq * heads * vdim * 2, 0).unwrap();
@@ -915,7 +1014,9 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
     let bf = |x: f64| -> f64 {
         let v = x as f32;
         let bits = v.to_bits();
-        let r = ((bits >> 16) + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1)))) << 16;
+        let r = ((bits >> 16)
+            + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1))))
+            << 16;
         f32::from_bits(r) as f64
     };
     let scale = 1.0f64 / (kdim as f64).sqrt();
@@ -1055,7 +1156,12 @@ fn gdn_chunk_state_v_split_is_bit_exact() {
         buf
     };
     let (qb, kb, gb, tb, vtb, kcdb) = (
-        upload(&q), upload(&k), upload(&g_cum), upload(&t), upload(&vt), upload(&kcd),
+        upload(&q),
+        upload(&k),
+        upload(&g_cum),
+        upload(&t),
+        upload(&vt),
+        upload(&kcd),
     );
 
     // The scan carries its state in the buffer it was given, so each run needs
@@ -1103,7 +1209,10 @@ fn gdn_chunk_state_v_split_is_bit_exact() {
             base_out.len()
         );
         assert_eq!(out_diff, 0, "value split {split} changed the output");
-        assert_eq!(state_diff, 0, "value split {split} changed the carried state");
+        assert_eq!(
+            state_diff, 0,
+            "value split {split} changed the carried state"
+        );
     }
     std::env::remove_var("APXINF_GDN_CHUNK_STATE_V_SPLIT");
 }
@@ -1161,7 +1270,13 @@ fn gdn_chunk_gemm_error_against_fp64_oracle() {
         }
         b
     };
-    let (ab, vb, kb, bb, gb) = (upload(&a), upload(&v), upload(&k), upload(&beta), upload(&g_cum));
+    let (ab, vb, kb, bb, gb) = (
+        upload(&a),
+        upload(&v),
+        upload(&k),
+        upload(&beta),
+        upload(&g_cum),
+    );
     let n_vt = heads * chunks * chunk * vdim;
     let n_kcd = heads * chunks * chunk * kdim;
     let vt = CudaBuffer::alloc(n_vt * 4, 0).unwrap();
@@ -1182,7 +1297,9 @@ fn gdn_chunk_gemm_error_against_fp64_oracle() {
     let bf = |x: f64| -> f64 {
         let f = x as f32;
         let bits = f.to_bits();
-        let r = ((bits >> 16) + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1)))) << 16;
+        let r = ((bits >> 16)
+            + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1))))
+            << 16;
         f32::from_bits(r) as f64
     };
     let mut sum_abs = 0.0f64;

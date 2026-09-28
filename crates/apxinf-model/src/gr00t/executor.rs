@@ -42,6 +42,8 @@ use super::Gr00tConfig;
 const INITIAL_GRAPH_WORKSPACE_BYTES: usize = 4usize << 30;
 const USE_FUSED_FP8_RMS_NORM: bool = true;
 const USE_FUSED_FP8_VISION_LAYER_NORM: bool = true;
+const USE_FUSED_FP8_VISION_CONCAT_QUANT: bool = true;
+const USE_FUSED_FP8_VISION_RESIDUAL_LAYER_NORM_QUANT: bool = true;
 const USE_FUSED_SELF_QKV: bool = true;
 const USE_FUSED_ADAPTIVE_LAYER_NORM: bool = true;
 const USE_STRIDED_FUSED_QKV_ATTENTION: bool = true;
@@ -51,6 +53,7 @@ const USE_FUSED_FP8_BIAS_GELU_QUANT: bool = true;
 const USE_FUSED_FP8_SELF_QKV_BIAS: bool = true;
 const USE_FUSED_ADAPTIVE_LAYER_NORM_QUANT: bool = true;
 const USE_FUSED_FFN_BIAS_RESIDUAL: bool = true;
+const USE_FUSED_FP8_DIT_RESIDUAL_LAYER_NORM_QUANT: bool = true;
 
 /// Precision-specific weight materialization and layer-composition policy.
 ///
@@ -65,6 +68,12 @@ pub(super) trait Gr00tPrecisionExecution: Sized + 'static {
 
     const NAME: &'static str;
     const SUPPORTS_CALIBRATION: bool;
+    const USE_HDIM96_BM64_ATTENTION: bool = false;
+    const USE_FUSED_QK_RMS_MROPE: bool = false;
+    const QK_RMS_MROPE_LEGACY_ENV: Option<&'static str> = None;
+    const USE_DIRECT_BF16_VISION_SEGMENT_OUTPUT: bool = false;
+    const USE_PRECOMPUTED_BF16_VISION_ROPE: bool = false;
+    const USE_FUSED_BF16_VISION_MLP_RESIDUAL_NORM: bool = false;
 
     fn transfer_dense(
         &self,
@@ -868,6 +877,8 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 &self.backbone_vision,
                 &*self.backend,
                 &observation.image_grid_thw,
+                E::USE_PRECOMPUTED_BF16_VISION_ROPE
+                    && std::env::var_os("APXINF_GR00T_BF16_LEGACY_VISION_ROPE").is_none(),
             )?;
             self.vision_position_cache = Some((observation.image_grid_thw.clone(), positions));
         }
@@ -910,9 +921,120 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 weight,
             )
         };
-        let vision_bias_gelu = |_name: &str, input: &Tensor, bias: &Tensor| {
+        let vision_bias_gelu = |name: &str, input: &Tensor, bias: &Tensor| {
+            if let Some(prefix) = name.strip_suffix(".fc1") {
+                let output_name = format!("{prefix}.fc2");
+                if let Some(linear) = self.backbone_linears.get(&output_name) {
+                    if let Some(scale) = linear.activation_scale() {
+                        return kernels::activation::bias_gelu_quant_bf16_e4m3(
+                            self.backend.context(),
+                            input,
+                            bias,
+                            scale,
+                        );
+                    }
+                }
+            }
             kernels::activation::bias_gelu_bf16(self.backend.context(), input, Some(bias))
         };
+        // BF16 explicitly opts into this exact-shape path. The legacy composed
+        // path remains in the same ELF for controlled benchmark comparisons.
+        let use_direct_bf16_vision_segment_output = E::USE_DIRECT_BF16_VISION_SEGMENT_OUTPUT
+            && std::env::var_os("APXINF_GR00T_BF16_LEGACY_VISION_SEGMENT_OUTPUT").is_none();
+        let use_fused_bf16_vision_mlp_residual_norm =
+            E::USE_FUSED_BF16_VISION_MLP_RESIDUAL_NORM
+                && std::env::var_os(
+                    "APXINF_GR00T_BF16_LEGACY_VISION_MLP_RESIDUAL_NORM",
+                )
+                .is_none();
+        let vision_segmented_attention =
+            |q: &Tensor,
+             k: &Tensor,
+             v: &Tensor,
+             segment_lengths: &[usize],
+             n_heads: usize,
+             head_dim: usize| {
+                if use_direct_bf16_vision_segment_output {
+                    return kernels::attention::segmented_noncausal_contiguous_output_bf16(
+                        self.backend.context(),
+                        q,
+                        k,
+                        v,
+                        segment_lengths,
+                        n_heads,
+                        head_dim,
+                    );
+                }
+                Ok(None)
+            };
+        let use_fused_vision_concat_quant = USE_FUSED_FP8_VISION_CONCAT_QUANT
+            && std::env::var_os("APXINF_GR00T_FP8_LEGACY_VISION_CONCAT_QUANT").is_none();
+        let vision_concat_quant = |name: &str, first: &Tensor, second: &Tensor| {
+            if use_fused_vision_concat_quant {
+                if let Some(linear) = self.backbone_linears.get(name) {
+                    if let Some(scale) = linear.activation_scale() {
+                        return kernels::quantization::concat_rows_quantize_bf16_e4m3(
+                            self.backend.context(),
+                            first,
+                            second,
+                            scale,
+                        )
+                        .map(Some);
+                    }
+                }
+            }
+            Ok(None)
+        };
+        // Benchmarking can select the legacy composed path in the same binary,
+        // avoiding build-to-build differences when the expected gain is small.
+        let use_fused_vision_residual_norm_quant = USE_FUSED_FP8_VISION_RESIDUAL_LAYER_NORM_QUANT
+            && std::env::var_os("APXINF_GR00T_FP8_LEGACY_VISION_RESIDUAL_NORM").is_none();
+        let vision_residual_norm_matmul =
+            |name: &str,
+             projection: &Tensor,
+             projection_bias: &Tensor,
+             residual: &Tensor,
+             norm_weight: &Tensor,
+             norm_bias: &Tensor,
+             eps: f32,
+             weight: &Tensor| {
+                if use_fused_vision_residual_norm_quant {
+                    if let Some(linear) = self.backbone_linears.get(name) {
+                        if let Some(scale) = linear.activation_scale() {
+                            let fused = kernels::fused::bias_residual_layer_quant_bf16_e4m3(
+                                self.backend.context(),
+                                projection,
+                                Some(projection_bias),
+                                residual,
+                                norm_weight,
+                                norm_bias,
+                                eps,
+                                scale,
+                            )?;
+                            let output = linear
+                                .forward_quantized_tensor(&fused.normalized, &*self.backend)?;
+                            return Ok((fused.hidden, output));
+                        }
+                    }
+                }
+                let fused = kernels::fused::bias_residual_layer_bf16(
+                    self.backend.context(),
+                    projection,
+                    Some(projection_bias),
+                    residual,
+                    norm_weight,
+                    norm_bias,
+                    eps,
+                )?;
+                let output = qwen_matmul(
+                    &*self.backend,
+                    &self.backbone_linears,
+                    name,
+                    &fused.normalized,
+                    weight,
+                )?;
+                Ok((fused.hidden, output))
+            };
         let vision_output = vision::forward_with_prepared_positions_and_matmul(
             &self.backbone_config,
             &self.backbone_vision,
@@ -923,6 +1045,10 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             &vision_matmul,
             Some(&vision_norm_matmul),
             Some(&vision_bias_gelu),
+            Some(&vision_segmented_attention),
+            Some(&vision_concat_quant),
+            Some(&vision_residual_norm_matmul),
+            use_fused_bf16_vision_mlp_residual_norm,
         )
         .map_err(|error| Error::Other(format!("GR00T vision forward failed: {error}")))?;
         let image_positions = &token_groups.image;
@@ -992,6 +1118,9 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 &self.backbone_config,
                 &self.backbone_text,
                 &self.backbone_linears,
+                E::USE_FUSED_QK_RMS_MROPE
+                    && E::QK_RMS_MROPE_LEGACY_ENV
+                        .is_none_or(|name| std::env::var_os(name).is_none()),
                 &hidden,
                 layer,
                 &position_buffer,
@@ -1219,27 +1348,49 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     true,
                 )?,
             };
-            hidden = self.backend.add(&hidden, &attention)?;
-            let normalized = layer_norm(
-                &self.backend,
-                &hidden,
-                &self.action.dit_norm_weight,
-                &self.action.dit_norm_bias,
-                self.config.diffusion.norm_eps,
-            )?;
-            hidden = if USE_FUSED_FFN_BIAS_RESIDUAL
-                && block.feed_forward.output.uses_quantized_output()
+            let fused_normalized = if USE_FUSED_FP8_DIT_RESIDUAL_LAYER_NORM_QUANT
+                && std::env::var_os("APXINF_GR00T_FP8_LEGACY_DIT_RESIDUAL_LN").is_none()
             {
-                forward_feed_forward_residual(
+                block.feed_forward.input.residual_layer_norm_quantized(
+                    &attention,
+                    &hidden,
+                    &self.action.dit_norm_weight,
+                    &self.action.dit_norm_bias,
+                    self.config.diffusion.norm_eps,
+                    &self.backend,
+                )?
+            } else {
+                None
+            };
+            hidden = if let Some((residual, normalized)) = fused_normalized {
+                forward_feed_forward_residual_quantized(
                     &*self.backend,
                     &normalized,
                     &block.feed_forward,
-                    &hidden,
+                    &residual,
                 )?
             } else {
-                let feed_forward =
-                    forward_feed_forward(&*self.backend, &normalized, &block.feed_forward)?;
-                self.backend.add(&hidden, &feed_forward)?
+                let residual = self.backend.add(&hidden, &attention)?;
+                let normalized = layer_norm(
+                    &self.backend,
+                    &residual,
+                    &self.action.dit_norm_weight,
+                    &self.action.dit_norm_bias,
+                    self.config.diffusion.norm_eps,
+                )?;
+                if USE_FUSED_FFN_BIAS_RESIDUAL && block.feed_forward.output.uses_quantized_output()
+                {
+                    forward_feed_forward_residual(
+                        &*self.backend,
+                        &normalized,
+                        &block.feed_forward,
+                        &residual,
+                    )?
+                } else {
+                    let feed_forward =
+                        forward_feed_forward(&*self.backend, &normalized, &block.feed_forward)?;
+                    self.backend.add(&residual, &feed_forward)?
+                }
             };
         }
 
@@ -1800,6 +1951,51 @@ fn forward_feed_forward_projection<E: Gr00tPrecisionExecution>(
     weights.output.forward(&hidden, backend)
 }
 
+fn forward_feed_forward_residual_quantized<E: Gr00tPrecisionExecution>(
+    backend: &RuntimeBackend,
+    input: &<E::FeedForward as DeviceLinearWeights>::ReusableInput,
+    weights: &Gr00tDeviceFeedForwardWeights<E>,
+    residual: &Tensor,
+) -> Result<Tensor> {
+    let fused_hidden = match weights.output.activation_scale() {
+        Some(output_scale) => {
+            weights
+                .input
+                .forward_reusable_quantized_bias_gelu(input, output_scale, backend)?
+        }
+        None => None,
+    };
+    let hidden = if let Some(hidden) = fused_hidden {
+        hidden
+    } else {
+        let hidden = weights.input.forward_reusable_quantized(input, backend)?;
+        let bias = weights.input.bias().ok_or_else(|| {
+            Error::Other("GR00T fused quantized bias GELU requires input bias".into())
+        })?;
+        weights
+            .output
+            .quantize_bias_gelu_reusable_input(&hidden, bias, backend)?
+            .ok_or_else(|| {
+                Error::Other("GR00T FP8 bias-GELU fusion did not produce quantized input".into())
+            })?
+    };
+    if let Some(output) = weights
+        .output
+        .forward_reusable_quantized_bias_residual(&hidden, residual, backend)?
+    {
+        return Ok(output);
+    }
+    let output = weights
+        .output
+        .forward_reusable_quantized(&hidden, backend)?;
+    kernels::fused::bias_then_residual_bf16(
+        backend.context(),
+        &output,
+        weights.output.bias(),
+        residual,
+    )
+}
+
 fn forward_feed_forward_residual<E: Gr00tPrecisionExecution>(
     backend: &RuntimeBackend,
     input: &Tensor,
@@ -1813,6 +2009,52 @@ fn forward_feed_forward_residual<E: Gr00tPrecisionExecution>(
         weights.output.bias(),
         residual,
     )
+}
+
+fn noncausal_attention<E: Gr00tPrecisionExecution>(
+    backend: &RuntimeBackend,
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    if E::USE_HDIM96_BM64_ATTENTION
+        && std::env::var_os("APXINF_GR00T_LEGACY_FA2_BM64").is_none()
+    {
+        if let Some(output) = kernels::attention::noncausal_hdim96_bm64(
+            backend.context(),
+            query,
+            key,
+            value,
+            heads,
+            head_dim,
+        )? {
+            return Ok(output);
+        }
+    }
+    kernels::attention::noncausal(backend.context(), query, key, value, heads, head_dim)
+}
+
+fn noncausal_strided_qkv_attention<E: Gr00tPrecisionExecution>(
+    backend: &RuntimeBackend,
+    qkv: &Tensor,
+    heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    if E::USE_HDIM96_BM64_ATTENTION
+        && std::env::var_os("APXINF_GR00T_LEGACY_FA2_BM64").is_none()
+    {
+        if let Some(output) = kernels::attention::noncausal_strided_qkv_hdim96_bm64(
+            backend.context(),
+            qkv,
+            heads,
+            head_dim,
+        )? {
+            return Ok(output);
+        }
+    }
+    kernels::attention::noncausal_strided_qkv(backend.context(), qkv, heads, head_dim)
 }
 
 fn forward_attention<E: Gr00tPrecisionExecution>(
@@ -1852,12 +2094,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
                     linear(backend, query_input, fused_qkv)?
                 };
                 let output = if USE_STRIDED_FUSED_QKV_ATTENTION {
-                    kernels::attention::noncausal_strided_qkv(
-                        backend.context(),
-                        &qkv,
-                        heads,
-                        head_dim,
-                    )?
+                    noncausal_strided_qkv_attention::<E>(backend, &qkv, heads, head_dim)?
                 } else {
                     let qkv = kernels::attention::split_qkv_bias_bf16(
                         backend.context(),
@@ -1866,14 +2103,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
                         heads,
                         head_dim,
                     )?;
-                    kernels::attention::noncausal(
-                        backend.context(),
-                        &qkv.q,
-                        &qkv.k,
-                        &qkv.v,
-                        heads,
-                        head_dim,
-                    )?
+                    noncausal_attention::<E>(backend, &qkv.q, &qkv.k, &qkv.v, heads, head_dim)?
                 };
                 return if apply_output_bias {
                     linear(backend, &output, &weights.output)
@@ -1935,14 +2165,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
         let query = query.reshape(vec![query_len, heads, head_dim])?;
         let key = key.reshape(vec![key_value_len, heads, head_dim])?;
         let value = value.reshape(vec![key_value_len, heads, head_dim])?;
-        let output = kernels::attention::noncausal(
-            backend.context(),
-            &query,
-            &key,
-            &value,
-            heads,
-            head_dim,
-        )?;
+        let output = noncausal_attention::<E>(backend, &query, &key, &value, heads, head_dim)?;
         return if apply_output_bias {
             linear(backend, &output, &weights.output)
         } else {
@@ -1972,8 +2195,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
         linear(backend, key_value_input, &weights.value)?
     }
     .reshape(vec![key_value_len, heads, head_dim])?;
-    let output =
-        kernels::attention::noncausal(backend.context(), &query, &key, &value, heads, head_dim)?;
+    let output = noncausal_attention::<E>(backend, &query, &key, &value, heads, head_dim)?;
     if apply_output_bias {
         linear(backend, &output, &weights.output)
     } else {
@@ -2031,8 +2253,8 @@ fn forward_attention_with_prepared_key_value<E: Gr00tPrecisionExecution>(
         linear(backend, query_input, &weights.query)?
     }
     .reshape(vec![query_len, heads, head_dim])?;
-    let output = kernels::attention::noncausal(
-        backend.context(),
+    let output = noncausal_attention::<E>(
+        backend,
         &query,
         &key_value.key,
         &key_value.value,
@@ -2164,6 +2386,7 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
     config: &Qwen3VLConfig,
     weights: &Qwen3VLTextWeights,
     linears: &BTreeMap<String, L>,
+    use_fused_qk_rms_mrope: bool,
     input: &Tensor,
     layer_index: usize,
     position_ids: &DeviceBuffer,
@@ -2260,31 +2483,52 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
     let query = query.reshape(vec![sequence_len * text.n_heads, text.head_dim])?;
     let key = key.reshape(vec![sequence_len * text.n_kv_heads, text.head_dim])?;
     let value = value.reshape(vec![sequence_len, text.n_kv_heads, text.head_dim])?;
-    let query = rms_norm(backend, &query, &layer.q_norm_weight, text.rms_norm_eps)?
-        .reshape(vec![sequence_len, text.n_heads, text.head_dim])?;
-    let key = rms_norm(backend, &key, &layer.k_norm_weight, text.rms_norm_eps)?.reshape(vec![
-        sequence_len,
-        text.n_kv_heads,
-        text.head_dim,
-    ])?;
-    let query = kernels::rope::apply_mrope(
-        backend.context(),
-        &query,
-        text.n_heads,
-        text.head_dim,
-        text.rope_theta,
-        text.mrope_section,
-        position_ids,
-    )?;
-    let key = kernels::rope::apply_mrope(
-        backend.context(),
-        &key,
-        text.n_kv_heads,
-        text.head_dim,
-        text.rope_theta,
-        text.mrope_section,
-        position_ids,
-    )?;
+    let use_fused_qk_rms_mrope = use_fused_qk_rms_mrope
+        && matches!(sequence_len, 90 | 156)
+        && text.n_heads == 16
+        && text.n_kv_heads == 8
+        && text.head_dim == 128;
+    let (query, key) = if use_fused_qk_rms_mrope {
+        kernels::rope::rms_norm_apply_mrope_qk(
+            backend.context(),
+            &query,
+            &layer.q_norm_weight,
+            &key,
+            &layer.k_norm_weight,
+            sequence_len,
+            text.n_heads,
+            text.n_kv_heads,
+            text.head_dim,
+            text.rms_norm_eps,
+            text.rope_theta,
+            text.mrope_section,
+            position_ids,
+        )?
+    } else {
+        let query = rms_norm(backend, &query, &layer.q_norm_weight, text.rms_norm_eps)?
+            .reshape(vec![sequence_len, text.n_heads, text.head_dim])?;
+        let key = rms_norm(backend, &key, &layer.k_norm_weight, text.rms_norm_eps)?
+            .reshape(vec![sequence_len, text.n_kv_heads, text.head_dim])?;
+        let query = kernels::rope::apply_mrope(
+            backend.context(),
+            &query,
+            text.n_heads,
+            text.head_dim,
+            text.rope_theta,
+            text.mrope_section,
+            position_ids,
+        )?;
+        let key = kernels::rope::apply_mrope(
+            backend.context(),
+            &key,
+            text.n_kv_heads,
+            text.head_dim,
+            text.rope_theta,
+            text.mrope_section,
+            position_ids,
+        )?;
+        (query, key)
+    };
     let attention =
         kernels::attention::causal_gqa_prefill_bf16(backend.context(), &query, &key, &value)?
             .ok_or_else(|| {

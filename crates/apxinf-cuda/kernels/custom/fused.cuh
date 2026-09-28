@@ -769,6 +769,52 @@ __global__ void bias_residual_layer_norm_bf16_kernel(
   }
 }
 
+// Opt-in BF16 residual LayerNorm that preserves the legacy two-kernel
+// LayerNorm -> FP8 quantization rounding contract.  Keep this separate from
+// bias_residual_layer_norm_bf16_kernel so existing callers retain their BF16
+// output and dispatch unchanged.
+__global__ void bias_residual_layer_norm_quant_bf16_e4m3_kernel(
+    const __nv_bfloat16* projection, const __nv_bfloat16* projection_bias,
+    const __nv_bfloat16* residual, const __nv_bfloat16* norm_weight,
+    const __nv_bfloat16* norm_bias, __nv_bfloat16* hidden,
+    __nv_fp8_e4m3* normalized, int rows, int cols, float eps,
+    float inverse_scale) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  float sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int64_t index = static_cast<int64_t>(row) * cols + col;
+    float value = __bfloat162float(projection[index]) +
+                  __bfloat162float(residual[index]);
+    if (projection_bias != nullptr) value += __bfloat162float(projection_bias[col]);
+    const __nv_bfloat16 rounded = __float2bfloat16(value);
+    hidden[index] = rounded;
+    sum += __bfloat162float(rounded);
+  }
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / cols;
+  float variance_sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float centered =
+        __bfloat162float(hidden[static_cast<int64_t>(row) * cols + col]) - mean;
+    variance_sum += centered * centered;
+  }
+  // Finish reading the previous reduction before reusing scratch.
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / cols + eps);
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int64_t index = static_cast<int64_t>(row) * cols + col;
+    float value =
+        (__bfloat162float(hidden[index]) - mean) * inverse_std *
+            __bfloat162float(norm_weight[col]) +
+        __bfloat162float(norm_bias[col]);
+    // Match bias_residual_layer_norm_bf16 followed by quantize_bf16_e4m3.
+    value = __bfloat162float(__float2bfloat16(value));
+    value = fminf(448.0f, fmaxf(-448.0f, value * inverse_scale));
+    normalized[index] = static_cast<__nv_fp8_e4m3>(value);
+  }
+}
+
 __global__ void ada_gate_residual_bf16_kernel(
     const __nv_bfloat16* projection, const __nv_bfloat16* residual,
     const __nv_bfloat16* style, __nv_bfloat16* output,

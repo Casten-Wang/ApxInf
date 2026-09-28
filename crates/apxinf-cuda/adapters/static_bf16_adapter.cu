@@ -427,6 +427,27 @@ extern "C" cudaError_t apxinf_static_bias_residual_layer_norm_bf16(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_bias_residual_layer_norm_quant_bf16_e4m3(
+    const void* projection, const void* projection_bias,
+    const void* residual, const void* norm_weight, const void* norm_bias,
+    void* hidden, void* normalized, int rows, int cols, float eps,
+    float scale, cudaStream_t stream) {
+  if (projection == nullptr || residual == nullptr || norm_weight == nullptr ||
+      norm_bias == nullptr || hidden == nullptr || normalized == nullptr ||
+      rows <= 0 || cols <= 0 || !std::isfinite(scale) || scale <= 0.0f)
+    return cudaErrorInvalidValue;
+  bias_residual_layer_norm_quant_bf16_e4m3_kernel<<<
+      rows, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(projection),
+      static_cast<const __nv_bfloat16*>(projection_bias),
+      static_cast<const __nv_bfloat16*>(residual),
+      static_cast<const __nv_bfloat16*>(norm_weight),
+      static_cast<const __nv_bfloat16*>(norm_bias),
+      static_cast<__nv_bfloat16*>(hidden),
+      static_cast<__nv_fp8_e4m3*>(normalized), rows, cols, eps, 1.0f / scale);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_ada_rms_norm_bf16(
     const void* input, const void* style, void* output,
     int rows, int cols, float eps, cudaStream_t stream) {

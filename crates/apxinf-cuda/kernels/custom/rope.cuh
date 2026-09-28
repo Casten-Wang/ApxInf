@@ -235,7 +235,82 @@ __global__ void rope_mrope_bf16_kernel(
     float x0 = __bfloat162float(input[idx0]);
     float x1 = __bfloat162float(input[idx1]);
     output[idx0] = __float2bfloat16(x0 * cos_val - x1 * sin_val);
-    output[idx1] = __float2bfloat16(x0 * sin_val + x1 * cos_val);
+  output[idx1] = __float2bfloat16(x0 * sin_val + x1 * cos_val);
+}
+
+// Fuse the per-head RMSNorm of Q and K with multimodal RoPE while preserving
+// the BF16 normalization boundary consumed by the standalone RoPE kernel.
+// One block owns one (sequence, head) row; Q and K share a single launch but
+// retain independent inputs, weights, head counts, and outputs.
+__global__ void qk_rms_norm_mrope_bf16_kernel(
+    const __nv_bfloat16* query_input, const __nv_bfloat16* query_weight,
+    __nv_bfloat16* query_output, const __nv_bfloat16* key_input,
+    const __nv_bfloat16* key_weight, __nv_bfloat16* key_output,
+    uint32_t head_dim, uint32_t query_heads, uint32_t key_heads,
+    uint32_t seq_len, float eps, float theta, const uint32_t* pos_ids,
+    uint32_t sec_h, uint32_t sec_w) {
+  extern __shared__ __nv_bfloat16 rounded[];
+  __shared__ float warp_sums[32];
+  __shared__ float block_square_sum;
+  const uint32_t combined_head = blockIdx.y;
+  const bool is_query = combined_head < query_heads;
+  const uint32_t heads = is_query ? query_heads : key_heads;
+  const uint32_t head = is_query ? combined_head : combined_head - query_heads;
+  const uint32_t seq = blockIdx.x;
+  if (seq >= seq_len || head >= heads) return;
+  const __nv_bfloat16* input = is_query ? query_input : key_input;
+  const __nv_bfloat16* weight = is_query ? query_weight : key_weight;
+  __nv_bfloat16* output = is_query ? query_output : key_output;
+  const int64_t base =
+      (static_cast<int64_t>(seq) * heads + head) * head_dim;
+
+  float square_sum = 0.0f;
+  for (uint32_t col = threadIdx.x; col < head_dim; col += blockDim.x) {
+    const float value = __bfloat162float(input[base + col]);
+    square_sum += value * value;
+  }
+  // Keep the reduction tree byte-for-byte equivalent to the public BF16
+  // RMSNorm kernel. The legacy boundary is observable because its BF16
+  // output is consumed by mRoPE.
+  for (int offset = 16; offset > 0; offset >>= 1)
+    square_sum += __shfl_xor_sync(0xffffffff, square_sum, offset);
+  const uint32_t warp = threadIdx.x / 32;
+  const uint32_t lane = threadIdx.x % 32;
+  if (lane == 0) warp_sums[warp] = square_sum;
+  __syncthreads();
+  if (warp == 0) {
+    float value =
+        threadIdx.x < (blockDim.x + 31) / 32 ? warp_sums[threadIdx.x] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1)
+      value += __shfl_xor_sync(0xffffffff, value, offset);
+    if (lane == 0) block_square_sum = value;
+  }
+  __syncthreads();
+  const float inverse_rms =
+      rsqrtf(block_square_sum / static_cast<float>(head_dim) + eps);
+  for (uint32_t col = threadIdx.x; col < head_dim; col += blockDim.x) {
+    rounded[col] = __float2bfloat16(
+        __bfloat162float(input[base + col]) * inverse_rms *
+        __bfloat162float(weight[col]));
+  }
+  __syncthreads();
+
+  const uint32_t pair = threadIdx.x;
+  if (pair >= head_dim / 2) return;
+  const uint32_t axis = mrope_axis_for_pair(pair, sec_h, sec_w);
+  const uint32_t pos = pos_ids[seq * 3 + axis];
+  const float freq =
+      1.0f / powf(theta, 2.0f * static_cast<float>(pair) /
+                            static_cast<float>(head_dim));
+  const float angle = static_cast<float>(pos) * freq;
+  const float cos_value = cosf(angle);
+  const float sin_value = sinf(angle);
+  const float first = __bfloat162float(rounded[pair]);
+  const float second = __bfloat162float(rounded[head_dim / 2 + pair]);
+  output[base + pair] =
+      __float2bfloat16(first * cos_value - second * sin_value);
+  output[base + head_dim / 2 + pair] =
+      __float2bfloat16(first * sin_value + second * cos_value);
 }
 
 
@@ -352,6 +427,32 @@ __global__ void rope_vision_2d_pair_bf16_kernel(
     float k1 = __bfloat162float(k[idx1]);
     k_out[idx0] = __float2bfloat16(k0 * cos_val - k1 * sin_val);
     k_out[idx1] = __float2bfloat16(k0 * sin_val + k1 * cos_val);
+}
+
+// Build one rotation per token/pair. The GR00T opt-in path prepares this once
+// for a fixed image grid instead of recomputing identical transcendental
+// values independently in all 16 heads and all 24 vision blocks.
+__global__ void build_vision_rotation_table_f32_kernel(
+    const uint32_t* pos_ids, float2* rotation_table,
+    uint32_t head_dim, uint32_t seq_len, float theta)
+{
+    const uint64_t linear = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t half = head_dim / 2;
+    const uint64_t total = (uint64_t)seq_len * half;
+    if (linear >= total) return;
+
+    const uint32_t pair_idx = (uint32_t)(linear % half);
+    const uint32_t seq_idx = (uint32_t)(linear / half);
+    const uint32_t axis = pair_idx < half / 2 ? 0u : 1u;
+    const uint32_t pair_in_axis =
+        pair_idx < half / 2 ? pair_idx : pair_idx - half / 2;
+    const uint32_t pos = pos_ids[seq_idx * 2 + axis];
+    const float frequency =
+        1.0f / powf(theta, 2.0f * static_cast<float>(pair_in_axis) /
+                               static_cast<float>(half));
+    float sine, cosine;
+    sincosf(static_cast<float>(pos) * frequency, &sine, &cosine);
+    rotation_table[linear] = make_float2(cosine, sine);
 }
 
 // Fuse the vision QKV layout split, bias and 2D RoPE.  The explicit BF16

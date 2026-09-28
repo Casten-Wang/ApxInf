@@ -43,6 +43,33 @@ pub(super) trait DeviceLinearWeights: Debug {
         Ok(None)
     }
 
+    /// Fuse an already-quantized FC1 input with projection, bias, GELU, and
+    /// the next projection's reusable-input quantization when available.
+    fn forward_reusable_quantized_bias_gelu(
+        &self,
+        _input: &Self::ReusableInput,
+        _output_scale: f32,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<Self::ReusableInput>> {
+        Ok(None)
+    }
+
+    /// Return an opt-in residual-add + LayerNorm + reusable quantization when
+    /// the precision has an exact model-neutral implementation. The returned
+    /// tensor is the BF16 residual boundary consumed by the rest of the block.
+    #[allow(clippy::too_many_arguments)]
+    fn residual_layer_norm_quantized(
+        &self,
+        _projection: &Tensor,
+        _residual: &Tensor,
+        _norm_weight: &Tensor,
+        _norm_bias: &Tensor,
+        _eps: f32,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<(Tensor, Self::ReusableInput)>> {
+        Ok(None)
+    }
+
     fn forward_reusable_quantized(
         &self,
         _input: &Self::ReusableInput,
@@ -51,6 +78,18 @@ pub(super) trait DeviceLinearWeights: Debug {
         Err(Error::Other(
             "this GR00T precision does not accept reusable quantized input".into(),
         ))
+    }
+
+    /// Return a private exact-shape FC2 projection + bias + residual fusion
+    /// when this precision provides one. All generic/default implementations
+    /// retain the established projection followed by pointwise fallback.
+    fn forward_reusable_quantized_bias_residual(
+        &self,
+        _input: &Self::ReusableInput,
+        _residual: &Tensor,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
     }
 
     /// Tensor-valued quantization is used by static FP8 paths that feed
