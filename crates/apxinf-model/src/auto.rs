@@ -664,8 +664,17 @@ fn select_cuda_tuning_database_path(
 ) -> Option<PathBuf> {
     match options.tuning_path.as_ref() {
         Some(path) if path.is_file() => Some(path.clone()),
-        Some(_) if options.autotune => None,
-        Some(path) => Some(path.clone()),
+        Some(path)
+            if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json")) =>
+        {
+            Some(path.clone())
+        }
+        // A directory is the cuda-new exact-recipe cache, not a legacy JSON
+        // tuning database. This distinction matters in inference mode too.
+        Some(_) => None,
         None => default_path
             .is_file()
             .then(|| default_path.to_path_buf())
@@ -694,6 +703,29 @@ mod tests {
         assert!(recipe.online_tune);
         options.autotune = false;
         assert!(!cuda_recipe_options(&options).unwrap().online_tune);
+    }
+
+    #[test]
+    fn recipe_directory_is_not_loaded_as_legacy_tuning_json() {
+        let default_path = Path::new("missing-default-tactics.json");
+        let legacy_path = Path::new("missing-legacy-tactics.json");
+        let directory_options = LoadOptions {
+            tuning_path: Some(PathBuf::from("qwen35-recipes")),
+            ..LoadOptions::default()
+        };
+        assert_eq!(
+            select_cuda_tuning_database_path(default_path, legacy_path, &directory_options),
+            None
+        );
+
+        let json_options = LoadOptions {
+            tuning_path: Some(PathBuf::from("explicit-tactics.json")),
+            ..LoadOptions::default()
+        };
+        assert_eq!(
+            select_cuda_tuning_database_path(default_path, legacy_path, &json_options),
+            Some(PathBuf::from("explicit-tactics.json"))
+        );
     }
 
     #[test]
