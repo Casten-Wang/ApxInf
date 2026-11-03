@@ -41,11 +41,12 @@ pub use attn_ops::{
 pub use cache::{concat_rows, copy_tensor, reserve_prefix};
 pub use gather::{gather, GatherArgs, GatherSemantic, PatchGeometry as GatherPatchGeometry};
 pub use gdn::{
-    gdn_causal_conv_forward, gdn_causal_conv_step, gdn_chunk_scan, gdn_chunk_scan_interleaved,
-    gdn_conv_prepare, gdn_decay_and_beta, gdn_decay_and_beta_seq, gdn_gated_norm,
-    gdn_gated_norm_quantize, gdn_gated_norm_seq, gdn_gated_norm_seq_f16, gdn_l2_normalize_heads,
-    gdn_prefill, gdn_prefill_workspace_bytes, gdn_prepare_prefill, gdn_recurrent_step,
-    gdn_state_elements, gdn_widen_f16_to_bf16,
+    gdn_causal_conv_forward, gdn_causal_conv_step, gdn_causal_conv_verify, gdn_chunk_scan,
+    gdn_chunk_scan_interleaved, gdn_conv_prepare, gdn_decay_and_beta, gdn_decay_and_beta_seq,
+    gdn_gated_norm, gdn_gated_norm_quantize, gdn_gated_norm_seq, gdn_gated_norm_seq_f16,
+    gdn_l2_normalize_heads, gdn_l2_normalize_heads_seq, gdn_prefill, gdn_prefill_workspace_bytes,
+    gdn_prepare_prefill, gdn_recurrent_step, gdn_recurrent_verify, gdn_state_elements,
+    gdn_widen_f16_to_bf16,
 };
 pub use gemm::{
     gemm, gemm_bias, gemm_bias_gelu, gemm_bias_residual, gemm_geglu, nvfp4_gemm_swiglu,
@@ -83,18 +84,17 @@ pub use qwen35_attention::{
     Qwen35AttentionReferenceArgs, Qwen35AttentionReferenceOutput, Qwen35AttentionScratch,
     Qwen35Fp8AttentionArgs, Qwen35Fp8KvCache, Qwen35KvCacheScales, FP8_E4M3_MAX_FINITE,
     QWEN35_ATTENTION_HEAD_DIM, QWEN35_ATTENTION_KV_HEADS, QWEN35_ATTENTION_KV_WIDTH,
-    QWEN35_ATTENTION_MAX_SPLITS, QWEN35_ATTENTION_Q_HEADS,
-    QWEN35_ATTENTION_Q_PROJECTION_WIDTH, QWEN35_ATTENTION_RMS_EPSILON,
-    QWEN35_ATTENTION_ROTARY_DIM, QWEN35_KV_CACHE_BLOCK_TOKENS,
+    QWEN35_ATTENTION_MAX_SPLITS, QWEN35_ATTENTION_Q_HEADS, QWEN35_ATTENTION_Q_PROJECTION_WIDTH,
+    QWEN35_ATTENTION_RMS_EPSILON, QWEN35_ATTENTION_ROTARY_DIM, QWEN35_KV_CACHE_BLOCK_TOKENS,
 };
 pub use qwen35_mixers::{
     qwen35_gdn_decode, qwen35_gdn_prefill, Qwen35GdnCakeScratch, Qwen35GdnCoreWeights,
-    Qwen35GdnStateCheckpoints,
     Qwen35GdnDecodeArgs, Qwen35GdnDecodeScratch, Qwen35GdnPrefillArgs, Qwen35GdnPrefillScratch,
-    Qwen35GdnState, QWEN35_GDN_CONV_WIDTH, QWEN35_GDN_EPSILON, QWEN35_GDN_HEAD_DIM,
-    QWEN35_GDN_KEY_HEADS, QWEN35_GDN_QKV_WIDTH, QWEN35_GDN_Q_WIDTH, QWEN35_GDN_SCAN_CHUNK,
-    QWEN35_GDN_VALUE_HEADS, QWEN35_GDN_VALUE_WIDTH,
+    Qwen35GdnState, Qwen35GdnStateCheckpoints, QWEN35_GDN_CONV_WIDTH, QWEN35_GDN_EPSILON,
+    QWEN35_GDN_HEAD_DIM, QWEN35_GDN_KEY_HEADS, QWEN35_GDN_QKV_WIDTH, QWEN35_GDN_Q_WIDTH,
+    QWEN35_GDN_SCAN_CHUNK, QWEN35_GDN_VALUE_HEADS, QWEN35_GDN_VALUE_WIDTH,
 };
+pub use qwen35_mtp::{qwen35_mtp_accept, Qwen35MtpAcceptArgs, QWEN35_MTP_ACCEPT_OUTPUT_I32};
 pub use qwen35_mtp::{
     qwen35_mtp_moe, qwen35_mtp_moe_reference, Qwen35MtpMoeArgs, Qwen35MtpMoeScratch,
     Qwen35MtpMoeState, Qwen35MtpMoeWeights, Qwen35MtpReferenceOutput, Qwen35MtpReferenceWeights,
