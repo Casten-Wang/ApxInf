@@ -4,8 +4,34 @@
 namespace apxinf::gemm {
 namespace {
 
+struct SharedCublasHandle {
+  cublasHandle_t handle = nullptr;
+  std::mutex mutex;
+
+  ~SharedCublasHandle() {
+    if (handle != nullptr) cublasDestroy(handle);
+  }
+};
+
+std::shared_ptr<SharedCublasHandle> stream_handle(int device, void* stream) {
+  // Handles have a substantial hidden device allocation on Thor. Prepared
+  // executions on one thread/device/stream can share a handle while keeping
+  // their graph-bound workspaces independent. Weak entries do not extend a
+  // handle beyond the last execution (including captured graph retention).
+  using Key = std::pair<int, void*>;
+  static thread_local std::map<Key, std::weak_ptr<SharedCublasHandle>> handles;
+  auto& slot = handles[{device, stream}];
+  if (auto handle = slot.lock()) return handle;
+  auto handle = std::make_shared<SharedCublasHandle>();
+  check_cublas(cublasCreate(&handle->handle));
+  check_cublas(cublasSetMathMode(handle->handle, CUBLAS_PEDANTIC_MATH));
+  slot = handle;
+  return handle;
+}
+
 struct CublasState {
   vendor::CommonResources common;
+  std::shared_ptr<SharedCublasHandle> shared_handle;
   cublasHandle_t handle = nullptr;
   void* workspace = nullptr;
   size_t workspace_bytes = 0;
@@ -14,7 +40,6 @@ struct CublasState {
 
   ~CublasState() {
     release_resources();
-    if (handle != nullptr) cublasDestroy(handle);
   }
 
   void release_resources() noexcept {
@@ -76,8 +101,8 @@ void prepare_cublas(Execution& state) {
     check_cuda(cudaMalloc(&resources->dequant_a, a_bytes));
     check_cuda(cudaMalloc(&resources->dequant_b, b_bytes));
   }
-  check_cublas(cublasCreate(&resources->handle));
-  check_cublas(cublasSetMathMode(resources->handle, CUBLAS_PEDANTIC_MATH));
+  resources->shared_handle = stream_handle(state.device, state.bindings.stream);
+  resources->handle = resources->shared_handle->handle;
   resources->workspace_bytes = 4 * 1024 * 1024;
   check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
   state.resource_bytes =
@@ -143,6 +168,7 @@ cudaError_t launch_cublas(Execution& state) {
                 : resources.common.projection_dtype == APXINF_DTYPE_F16
                       ? CUDA_R_16F
                       : CUDA_R_16BF;
+  std::lock_guard<std::mutex> lock(resources.shared_handle->mutex);
   check_cublas(cublasSetStream(resources.handle, stream));
   check_cublas(cublasSetWorkspace(resources.handle, resources.workspace,
                                   resources.workspace_bytes));

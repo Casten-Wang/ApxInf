@@ -202,6 +202,7 @@ std::unique_ptr<Execution> fallback(
     if (!implementation.fallback ||
         !apxinf::attention::supports_device(implementation, device) ||
         !implementation.supports(spec) ||
+        !apxinf::attention::supports_alignment(implementation, spec) ||
         (policy.graph_safe && !implementation.graph_safe) ||
         (policy.deterministic && !implementation.deterministic)) {
       continue;
