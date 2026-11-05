@@ -6,7 +6,6 @@
 //! unless a larger `--max-new` value is requested. EOS stopping is disabled.
 //! The model and its CUDA allocations are loaded once for the whole process.
 
-use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -18,12 +17,61 @@ use apxinf_model::{
 };
 use serde_json::{json, Value};
 
-const VOCAB_SIZE: usize = 248_320;
+#[path = "support/qwen35_benchmark.rs"]
+mod benchmark;
+#[path = "support/qwen35_cuda_profile.rs"]
+mod cuda_profile;
+#[path = "support/qwen35_decode_profile.rs"]
+mod decode_profile;
+#[path = "support/qwen35_callback_timing.rs"]
+mod callback_clock;
+
+struct NvtxGenerationRanges;
+impl decode_profile::RangeSink for NvtxGenerationRanges {
+    type Guard = apxinf_model::profiling::trace::Range;
+    fn push(&mut self, label: &'static str) -> Self::Guard {
+        apxinf_model::profiling::trace::range(label)
+    }
+}
+use benchmark::{quantile, token_digest, INPUT_SEED};
 const PROMPT_TOKENS: usize = 4_096;
 const DEFAULT_OUTPUT_TOKENS: usize = 256;
 const DEFAULT_WARMUPS: usize = 2;
 const DEFAULT_REPEATS: usize = 5;
-const MTP_LOOKAHEAD: usize = 2;
+const MTP_LOOKAHEAD: usize = apxinf_model::qwen35moe::mtp_schedule::QWEN35_MTP_DRAFT_STEPS;
+
+fn report_repeat_divergence(
+    mode: &str,
+    iteration: usize,
+    warmup: bool,
+    allow_repeat_divergence: bool,
+    expected: &[u32],
+    actual: &[u32],
+) {
+    let first_diff = expected.iter().zip(actual)
+        .position(|(a, b)| a != b)
+        .unwrap_or(expected.len().min(actual.len()));
+    let start = first_diff.saturating_sub(3);
+    let expected_start = start.min(expected.len());
+    let actual_start = start.min(actual.len());
+    eprintln!("{}", json!({
+        "schema": "apxinf.qwen35.benchmark.repeat_divergence.v1",
+        "benchmark": "decode",
+        "mode": mode,
+        "iteration": iteration,
+        "warmup": warmup,
+        "allow_repeat_divergence": allow_repeat_divergence,
+        "first_diff": first_diff,
+        "expected_output_tokens": expected.len(),
+        "actual_output_tokens": actual.len(),
+        "expected_digest_fnv1a64": format!("{:016x}", token_digest(expected)),
+        "actual_digest_fnv1a64": format!("{:016x}", token_digest(actual)),
+        "expected_first_diff_token": expected.get(first_diff),
+        "actual_first_diff_token": actual.get(first_diff),
+        "expected_window": {"start": expected_start, "tokens": &expected[expected_start..expected_start.saturating_add(8).min(expected.len())]},
+        "actual_window": {"start": actual_start, "tokens": &actual[actual_start..actual_start.saturating_add(8).min(actual.len())]},
+    }));
+}
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -158,27 +206,7 @@ fn note_divergence(summary: &mut Value, divergent_repeats: usize) {
 }
 
 fn exact_prompt(prompt_tokens: usize) -> Vec<u32> {
-    let mut state = 0x35A3_BF04_4096_0001u64;
-    let mut tokens = Vec::with_capacity(prompt_tokens);
-    for _ in 0..prompt_tokens {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        // Avoid the checkpoint's high special-token range. These are already
-        // token IDs, so tokenizer version cannot change the measured length.
-        tokens.push(((state >> 17) as usize % (VOCAB_SIZE - 1_000)) as u32);
-    }
-    tokens
-}
-
-fn quantile(values: &[f64], percentile: f64) -> f64 {
-    assert!(!values.is_empty());
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
-    let index = ((percentile * sorted.len() as f64).ceil() as usize)
-        .saturating_sub(1)
-        .min(sorted.len() - 1);
-    sorted[index]
+    benchmark::exact_tokens(prompt_tokens)
 }
 
 fn run_mode(
@@ -189,20 +217,78 @@ fn run_mode(
     warmups: usize,
     repeats: usize,
     allow_repeat_divergence: bool,
+    autotune: bool,
+    profiling: bool,
 ) -> Result<ModeResult, Box<dyn std::error::Error>> {
     let mut divergent_repeats = 0usize;
+    let mut divergent_warmups = 0usize;
     let options = mode.options(max_new_tokens);
     let mut measured_ttft_ms = Vec::with_capacity(repeats);
     let mut measured_prefill_tps = Vec::with_capacity(repeats);
     let mut measured_generation_tps = Vec::with_capacity(repeats);
+    let mut measured_decode_ms = Vec::with_capacity(repeats);
+    let mut measured_post_last_ms = Vec::with_capacity(repeats);
+    let mut measured_total_ms = Vec::with_capacity(repeats);
+    let mut measured_legacy_generation_tps = Vec::with_capacity(repeats);
     let mut aggregate = AggregateSpeculation::default();
     let mut canonical_tokens: Option<Vec<u32>> = None;
 
     for iteration in 0..warmups + repeats {
         let warmup = iteration < warmups;
-        let output =
-            model.generate_streaming_with_options(LlmInput::text(prompt), &options, |_token| {})?;
+        let profile_range = cuda_profile::CudaProfileRange::start(profiling && !warmup)?;
+        let (output, callback_timing) = if profiling && !warmup {
+            // Callback endpoints are host availability boundaries. They do not
+            // introduce GPU synchronization or split an MTP round into tokens.
+            let mut phases = decode_profile::GenerationRanges::new(
+                NvtxGenerationRanges, max_new_tokens,
+            )?;
+            let mut timing = callback_clock::CallbackTimer::start(max_new_tokens)?;
+            let output = model.generate_streaming_with_options(
+                LlmInput::text(prompt), &options, |_token| {
+                    timing.on_token();
+                    phases.on_token();
+                },
+            )?;
+            let timing = timing.finish_after_generate(output.tokens.len())?;
+            phases.finish(output.tokens.len())?;
+            (output, timing)
+        } else {
+            // The same timing helper checks warmups and formal output budgets.
+            // Only first/final callbacks read the clock; intermediate callbacks
+            // count delivery without token timestamps, GPU work, or logging.
+            let mut timing = callback_clock::CallbackTimer::start(max_new_tokens)?;
+            let output = model.generate_streaming_with_options(
+                LlmInput::text(prompt), &options, |_token| timing.on_token(),
+            )?;
+            let timing = timing.finish_after_generate(output.tokens.len())?;
+            (output, timing)
+        };
+        profile_range.finish()?;
+        if profiling && !warmup {
+            println!("{}", json!({
+                "schema": "apxinf.qwen35.benchmark.profile_scope.v2",
+                "mode": mode.name(), "iteration": iteration,
+                "performance_eligible": false,
+                "capture_scope": "full_generate_including_prompt_prefill",
+                "nvtx_requested": std::env::var("APXINF_NVTX").as_deref() == Ok("1"),
+                "generate_range": decode_profile::GENERATE,
+                "entry_to_first_callback_range": decode_profile::PREFILL,
+                "first_to_last_callback_range": (max_new_tokens > 1).then_some(decode_profile::DECODE),
+                "last_callback_to_return_range": decode_profile::FINALIZE,
+                "callback_tokens": output.tokens.len(),
+                "callback_intervals": output.tokens.len().saturating_sub(1),
+                "attribution_requires_actual_nvtx_events_and_cuda_correlation": true,
+            }));
+        }
         let token_ids = output.token_ids();
+        if let Some(expected) = &canonical_tokens {
+            if expected != &token_ids {
+                // Emit before either length or repeat gates return an error.
+                report_repeat_divergence(
+                    mode.name(), iteration, warmup, allow_repeat_divergence, expected, &token_ids,
+                );
+            }
+        }
         if token_ids.len() != max_new_tokens {
             return Err(format!(
                 "{} iteration {iteration} produced {} tokens, expected {max_new_tokens}",
@@ -211,6 +297,7 @@ fn run_mode(
             )
             .into());
         }
+        let mut repeat_diverged = false;
         if let Some(expected) = &canonical_tokens {
             if expected != &token_ids {
                 let mismatch = expected
@@ -242,7 +329,12 @@ fn run_mode(
                 // a genuinely deterministic path and should still be run
                 // without this flag as the correctness gate.
                 if allow_repeat_divergence {
-                    divergent_repeats += 1;
+                    repeat_diverged = true;
+                    if warmup {
+                        divergent_warmups += 1;
+                    } else {
+                        divergent_repeats += 1;
+                    }
                     eprintln!("[qwen35-bench] WARNING {detail}");
                 } else {
                     return Err(detail.into());
@@ -252,14 +344,27 @@ fn run_mode(
             canonical_tokens = Some(token_ids.clone());
         }
 
-        let ttft_ms = output
-            .profile
-            .ttft_ms()
-            .ok_or("generation profile did not record TTFT")?;
-        let generation_tps = output
-            .profile
-            .generation_tps()
-            .ok_or("generation profile did not record generation TPS")?;
+        let legacy_ttft_ms = output.profile.ttft_ms()
+            .ok_or("legacy generation profile did not record TTFT")?;
+        let legacy_generation_tps = output.profile.generation_tps();
+        let legacy_total_ms = output.profile.total_latency_ms()
+            .ok_or("legacy generation profile did not record total latency")?;
+        let legacy_decode_ms = (max_new_tokens > 1).then_some(legacy_total_ms - legacy_ttft_ms);
+        let ttft_ms = callback_clock::ms(callback_timing.first_callback);
+        let total_latency_ms = callback_clock::ms(callback_timing.generate_return);
+        let decode_ms = callback_timing.decode_ms();
+        let post_last_callback_ms = callback_clock::ms(callback_timing.post_last_callback);
+        let generation_tps = callback_timing.decode_tps();
+        if max_new_tokens > 1 && (generation_tps.is_none() || legacy_generation_tps.is_none()) {
+            return Err("callback or legacy generation profile did not record Decode TPS".into());
+        }
+        if output.profile.reused_input_tokens() != 0
+            || output.profile.input_tokens() != prompt.len()
+        {
+            return Err(
+                "decode benchmark requires the entire prompt with zero context reuse".into(),
+            );
+        }
         let prefill_tps = prompt.len() as f64 / (ttft_ms / 1_000.0);
         let speculation = model.speculative_generation_stats()?;
         match (mode, speculation.as_ref()) {
@@ -280,15 +385,46 @@ fn run_mode(
         println!(
             "{}",
             json!({
-                "schema": "apxinf.qwen35.benchmark.iteration.v1",
+                "schema": "apxinf.qwen35.benchmark.iteration.v2",
                 "mode": mode.name(),
                 "iteration": iteration,
                 "warmup": warmup,
+                "autotune": autotune,
+                "profiling": profiling,
+                "performance_eligible": !autotune && !profiling,
+                "strict_recipe_required": !autotune,
+                "recipe_audit_required": true,
+                "computed_prompt_tokens": output.profile.input_tokens(),
+                "reused_prompt_tokens": output.profile.reused_input_tokens(),
+                "decode_intervals": token_ids.len().saturating_sub(1),
+                "total_latency_ms": total_latency_ms,
+                "timing_method": callback_clock::METHOD,
+                "decode_interval_ms": decode_ms,
+                "post_last_callback_ms": post_last_callback_ms,
+                "callback_timing": {
+                    "clock": callback_clock::CLOCK,
+                    "origin": callback_clock::ORIGIN,
+                    "clock_reads": callback_timing.clock_reads,
+                    "callback_count": callback_timing.callback_count,
+                    "decode_intervals": callback_timing.intervals,
+                    "first_callback_elapsed_ns": callback_timing.first_callback.as_nanos(),
+                    "last_callback_elapsed_ns": callback_timing.last_callback.as_nanos(),
+                    "generate_return_elapsed_ns": callback_timing.generate_return.as_nanos(),
+                },
+                "legacy_engine_profile": {
+                    "schema": "apxinf.qwen35.legacy-engine-profile.v1",
+                    "scope": "first_model_token_ready_to_engine_finalize_callbacks_excluded",
+                    "ttft_ms": legacy_ttft_ms,
+                    "total_latency_ms": legacy_total_ms,
+                    "decode_including_finalize_ms": legacy_decode_ms,
+                    "generation_tokens_per_second": legacy_generation_tps,
+                },
                 "prompt_tokens": prompt.len(),
                 "output_tokens": token_ids.len(),
                 "ttft_ms": ttft_ms,
                 "prefill_tokens_per_second": prefill_tps,
-                "generation_tokens_per_second": generation_tps,
+                "decode_tokens_per_second": generation_tps,
+                "repeat_diverged": repeat_diverged,
                 "token_digest_fnv1a64": format!("{:016x}", token_digest(&token_ids)),
                 "speculation": speculation,
             })
@@ -297,13 +433,25 @@ fn run_mode(
         if !warmup {
             measured_ttft_ms.push(ttft_ms);
             measured_prefill_tps.push(prefill_tps);
-            measured_generation_tps.push(generation_tps);
+            measured_post_last_ms.push(post_last_callback_ms);
+            measured_total_ms.push(total_latency_ms);
+            if let Some(ms) = decode_ms { measured_decode_ms.push(ms); }
+            if let Some(tps) = legacy_generation_tps { measured_legacy_generation_tps.push(tps); }
+            if let Some(tps) = generation_tps {
+                measured_generation_tps.push(tps);
+            }
         }
     }
 
     let mut summary = json!({
-        "schema": "apxinf.qwen35.benchmark.summary.v1",
+        "schema": "apxinf.qwen35.benchmark.summary.v2",
         "mode": mode.name(),
+        "autotune": autotune,
+        "profiling": profiling,
+        "performance_eligible": !autotune && !profiling,
+        "strict_recipe_required": !autotune,
+        "recipe_audit_required": true,
+        "decode_intervals": max_new_tokens - 1,
         "prompt_tokens": prompt.len(),
         "output_tokens": max_new_tokens,
         "warmups": warmups,
@@ -316,27 +464,40 @@ fn run_mode(
             "median": quantile(&measured_prefill_tps, 0.5),
             "p95": quantile(&measured_prefill_tps, 0.95),
         },
-        "generation_tokens_per_second": {
+        "timing_method": callback_clock::METHOD,
+        "post_last_callback_ms": {
+            "median": quantile(&measured_post_last_ms, 0.5),
+            "p95": quantile(&measured_post_last_ms, 0.95),
+        },
+        "total_latency_ms": {
+            "median": quantile(&measured_total_ms, 0.5),
+            "p95": quantile(&measured_total_ms, 0.95),
+        },
+        "decode_interval_ms": (!measured_decode_ms.is_empty()).then(|| json!({
+            "median": quantile(&measured_decode_ms, 0.5),
+            "p95": quantile(&measured_decode_ms, 0.95),
+        })),
+        "legacy_engine_profile": {
+            "scope": "first_model_token_ready_to_engine_finalize_callbacks_excluded",
+            "generation_tokens_per_second": (!measured_legacy_generation_tps.is_empty()).then(|| json!({
+                "median": quantile(&measured_legacy_generation_tps, 0.5),
+                "p95": quantile(&measured_legacy_generation_tps, 0.95),
+            })),
+        },
+        "decode_tokens_per_second": (!measured_generation_tps.is_empty()).then(|| json!({
             "median": quantile(&measured_generation_tps, 0.5),
             "p95": quantile(&measured_generation_tps, 0.95),
-        },
+        })),
         "speculation": match mode {
             Mode::Mtp => aggregate.to_json(),
             Mode::Scalar => Value::Null,
         },
     });
     note_divergence(&mut summary, divergent_repeats);
+    summary["divergent_warmups"] = Value::from(divergent_warmups);
     Ok(ModeResult {
         canonical_tokens: canonical_tokens.expect("at least one iteration"),
         summary,
-    })
-}
-
-fn token_digest(tokens: &[u32]) -> u64 {
-    tokens.iter().fold(0xcbf29ce484222325u64, |hash, token| {
-        token.to_le_bytes().into_iter().fold(hash, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-        })
     })
 }
 
@@ -399,6 +560,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kv_cache = precision_arg::<Qwen35KvCacheDType>(&args, "--qwen35-kv-cache")?;
     let tuning_path = optional_path_arg(&args, "--tuning-dir")?;
     let autotune = args.iter().any(|arg| arg == "--autotune");
+    let profiling = args.iter().any(|arg| arg == "--profile-measured");
+    if profiling && (autotune || repeats != 1 || matches!(benchmark_mode, BenchmarkMode::Both)) {
+        return Err("--profile-measured requires one non-autotune repeat and one --mode".into());
+    }
+    let fa2_packed_gqa = benchmark::pin_fa2_packed_gqa()?;
+    std::env::set_var("APXINF_REQUIRE_RECIPES", if autotune { "0" } else { "1" });
+    benchmark::validate_tuning_path(&tuning_path, autotune)?;
     if tuning_path.as_ref().is_some_and(|path| !path.is_absolute()) {
         return Err("--tuning-dir must be an absolute path".into());
     }
@@ -416,8 +584,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let prompt = exact_prompt(prompt_tokens);
+    let capacity = prompt_tokens
+        .checked_add(max_new_tokens)
+        .and_then(|value| value.checked_add(MTP_LOOKAHEAD))
+        .ok_or("KV capacity overflow")?;
+    let fixed_depth = std::env::var("APXINF_QWEN35_MTP_FIXED_DEPTH")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?;
+    if fixed_depth.is_some_and(|depth| !(1..=MTP_LOOKAHEAD).contains(&depth)) {
+        return Err("APXINF_QWEN35_MTP_FIXED_DEPTH must be within supported draft depth".into());
+    }
     let options = LoadOptions {
-        text_kv_capacity: Some(prompt_tokens + max_new_tokens + MTP_LOOKAHEAD),
+        text_kv_capacity: Some(capacity),
         qwen35_moe_activation: Some(moe_activation),
         qwen35_kv_cache: Some(kv_cache),
         tuning_path: tuning_path.clone(),
@@ -426,10 +605,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let load_start = Instant::now();
     let mut model = AutoModel::load_model(Device::Cuda(device), checkpoint, &options)?;
+    model.set_context_reuse(false)?;
     println!(
         "{}",
         json!({
-            "schema": "apxinf.qwen35.benchmark.config.v1",
+            "schema": "apxinf.qwen35.benchmark.config.v2",
+            "fa2_packed_gqa": fa2_packed_gqa,
             "checkpoint": checkpoint,
             "device": device,
             "prompt_tokens": prompt_tokens,
@@ -441,6 +622,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "qwen35_kv_cache": kv_cache.as_str(),
             "tuning_dir": tuning_path,
             "autotune": autotune,
+            "profiling": profiling,
+            "performance_eligible": !autotune && !profiling,
+            "strict_recipe_required": !autotune,
+            "recipe_audit_required": true,
+            "context_reuse": false,
+            "timing_method": callback_clock::METHOD,
+            "timing_clock": callback_clock::CLOCK,
+            "timing_origin": callback_clock::ORIGIN,
+            "timing_clock_reads_per_generate": if max_new_tokens > 1 { 4 } else { 3 },
+            "ttft_scope": "generate_entry_to_first_callback",
+            "decode_scope": "first_to_last_callback_intervals",
+            "post_last_callback_scope": "last_callback_to_generate_return",
+            "temperature": 0.0,
+            "sampling_mode": "greedy",
+            "kv_capacity": capacity,
+            "input_seed_hex": format!("{:016x}", INPUT_SEED),
+            "input_digest_fnv1a64": format!("{:016x}", token_digest(&prompt)),
+            "mtp_enabled": !matches!(benchmark_mode, BenchmarkMode::Scalar),
+            "mtp_strategy": if matches!(benchmark_mode, BenchmarkMode::Scalar) { "disabled" } else if fixed_depth.is_some() { "fixed" } else { "adaptive" },
+            "fixed_depth": if matches!(benchmark_mode, BenchmarkMode::Scalar) { None } else { fixed_depth },
+            "mtp_depth": if matches!(benchmark_mode, BenchmarkMode::Scalar) { None } else { fixed_depth },
+            "draft_kv_dtype": "fp8",
+            "draft_kv_scale": 1.0,
+            "allow_repeat_divergence": allow_repeat_divergence,
             "load_seconds": load_start.elapsed().as_secs_f64(),
         })
     );
@@ -455,6 +660,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 warmups,
                 repeats,
                 allow_repeat_divergence,
+                autotune,
+                profiling,
             )?;
             println!("{}", scalar.summary);
         }
@@ -467,6 +674,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 warmups,
                 repeats,
                 allow_repeat_divergence,
+                autotune,
+                profiling,
             )?;
             println!("{}", mtp.summary);
         }
@@ -479,6 +688,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 warmups,
                 repeats,
                 allow_repeat_divergence,
+                autotune,
+                profiling,
             )?;
             let mtp = run_mode(
                 &mut model,
@@ -488,6 +699,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 warmups,
                 repeats,
                 allow_repeat_divergence,
+                autotune,
+                profiling,
             )?;
             if scalar.canonical_tokens != mtp.canonical_tokens {
                 let mismatch = scalar

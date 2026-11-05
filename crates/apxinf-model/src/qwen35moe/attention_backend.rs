@@ -387,7 +387,13 @@ impl FullAttentionBackend for Qwen35Fp8AttentionBackend {
             tokens,
         )?;
         let scratch = self.scratch(ctx, tokens, cache.capacity, request.phase)?;
-        scratch.ensure_text_positions(request.start_position)?;
+        scratch.ensure_text_positions(ctx, request.start_position)?;
+        let profile_attention = tokens == ops::QWEN35_MTP_DRAFT_STEPS + 1
+            && std::env::var_os("APXINF_QWEN35_ATTENTION_TIMING").is_some();
+        if profile_attention {
+            ctx.synchronize().map_err(Error::Cuda)?;
+        }
+        let attention_started = std::time::Instant::now();
 
         // ---- q/k/v projection GEMMs ----
         let mut project_qkv = || {
@@ -417,6 +423,15 @@ impl FullAttentionBackend for Qwen35Fp8AttentionBackend {
         } else {
             project_qkv()?;
         }
+        if profile_attention {
+            ctx.synchronize().map_err(Error::Cuda)?;
+            eprintln!(
+                "[verify-attention] layer={} qkv_ms={:.3}",
+                request.layer_index,
+                attention_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let attention_core_started = std::time::Instant::now();
 
         if cache.dtype == Qwen35KvCacheDType::Fp8Dynamic {
             return run_dynamic_fp8_attention(
@@ -472,6 +487,15 @@ impl FullAttentionBackend for Qwen35Fp8AttentionBackend {
                     rope_theta,
                 },
             )?;
+            if profile_attention {
+                ctx.synchronize().map_err(Error::Cuda)?;
+                eprintln!(
+                    "[verify-attention] layer={} core_ms={:.3}",
+                    request.layer_index,
+                    attention_core_started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            let output_projection_started = std::time::Instant::now();
 
             let attention_output = view(
                 &scratch.attention_output,
@@ -497,11 +521,20 @@ impl FullAttentionBackend for Qwen35Fp8AttentionBackend {
                     tokens,
                 )
             };
-            return if let Some(session) = post_projection {
+            let result = if let Some(session) = post_projection {
                 session.run(project_output)
             } else {
                 project_output()
             };
+            if profile_attention {
+                ctx.synchronize().map_err(Error::Cuda)?;
+                eprintln!(
+                    "[verify-attention] layer={} output_ms={:.3}",
+                    request.layer_index,
+                    output_projection_started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return result;
         }
 
         // ---- Decomposed pre/post processing (shared with old scalar path) ----
@@ -1105,13 +1138,13 @@ impl AttentionScratch {
         })
     }
 
-    fn ensure_text_positions(&mut self, start_position: usize) -> Result<()> {
+    fn ensure_text_positions(&mut self, ctx: &CudaContext, start_position: usize) -> Result<()> {
         if self.positions_start == Some(start_position) {
             return Ok(());
         }
         let values = text_position_values(start_position, self.tokens)?;
         let host = Tensor::from_i32(vec![TEXT_POSITION_CHANNELS, self.tokens], &values)?;
-        transfers::copy_cpu_to_cuda(&host, &self.positions)?;
+        transfers::copy_cpu_to_cuda_on_stream(ctx, host, &self.positions)?;
         self.positions_start = Some(start_position);
         Ok(())
     }
@@ -1524,7 +1557,7 @@ fn zeros(ctx: &CudaContext, shape: Vec<usize>, dtype: DType) -> Result<Tensor> {
             bytes.checked_mul(*dimension)
         })
         .ok_or_else(|| invalid("Qwen3.5 attention CUDA allocation size overflow"))?;
-    Ok(CudaBuffer::alloc_zeros(bytes, ctx.device_id())
+    Ok(CudaBuffer::alloc_zeros_async(bytes, ctx.device_id(), ctx.stream())
         .map_err(Error::Cuda)?
         .as_tensor(Shape::new(shape), dtype)
         .map_err(Error::Cuda)?)

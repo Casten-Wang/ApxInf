@@ -41,11 +41,12 @@ pub use attn_ops::{
 pub use cache::{concat_rows, copy_tensor, reserve_prefix};
 pub use gather::{gather, GatherArgs, GatherSemantic, PatchGeometry as GatherPatchGeometry};
 pub use gdn::{
-    gdn_causal_conv_forward, gdn_causal_conv_step, gdn_chunk_scan, gdn_chunk_scan_interleaved,
-    gdn_conv_prepare, gdn_decay_and_beta, gdn_decay_and_beta_seq, gdn_gated_norm,
-    gdn_gated_norm_quantize, gdn_gated_norm_seq, gdn_gated_norm_seq_f16, gdn_l2_normalize_heads,
-    gdn_prefill, gdn_prefill_workspace_bytes, gdn_prepare_prefill, gdn_recurrent_step,
-    gdn_state_elements, gdn_widen_f16_to_bf16,
+    gdn_causal_conv_forward, gdn_causal_conv_step, gdn_causal_conv_verify, gdn_chunk_scan,
+    gdn_chunk_scan_interleaved, gdn_conv_prepare, gdn_decay_and_beta, gdn_decay_and_beta_seq,
+    gdn_gated_norm, gdn_gated_norm_quantize, gdn_gated_norm_seq, gdn_gated_norm_seq_f16,
+    gdn_l2_normalize_heads, gdn_l2_normalize_heads_seq, gdn_prefill, gdn_prefill_workspace_bytes,
+    gdn_prepare_prefill, gdn_recurrent_step, gdn_recurrent_verify, gdn_state_elements,
+    gdn_widen_f16_to_bf16,
 };
 pub use gemm::{
     gemm, gemm_bias, gemm_bias_gelu, gemm_bias_residual, gemm_geglu, nvfp4_gemm_swiglu,
@@ -96,6 +97,7 @@ pub use qwen35_mixers::{
     QWEN35_GDN_HEAD_DIM, QWEN35_GDN_KEY_HEADS, QWEN35_GDN_QKV_WIDTH, QWEN35_GDN_Q_WIDTH,
     QWEN35_GDN_SCAN_CHUNK, QWEN35_GDN_VALUE_HEADS, QWEN35_GDN_VALUE_WIDTH,
 };
+pub use qwen35_mtp::{qwen35_mtp_accept, Qwen35MtpAcceptArgs, QWEN35_MTP_ACCEPT_OUTPUT_I32};
 pub use qwen35_mtp::{
     qwen35_mtp_moe, qwen35_mtp_moe_reference, Qwen35MtpMoeArgs, Qwen35MtpMoeScratch,
     Qwen35MtpMoeState, Qwen35MtpMoeWeights, Qwen35MtpReferenceOutput, Qwen35MtpReferenceWeights,

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 
 use apxinf_core::Device;
@@ -27,6 +27,8 @@ pub struct EngineRequest {
     pub presence_penalty: Option<f32>,
     pub seed: Option<u64>,
     pub disable_spec_decode: bool,
+    /// Stop at a model-native tool terminator when the caller permits one call.
+    pub stop_after_tool_call: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -81,7 +83,21 @@ pub struct ApxInfChatEngine {
     default_max_tokens: usize,
     max_input_tokens: usize,
     enable_context_reuse: bool,
+    /// The system/tool prefix boundary depends only on leading system
+    /// messages and chat-template options. AIOS repeats that configuration on
+    /// every turn, so avoid rendering and tokenizing two 8K+ probes each time.
+    reusable_prefix_cache: VecDeque<(String, usize)>,
+    /// Exact rendered prompts also repeat in normalized-time AIOS benchmarks.
+    /// Retain their token IDs so a hot request reaches inference without a
+    /// third full tokenizer traversal.
+    /// Structured request key -> rendered prompt tokens. Keying before the
+    /// Jinja template lets repeated AIOS turns skip both template expansion
+    /// and tokenization instead of caching only the latter.
+    prompt_token_cache: VecDeque<(String, Vec<u32>)>,
 }
+
+const REUSABLE_PREFIX_CACHE_ENTRIES: usize = 4;
+const PROMPT_TOKEN_CACHE_ENTRIES: usize = 4;
 
 impl ApxInfChatEngine {
     pub fn load(mut config: ApxInfEngineConfig) -> Result<Self, ApiError> {
@@ -89,12 +105,12 @@ impl ApxInfChatEngine {
             .max_input_tokens
             .checked_add(config.default_max_tokens)
             .ok_or_else(|| ApiError::unavailable("configured sequence capacity overflows usize"))?;
-        // Qwen3.5 MTP verifies a fixed three-row target window before applying
-        // output-budget truncation. Two lookahead slots let the last round
+        // Qwen3.5 MTP verifies pending plus three draft rows before applying
+        // output-budget truncation. Three lookahead slots let the last round
         // remain speculative; other text runtimes simply retain a tiny unused
         // tail in their fixed cache.
         let required_capacity = admitted_tokens
-            .checked_add(2)
+            .checked_add(3)
             .ok_or_else(|| ApiError::unavailable("configured MTP lookahead overflows usize"))?;
         match config.load_options.text_kv_capacity {
             Some(capacity) if capacity < required_capacity => {
@@ -134,6 +150,8 @@ impl ApxInfChatEngine {
             default_max_tokens: config.default_max_tokens,
             max_input_tokens: config.max_input_tokens,
             enable_context_reuse: config.enable_context_reuse,
+            reusable_prefix_cache: VecDeque::new(),
+            prompt_token_cache: VecDeque::new(),
         })
     }
 }
@@ -191,14 +209,37 @@ impl ChatEngine for ApxInfChatEngine {
                     .map_err(|error| ApiError::internal(error.to_string()))?,
             );
         }
-        let prompt = self
-            .tokenizer
-            .apply_chat_template_messages_with_options(&messages, &options)
-            .map_err(|error| ApiError::invalid(error.to_string(), Some("messages".to_owned())))?;
-        let prompt_tokens = self
-            .tokenizer
-            .encode(&prompt)
-            .map_err(|error| ApiError::invalid(error.to_string(), Some("messages".to_owned())))?;
+        let prompt_key = serde_json::to_string(&(&messages, &options))
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let prompt_tokens = if let Some(index) = self
+            .prompt_token_cache
+            .iter()
+            .position(|(cached, _)| cached == &prompt_key)
+        {
+            let entry = self
+                .prompt_token_cache
+                .remove(index)
+                .expect("located prompt-token cache entry exists");
+            let tokens = entry.1.clone();
+            self.prompt_token_cache.push_front(entry);
+            tokens
+        } else {
+            let prompt = self
+                .tokenizer
+                .apply_chat_template_messages_with_options(&messages, &options)
+                .map_err(|error| {
+                    ApiError::invalid(error.to_string(), Some("messages".to_owned()))
+                })?;
+            let tokens = self.tokenizer.encode(&prompt).map_err(|error| {
+                ApiError::invalid(error.to_string(), Some("messages".to_owned()))
+            })?;
+            if self.prompt_token_cache.len() >= PROMPT_TOKEN_CACHE_ENTRIES {
+                self.prompt_token_cache.pop_back();
+            }
+            self.prompt_token_cache
+                .push_front((prompt_key, tokens.clone()));
+            tokens
+        };
         if prompt_tokens.is_empty() {
             return Err(ApiError::invalid(
                 "chat template produced an empty prompt",
@@ -216,7 +257,28 @@ impl ChatEngine for ApxInfChatEngine {
             ));
         }
         let reusable_prefix_tokens = if self.enable_context_reuse {
-            system_prefix_tokens(&self.tokenizer, &messages, &options, &prompt_tokens)?
+            let key = system_prefix_cache_key(&messages, &options)?;
+            if let Some(index) = self
+                .reusable_prefix_cache
+                .iter()
+                .position(|(cached, _)| cached == &key)
+            {
+                let entry = self
+                    .reusable_prefix_cache
+                    .remove(index)
+                    .expect("located reusable-prefix cache entry exists");
+                let tokens = entry.1.min(prompt_tokens.len());
+                self.reusable_prefix_cache.push_front(entry);
+                tokens
+            } else {
+                let tokens =
+                    system_prefix_tokens(&self.tokenizer, &messages, &options, &prompt_tokens)?;
+                if self.reusable_prefix_cache.len() >= REUSABLE_PREFIX_CACHE_ENTRIES {
+                    self.reusable_prefix_cache.pop_back();
+                }
+                self.reusable_prefix_cache.push_front((key, tokens));
+                tokens
+            }
         } else {
             0
         };
@@ -233,16 +295,46 @@ impl ChatEngine for ApxInfChatEngine {
             .map_err(|error| ApiError::internal(error.to_string()))?
             .eos_token_ids
             .clone();
-        let eos_token_ids = default_eos
+        let mut eos_token_ids = default_eos
             .clone()
             .or_else(|| self.tokenizer.eos_token_id().map(|id| vec![id]));
+        let mut generation_eos_token_ids = eos_token_ids.clone();
+        if request.stop_after_tool_call && !request.tools.is_empty() {
+            // Qwen3.6 has a single, non-special </tool_call> token. Use the
+            // runtime's EOS transaction so MTP commits only the accepted rows
+            // through that token, rather than cancelling a partially committed
+            // speculative round from a text callback. Other tokenizers retain
+            // the existing path when this delimiter is not one token.
+            if let Ok(ids) = self.tokenizer.encode("</tool_call>") {
+                if let [tool_end] = ids.as_slice() {
+                    // An unknown-token fallback is not a tool terminator.
+                    if self
+                        .tokenizer
+                        .decode_with_options(&ids, false)
+                        .ok()
+                        .as_deref()
+                        == Some("</tool_call>")
+                    {
+                        let stop_ids = generation_eos_token_ids.get_or_insert_with(Vec::new);
+                        if !stop_ids.contains(tool_end) {
+                            stop_ids.push(*tool_end);
+                        }
+                        // Preserve the delimiter in both streamed and final text:
+                        // the structured-tool parser needs the closing tag.
+                        if let Some(hidden_eos) = eos_token_ids.as_mut() {
+                            hidden_eos.retain(|id| id != tool_end);
+                        }
+                    }
+                }
+            }
+        }
         let max_tokens = request
             .max_tokens
             .max(1)
             .min(self.default_max_tokens.max(1));
         let generation = GenerationOptions {
             max_new_tokens: Some(max_tokens),
-            eos_token_ids: eos_token_ids.clone(),
+            eos_token_ids: generation_eos_token_ids,
             sampling_mode: request.temperature.map(|temperature| {
                 if temperature == 0.0 {
                     SamplingMode::Greedy
@@ -309,6 +401,21 @@ impl ChatEngine for ApxInfChatEngine {
             }
         }
         let completion_tokens = output.profile.output_tokens();
+        if let Ok(Some(stats)) = self.model.speculative_generation_stats() {
+            eprintln!(
+                "MTP profile: draft_steps={} rounds={} zero_accept={} partial_accept={} full_accept={} proposed={} accepted={} emitted={} rolled_back_rows={} accepted_by_depth={:?}",
+                stats.draft_steps,
+                stats.rounds,
+                stats.zero_accept_rounds,
+                stats.partial_accept_rounds,
+                stats.full_accept_rounds,
+                stats.proposed_tokens,
+                stats.verified_accepted_tokens,
+                stats.emitted_tokens,
+                stats.target_rolled_back_rows,
+                stats.accepted_prefix_by_depth,
+            );
+        }
         eprintln!(
             "request profile: prompt_tokens={} reused_prompt_tokens={} completion_tokens={} ttft_ms={:?} tpot_ms={:?} generation_tps={:?} total_latency_ms={:?}",
             output.profile.input_tokens(),
@@ -370,6 +477,18 @@ fn system_prefix_tokens(
     let second = render_probe("\u{2603}APXINF_SYSTEM_PREFIX_BOUNDARY_B")?;
     let probe_prefix = common_token_prefix(&first, &second);
     Ok(probe_prefix.min(common_token_prefix(&first, prompt_tokens)))
+}
+
+fn system_prefix_cache_key(
+    messages: &[ChatTemplateMessage],
+    options: &Map<String, Value>,
+) -> Result<String, ApiError> {
+    let system_messages = messages
+        .iter()
+        .take_while(|message| message.role == "system")
+        .collect::<Vec<_>>();
+    serde_json::to_string(&(system_messages, options))
+        .map_err(|error| ApiError::internal(format!("failed to key system prefix: {error}")))
 }
 
 fn common_token_prefix(left: &[u32], right: &[u32]) -> usize {

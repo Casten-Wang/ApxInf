@@ -58,7 +58,7 @@ impl TextBoundaryScratch {
         })
     }
 
-    pub fn write_token_ids(&self, token_ids: &[u32]) -> Result<()> {
+    pub fn write_token_ids(&self, ctx: &CudaContext, token_ids: &[u32]) -> Result<()> {
         if token_ids.len() != self.tokens {
             return Err(invalid(format!(
                 "Qwen3.5 token count mismatch: prepared {}, got {}",
@@ -74,7 +74,7 @@ impl TextBoundaryScratch {
             })
             .collect::<Result<Vec<_>>>()?;
         let host = Tensor::from_i32(vec![self.tokens], &token_ids)?;
-        transfers::copy_cpu_to_cuda(&host, &self.token_ids)
+        transfers::copy_cpu_to_cuda_on_stream(ctx, host, &self.token_ids)
     }
 
     /// Run checkpoint embedding lookup into resident hidden storage.
@@ -1806,7 +1806,7 @@ fn zeros(ctx: &CudaContext, shape: Vec<usize>, dtype: DType) -> Result<Tensor> {
             bytes.checked_mul(*dimension)
         })
         .ok_or_else(|| invalid("Qwen3.5 CUDA allocation size overflow"))?;
-    Ok(CudaBuffer::alloc_zeros(bytes, ctx.device_id())
+    Ok(CudaBuffer::alloc_zeros_async(bytes, ctx.device_id(), ctx.stream())
         .map_err(Error::Cuda)?
         .as_tensor(Shape::new(shape), dtype)
         .map_err(Error::Cuda)?)
@@ -1961,5 +1961,20 @@ mod tests {
         // A raw checkpoint delta of zero must mean an affine of one, not an
         // output of zero as generic RMSNorm would produce.
         assert_ne!(actual[1], 0.0);
+    }
+}
+
+// Unit-test-only observation seams. No release getter/API is generated.
+#[cfg(test)]
+impl GdnState {
+    pub(in crate::qwen35moe) fn gpu_test_tensors(&self) -> (&Tensor, &Tensor) {
+        (&self.conv, &self.recurrent)
+    }
+}
+
+#[cfg(test)]
+impl GdnStateCheckpoints {
+    pub(in crate::qwen35moe) fn gpu_test_tensors(&self) -> (&Tensor, &Tensor) {
+        (&self.conv, &self.recurrent)
     }
 }

@@ -175,6 +175,7 @@ async fn chat_completions(
         presence_penalty: request.presence_penalty,
         seed: request.seed,
         disable_spec_decode: request.disable_spec_decode,
+        stop_after_tool_call: !parallel_tool_calls,
     };
     let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let id = format!("chatcmpl-{sequence:016x}");
@@ -277,6 +278,7 @@ async fn messages(
         presence_penalty: None,
         seed: None,
         disable_spec_decode: openai_request.disable_spec_decode,
+        stop_after_tool_call: !parallel_tool_calls,
     };
     let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let id = format!("msg-{sequence:016x}");
@@ -373,7 +375,7 @@ fn streaming_response(
     created: u64,
     model: String,
 ) -> Response {
-    let (sender, body_receiver) = mpsc::channel::<Result<Bytes, Infallible>>(8);
+    let (sender, body_receiver) = mpsc::channel::<Result<Bytes, Infallible>>(128);
     tokio::spawn(async move {
         let envelope = StreamEnvelope {
             id: &id,
@@ -529,7 +531,7 @@ fn anthropic_streaming_response(
     id: String,
     model: String,
 ) -> Response {
-    let (sender, body_receiver) = mpsc::channel::<Result<Bytes, Infallible>>(8);
+    let (sender, body_receiver) = mpsc::channel::<Result<Bytes, Infallible>>(128);
     tokio::spawn(async move {
         if !send_anthropic_sse(
             &sender,
