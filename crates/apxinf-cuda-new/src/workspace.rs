@@ -461,7 +461,11 @@ pub(crate) fn use_execution<T: Any>(resource: &Rc<T>) -> Result<()> {
 }
 
 pub(crate) fn retain_resource<T: Any>(resource: &Rc<T>) {
-    if !is_capturing() {
+    // Preparation and capture must observe identical buffer lifetimes: an
+    // arena block that capture pins must stay pinned while preparing, or the
+    // free list (and therefore every later output address) diverges and the
+    // captured ExecutionKeys no longer match the prepared ones.
+    if !is_capturing() && !PREPARING.with(Cell::get) {
         return;
     }
     let resource: Rc<dyn Any> = resource.clone();
