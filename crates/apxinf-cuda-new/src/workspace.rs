@@ -337,8 +337,16 @@ fn with_session_phase<T>(
             session: previous,
             preparing: previous_preparing,
         };
+        let retained_before = CAPTURED_RESOURCES.with(|resources| resources.borrow().len());
         retain_resource(&session.inner);
         let result = operation();
+        if prepare && !is_capturing() {
+            // Preparation only pins blocks for the length of its own traversal;
+            // a capture starts its own retention list. Holding them past this
+            // point would keep the session and its arena alive on this thread
+            // until some later capture happened to clear the list.
+            CAPTURED_RESOURCES.with(|resources| resources.borrow_mut().truncate(retained_before));
+        }
         if result.is_ok()
             && !prepare
             && session.inner.sequence_cursor.get() != session.inner.prepared_sequence.borrow().len()
