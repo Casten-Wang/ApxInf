@@ -477,6 +477,30 @@ pub(crate) fn retain_resource<T: Any>(resource: &Rc<T>) {
     });
 }
 
+/// Retain a buffer handle for the same boundary as [`retain_resource`].
+///
+/// Direct-launch operators create a fresh handle on every call, so the handle's
+/// own allocation cannot serve as its identity; the device address can. Without
+/// that, one capture of a repeated operator would retain the same arena block
+/// once per occurrence.
+pub(crate) fn retain_buffer(buffer: &CudaBuffer) {
+    if !is_capturing() && !PREPARING.with(Cell::get) {
+        return;
+    }
+    let address = buffer.address().ptr() as usize;
+    CAPTURED_RESOURCES.with(|resources| {
+        let mut resources = resources.borrow_mut();
+        let stored = resources.iter().any(|resource| {
+            resource
+                .downcast_ref::<CudaBuffer>()
+                .is_some_and(|held| held.address().ptr() as usize == address)
+        });
+        if !stored {
+            resources.push(Rc::new(buffer.clone()));
+        }
+    });
+}
+
 /// Session-aware allocation for direct-launch operators. During an
 /// execution session it sub-allocates deterministically from the session
 /// arena; eager calls own a zeroed allocation directly.
