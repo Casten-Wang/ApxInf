@@ -65,12 +65,15 @@ resampling, mel extraction, and spectrogram extraction. The HuBERT 16 kHz
 branch follows the official GPU `kaiser_best` resampler; the 32 kHz mel and
 spectrogram branch uses torchaudio.
 
-The Rust model contract is `apxinf_model::TtsTrait`, defined in
-`tts_trait.rs`, alongside the separate `LlmTrait` language-model contract.
-`LoadedModel::Tts` owns the implementation, and `LoadedModel::tts()`
-returns the trait object. `TtsRequest`, `TtsSpec`, `PreparedTts`,
-and `PcmAudio` describe synthesis input, fixed profiles, prepared plans, and
-output. The Python binding remains `SpeechRunner`.
+The Rust model contract is `apxinf_model::TtsTrait`, defined in `tts_trait.rs`,
+alongside the separate `LlmTrait` language-model contract. One contract covers
+every TTS family (GPT-SoVITS V5 and Qwen3-TTS share it); `LoadedModel::Tts`
+owns the implementation and `LoadedModel::tts()` returns the runtime.
+`TtsRequest` carries the shared core (text, seed), optional `TtsSampling` knobs,
+and a typed per-family `TtsExtension`; GPT-SoVITS passes its phone/BERT/reference
+inputs through `TtsExtension::GptSovits`. `TtsSpec`, `PreparedTts` and
+`GeneratedAudio` describe fixed profiles, prepared plans and output. The Python
+binding remains `SpeechRunner`.
 
 ## Python API
 
@@ -179,9 +182,14 @@ per-request KV contents and retains one decode executable, KV allocation and
 workspace for the latest exact capacity across requests. Each request recomputes
 and overwrites its complete text/audio prefix before decode. Fixed-address
 metadata supplies the current cache length and write position on each replay.
-Token embedding, logits transfer and FP16 exponential-race sampling occur outside
-the decode graph. Sampling currently downloads logits and filters them on CPU;
-its counter RNG is independent of PyTorch's generator offset mapping. Frontend/acoustic graph inputs are rebound before replay;
+Token embedding and FP16 exponential-race sampling run outside the decode graph.
+When `top_p >= 1.0` and `top_k <= 128` the sampler runs on the device: the
+repetition-penalty flags stay resident there, and each step reads back only the four-word
+sampler output (sampled token, adjusted-logits argmax, status) instead of the logits.
+Requests outside that range (`top_p < 1.0`, `top_k > 128`, or an unsupported
+logits dtype) fall back to the reference host sampler, which downloads logits and
+filters them on CPU. Both paths use the same counter RNG, which is independent of
+PyTorch's generator offset mapping. Frontend/acoustic graph inputs are rebound before replay;
 fixed row maps, weights and workspaces remain owned by the prepared object.
 The caller must supply `target_frames`, four times the expected semantic
 token count:
